@@ -29,6 +29,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | Current conformance classification | [`conformance-v0-second-pass.md`](docs/governed-runtime/conformance-v0-second-pass.md) |
 | What it does not do | [`greenfield-known-gaps.md`](docs/governed-runtime/greenfield-known-gaps.md) · [`non-goals.md`](docs/governed-runtime/non-goals.md) |
 | Test coverage | [`greenfield-test-matrix.md`](docs/governed-runtime/greenfield-test-matrix.md) |
+| First governed execution (pilot) | [`pilot-01.md`](docs/pilot-01.md) |
 
 Documents cite an external "normative packet" as their requirements source. That packet is
 held privately and is not part of this repository; the citations are to an external source,
