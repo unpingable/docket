@@ -1,0 +1,11 @@
+[package]
+name = "gwr-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gwr-core = { path = "../gwr-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "gwr-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gwr-core = { path = "../gwr-core" }
+gwr-runtime = { path = "../gwr-runtime" }
+
+[lints]
+workspace = true
