@@ -102,6 +102,12 @@ pub enum RecoveryRefusal {
         resolving: DispatchId,
     },
     BindingIncomplete,
+    /// The fact names a different repository than the attempt it would resolve.
+    RepositoryMismatch,
+    /// The fact names a different target ref than the attempt's effect.
+    TargetRefMismatch,
+    /// The fact names a different basis than the attempt was specified against.
+    BasisMismatch,
     StandingInsufficient,
     StandingExpired,
     StandingAlreadyUsed,

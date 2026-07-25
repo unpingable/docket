@@ -39,43 +39,76 @@ pub struct RecoveryFact {
     pub recorded_at: ClockReading,
 }
 
+/// The authoritative binding a fact is checked against: the admitted attempt's
+/// own fields and the attempt's one dispatch identity, never the fact's.
+///
+/// A recovery fact carries a copy of every binding field. Those copies are the
+/// fact's testimony, not the yardstick: comparing the fact against itself would
+/// reduce validation to "does this document agree with itself?" and would let a
+/// fact manufacture a verdict about an attempt it never touched.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthoritativeBinding<'a> {
+    pub attempt: AttemptId,
+    pub dispatch: DispatchId,
+    pub prepared_attempt_digest: &'a Sha256Digest,
+    pub repository: &'a RepositoryIdentity,
+    pub target_ref: &'a RefName,
+    pub basis: &'a CommitHash,
+}
+
 impl RecoveryFact {
-    /// What this fact establishes about its own attempt — and only its own.
-    /// Conflicting or insufficient evidence establishes nothing.
-    pub fn establishes(&self) -> Option<RecoveryVerdict> {
+    /// What this fact establishes about the attempt named by `authoritative` —
+    /// and only that attempt. The comparison baseline is the attempt's own
+    /// basis, never the fact's copy of it. Conflicting or insufficient evidence
+    /// establishes nothing and leaves the attempt indeterminate.
+    pub fn establishes(&self, authoritative: &AuthoritativeBinding<'_>) -> Option<RecoveryVerdict> {
+        // The ref still holds the attempt's real basis: the effect did not land.
+        if &self.observed_ref == authoritative.basis {
+            return Some(RecoveryVerdict::ProvenNotCommitted);
+        }
+        // The ref holds exactly the commit the broker journal established this
+        // dispatch would produce: the effect landed. A result equal to the basis
+        // is not a commitment, and is rejected above.
         match &self.expected_result_commit {
-            Some(expected) if &self.observed_ref == expected => {
+            Some(expected) if &self.observed_ref == expected && expected != authoritative.basis => {
                 Some(RecoveryVerdict::CommittedViaRecovery)
             }
-            _ if self.observed_ref == self.basis => Some(RecoveryVerdict::ProvenNotCommitted),
             _ => None,
         }
     }
 }
 
-/// Pure validation that a fact may resolve a given attempt's dispatch. This
-/// checks binding only; standing validity is the domain's job and both are
-/// required by the bridge.
+/// Pure validation that a fact may resolve a given attempt's dispatch. Every
+/// semantically binding field is compared against `authoritative`; nothing is
+/// taken on the fact's own word. This checks binding only — standing validity is
+/// separate authority, and the bridge requires both.
 pub fn validate_fact_binding(
     fact: &RecoveryFact,
-    attempt: AttemptId,
-    dispatch: DispatchId,
-    prepared_attempt_digest: &Sha256Digest,
+    authoritative: &AuthoritativeBinding<'_>,
 ) -> Result<(), RecoveryRefusal> {
-    if fact.attempt != attempt {
+    if fact.attempt != authoritative.attempt {
         return Err(RecoveryRefusal::AttemptMismatch {
             fact_names: fact.attempt,
-            resolving: attempt,
+            resolving: authoritative.attempt,
         });
     }
-    if fact.dispatch != dispatch {
+    if fact.dispatch != authoritative.dispatch {
         return Err(RecoveryRefusal::DispatchMismatch {
             fact_names: fact.dispatch,
-            resolving: dispatch,
+            resolving: authoritative.dispatch,
         });
     }
-    if &fact.prepared_attempt_digest != prepared_attempt_digest {
+    if &fact.prepared_attempt_digest != authoritative.prepared_attempt_digest {
         return Err(RecoveryRefusal::BindingIncomplete);
+    }
+    if &fact.repository != authoritative.repository {
+        return Err(RecoveryRefusal::RepositoryMismatch);
+    }
+    if &fact.target_ref != authoritative.target_ref {
+        return Err(RecoveryRefusal::TargetRefMismatch);
+    }
+    if &fact.basis != authoritative.basis {
+        return Err(RecoveryRefusal::BasisMismatch);
     }
     Ok(())
 }
