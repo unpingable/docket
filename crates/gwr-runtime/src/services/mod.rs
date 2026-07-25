@@ -1,5 +1,7 @@
 //! Use-case coordination over the neutral ports.
 
+pub mod authz_request;
+pub mod authz_standing;
 pub mod dispatch;
 pub mod dossier;
 pub mod journal;

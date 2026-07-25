@@ -111,8 +111,36 @@ pub trait Store {
     /// mid-dispatch can present it to the broker again for inspection.
     fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError>;
 
-    // Standing.
+    // Standing. `create_standing_grant` records a locally-authorized grant;
+    // `create_upstream_standing_grant` records one justified by a verified
+    // upstream issuance. The issuance is the *basis*: it never becomes the
+    // grant, and one issuance can justify at most one grant.
     fn create_standing_grant(&mut self, grant: &StandingGrant) -> Result<(), StoreError>;
+    fn record_authz_issuance(
+        &mut self,
+        issuance: &gwr_core::authorization::AcceptedIssuance,
+    ) -> Result<(), StoreError>;
+    fn get_authz_issuance(
+        &mut self,
+        issuance_id: &str,
+    ) -> Result<Option<gwr_core::authorization::AcceptedIssuance>, StoreError>;
+    /// The issuance recorded for an attempt, if any.
+    fn find_attempt_issuance(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<gwr_core::authorization::AcceptedIssuance>, StoreError>;
+    fn create_upstream_standing_grant(
+        &mut self,
+        grant: &StandingGrant,
+        issuance_id: &str,
+    ) -> Result<(), StoreError>;
+    /// The authorization source recorded for a grant. `None` means the grant
+    /// predates source recording and reads as unrecorded — never as either
+    /// source.
+    fn get_grant_authorization(
+        &mut self,
+        grant: StandingGrantId,
+    ) -> Result<Option<(gwr_core::authorization::AuthorizationSource, Option<String>)>, StoreError>;
     fn get_standing_grant(&mut self, id: StandingGrantId) -> Result<StandingGrant, StoreError>;
 
     // Reservation. Creation checks exclusivity atomically.

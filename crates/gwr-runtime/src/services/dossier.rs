@@ -15,6 +15,7 @@
 //! and was reverted (`docs/governed-runtime/trust-model.md` §2).
 
 use crate::ports::store::{RelianceRefusalRecord, Store, StoreError, TimelineEntry};
+use gwr_core::authorization::{AcceptedIssuance, AuthorizationSource};
 use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant};
 use gwr_core::ids::*;
 use gwr_core::lifecycle::{AttemptState, RecoveryVerdict};
@@ -28,7 +29,10 @@ use gwr_core::work_request::{ClockReading, WorkRequest};
 
 /// The dossier format identifier, carried in every JSON rendering. Any change
 /// to the JSON key set or value encodings is a version bump here, not an edit.
-pub const DOSSIER_FORMAT: &str = "gwr:attempt-dossier:v1";
+/// The dossier format identifier. v2 adds the `authorization` block: v1 is a
+/// closed schema whose consumers deny unknown fields, so carrying upstream
+/// authorization facts honestly requires a version, not an extension.
+pub const DOSSIER_FORMAT: &str = "gwr:attempt-dossier:v2";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DossierError {
@@ -225,6 +229,21 @@ pub struct AttemptDossier {
     pub execution: ExecutionSection,
     pub observation: ObservationSection,
     pub qualification: Option<QualificationSection>,
+    /// Where the authority to ratify this attempt came from, and — when an
+    /// upstream office authorized it — that office's own facts, carried as
+    /// source testimony. Upstream premises are never merged into settlement
+    /// premises; upstream residuals are never discharged here.
+    pub authorization: AuthorizationSection,
+}
+
+/// The authorization provenance of an attempt's standing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationSection {
+    /// `local`, `upstream`, or — for grants written before source recording —
+    /// unrecorded.
+    pub source: Option<AuthorizationSource>,
+    /// The verified upstream issuance, when one justified the standing.
+    pub issuance: Option<AcceptedIssuance>,
 }
 
 fn optional<T>(r: Result<T, StoreError>) -> Result<Option<T>, StoreError> {
@@ -399,6 +418,23 @@ pub fn assemble(
     let reconciliation = store.get_reconciliation(attempt_id)?;
     let settlement = settlement(&projected.state);
 
+    // Authorization provenance: the ratifying grant's recorded source, and the
+    // upstream issuance when one justified it. A grant written before source
+    // recording yields `None` — unrecorded, never defaulted to either source.
+    let issuance = store.find_attempt_issuance(attempt_id)?;
+    let authorization_source = match &ratifying_grant {
+        // Once ratified, the grant that was actually consumed is the record.
+        Some(g) => store.get_grant_authorization(g.grant)?.map(|(s, _)| s),
+        // Before ratification, an accepted issuance already establishes that
+        // this attempt's standing came from upstream authorization.
+        None if issuance.is_some() => Some(AuthorizationSource::Upstream),
+        None => None,
+    };
+    let issuance = match authorization_source {
+        Some(AuthorizationSource::Upstream) => issuance,
+        _ => None,
+    };
+
     Ok(AttemptDossier {
         attempt: projected.attempt,
         state: projected.state,
@@ -430,6 +466,10 @@ pub fn assemble(
             reconciliation,
         },
         qualification,
+        authorization: AuthorizationSection {
+            source: authorization_source,
+            issuance,
+        },
     })
 }
 
@@ -448,7 +488,7 @@ fn hx(bytes: &[u8; 16]) -> String {
 }
 
 /// JSON string escaping per RFC 8259: quote, backslash, and control characters.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {
@@ -467,22 +507,22 @@ fn esc(s: &str) -> String {
     out
 }
 
-fn js(s: &str) -> String {
+pub(crate) fn js(s: &str) -> String {
     format!("\"{}\"", esc(s))
 }
 
-fn js_opt(s: Option<String>) -> String {
+pub(crate) fn js_opt(s: Option<String>) -> String {
     match s {
         Some(v) => js(&v),
         None => "null".into(),
     }
 }
 
-fn js_arr(items: Vec<String>) -> String {
+pub(crate) fn js_arr(items: Vec<String>) -> String {
     format!("[{}]", items.join(","))
 }
 
-fn js_str_arr(items: &[String]) -> String {
+pub(crate) fn js_str_arr(items: &[String]) -> String {
     js_arr(items.iter().map(|s| js(s)).collect())
 }
 
@@ -845,16 +885,105 @@ pub fn render_json(d: &AttemptDossier) -> String {
             }
         };
 
+    let authorization = {
+        let issuance = match &d.authorization.issuance {
+            None => "null".to_string(),
+            Some(i) => {
+                let premises = js_arr(
+                    i.premises
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{{\"kind\":{},\"statement\":{}}}",
+                                js(&p.kind),
+                                js(&p.statement)
+                            )
+                        })
+                        .collect(),
+                );
+                let residuals = js_arr(
+                    i.residuals
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{{\"source_system\":{},\"obligation_id\":{},\"subject\":{},\
+                                 \"kind\":{},\"statement\":{},\"discharged\":false}}",
+                                js(&r.source_system),
+                                js(&r.obligation_id),
+                                js(&r.subject),
+                                js(&r.kind),
+                                js(&r.statement)
+                            )
+                        })
+                        .collect(),
+                );
+                format!(
+                    "{{\"issuance_id\":{},\"decision_id\":{},\"issuer_principal\":{},\
+                     \"issuer_key_id\":{},\"target_id\":{},\"request_raw_sha256\":{},\
+                     \"request_upstream_digest\":{},\"prepared_attempt_digest\":{},\
+                     \"requested_actor\":{},\"issued_at_ms\":{},\"expires_at_ms\":{},\
+                     \"accepted_at_ms\":{},\"upstream_premises\":{},\
+                     \"upstream_premises_meaning\":{},\"upstream_residual_status\":{},\
+                     \"upstream_residuals\":{},\"consumption_ledger\":{},\
+                     \"consumption_use_digest\":{},\"establishes\":{},\
+                     \"does_not_establish\":{}}}",
+                    js(&i.issuance_id),
+                    js(&i.decision_id),
+                    js(&i.issuer_principal),
+                    js(&i.issuer_key_id),
+                    js(&i.target_id),
+                    js(&i.request_raw_sha256),
+                    js(&i.request_upstream_digest),
+                    js(&i.prepared_digest.to_hex()),
+                    js(&i.requested_actor),
+                    i.issued_at.0,
+                    i.expires_at.0,
+                    i.accepted_at.0,
+                    premises,
+                    js(
+                        "upstream authorization premises, asserted by the issuing office \
+                        and not verified by this runtime; distinct from this effect \
+                        class's settlement premises"
+                    ),
+                    js(i.residual_status.tag()),
+                    residuals,
+                    js(&i.consumption_ledger),
+                    js(&i.consumption_use_digest),
+                    js(
+                        "an upstream office admitted this exact prepared attempt, its \
+                        issuance authenticated to a trusted issuer, and every docket-owned \
+                        field it names matched this runtime's stored attempt"
+                    ),
+                    js(
+                        "that the effect executed, that the upstream policy was correct, \
+                        that upstream premises are true, or that upstream residual \
+                        obligations are discharged"
+                    ),
+                )
+            }
+        };
+        format!(
+            "{{\"source\":{},\"issuance\":{}}}",
+            js(match d.authorization.source {
+                None => "unrecorded",
+                Some(AuthorizationSource::Local) => "local",
+                Some(AuthorizationSource::Upstream) => "upstream",
+            }),
+            issuance
+        )
+    };
+
     format!(
         "{{\"dossier_format\":{},\"attempt\":{},\"state\":{},\"version\":{},\"settlement\":{},\
-         \"identity\":{},\"authority\":{},\"timeline\":{},\"execution\":{},\"observation\":{},\
-         \"qualification\":{}}}",
+         \"identity\":{},\"authorization\":{},\"authority\":{},\"timeline\":{},\
+         \"execution\":{},\"observation\":{},\"qualification\":{}}}",
         js(DOSSIER_FORMAT),
         js(&hx(d.attempt.attempt_id.as_bytes())),
         js(state_tag(&d.state)),
         d.version,
         js(d.execution.settlement.tag()),
         identity,
+        authorization,
         authority,
         timeline,
         execution,
@@ -922,6 +1051,69 @@ pub fn render_text(d: &AttemptDossier) -> String {
         "  request_created_at_ms {} admitted_at_ms {}",
         d.work_request.created_at.0, a.admitted_at.0
     );
+
+    let _ = writeln!(w, "\nauthorization");
+    let _ = writeln!(
+        w,
+        "  source {}",
+        match d.authorization.source {
+            None => "unrecorded (grant predates authorization-source recording)",
+            Some(AuthorizationSource::Local) => "local (operator authority; bootstrap path)",
+            Some(AuthorizationSource::Upstream) => "upstream (verified issuance)",
+        }
+    );
+    if let Some(i) = &d.authorization.issuance {
+        let _ = writeln!(w, "  issuance_id {}", i.issuance_id);
+        let _ = writeln!(w, "  decision_id {}", i.decision_id);
+        let _ = writeln!(w, "  issuer {} key {}", i.issuer_principal, i.issuer_key_id);
+        let _ = writeln!(w, "  target_id {}", i.target_id);
+        let _ = writeln!(w, "  request_raw_sha256 {}", i.request_raw_sha256);
+        let _ = writeln!(w, "  request_upstream_digest {}", i.request_upstream_digest);
+        let _ = writeln!(
+            w,
+            "  prepared_attempt_digest {} (matched against this runtime's stored attempt)",
+            i.prepared_digest.to_hex()
+        );
+        let _ = writeln!(
+            w,
+            "  requested_actor {} issued_at_ms {} expires_at_ms {} accepted_at_ms {}",
+            i.requested_actor, i.issued_at.0, i.expires_at.0, i.accepted_at.0
+        );
+        for p in &i.premises {
+            let _ = writeln!(w, "  upstream_premise {} — {}", p.kind, p.statement);
+        }
+        let _ = writeln!(
+            w,
+            "  upstream_premises are asserted by the issuing office, not verified here, \
+             and are not this effect class's settlement premises"
+        );
+        let _ = writeln!(w, "  upstream_residual_status {}", i.residual_status.tag());
+        for r in &i.residuals {
+            let _ = writeln!(
+                w,
+                "  upstream_residual {} kind {} subject {} — {} (outstanding: import and \
+                 execution discharge nothing upstream)",
+                r.obligation_id, r.kind, r.subject, r.statement
+            );
+        }
+        let _ = writeln!(
+            w,
+            "  upstream_authority_consumption ledger {} use {}",
+            i.consumption_ledger, i.consumption_use_digest
+        );
+        let _ = writeln!(
+            w,
+            "  establishes: an upstream office admitted this exact prepared attempt, its \
+             issuance authenticated to a trusted issuer, and every docket-owned field it \
+             names matched this runtime's stored attempt"
+        );
+        let _ = writeln!(
+            w,
+            "  does_not_establish: that the effect executed, that the upstream policy was \
+             correct, that upstream premises are true, or that upstream residual \
+             obligations are discharged"
+        );
+    }
 
     let _ = writeln!(w, "\nauthority");
     match (&d.authority.ratification, &d.authority.ratifying_grant) {

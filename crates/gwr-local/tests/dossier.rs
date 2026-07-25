@@ -499,7 +499,7 @@ fn human_and_json_render_from_one_model() {
     let d = assemble(&mut fx.store, fx.att.attempt_id).unwrap();
     let text = render_text(&d);
     let json = render_json(&d);
-    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v1\""));
+    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v2\""));
 
     // Every identifier the model holds appears on both surfaces.
     let ids: Vec<String> = vec![

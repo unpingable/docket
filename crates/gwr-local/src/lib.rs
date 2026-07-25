@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod authz_intake;
 pub mod broker;
 pub mod capabilities;
 pub mod observe;

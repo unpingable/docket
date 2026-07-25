@@ -4,6 +4,10 @@
 mod codec;
 
 use codec::*;
+use gwr_core::authorization::{
+    AcceptedIssuance, AuthorizationSource, UpstreamPremise, UpstreamResidual,
+    UpstreamResidualStatus,
+};
 use gwr_core::domain::reservation::{ClaimState, ReservationClaim};
 use gwr_core::domain::standing::{GrantState, StandingGrant, StandingScope, StandingUse};
 use gwr_core::ids::*;
@@ -25,6 +29,7 @@ use std::path::Path;
 
 const MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_reliance_subject.sql");
+const MIGRATION_0003: &str = include_str!("../../migrations/0003_authz_issuance.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -74,6 +79,20 @@ impl SqliteStore {
             .map_err(backend)?;
         if has_subject == 0 {
             conn.execute_batch(MIGRATION_0002).map_err(backend)?;
+        }
+        // 0003 adds the upstream-authorization issuance table and the grant's
+        // authorization source. Pre-0003 grants keep a NULL source, which reads
+        // as "unrecorded" — never as either authorization source.
+        let has_source: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('standing_grant')
+                 WHERE name='source'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if has_source == 0 {
+            conn.execute_batch(MIGRATION_0003).map_err(backend)?;
         }
         Ok(())
     }
@@ -802,8 +821,8 @@ impl Store for SqliteStore {
         let changed = tx
             .execute(
                 "INSERT OR IGNORE INTO standing_grant
-                 (id, actor, act, repository, attempt_digest, expires_at)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                 (id, actor, act, repository, attempt_digest, expires_at, source)
+                 VALUES (?1,?2,?3,?4,?5,?6,'local')",
                 params![
                     id16(grant.id().as_bytes()),
                     id16(grant.scope().actor.as_bytes()),
@@ -1761,5 +1780,271 @@ impl Store for SqliteStore {
                 })
             })
             .transpose()
+    }
+
+    fn record_authz_issuance(&mut self, i: &AcceptedIssuance) -> Result<(), StoreError> {
+        let (kinds, statements): (Vec<String>, Vec<String>) = i
+            .premises
+            .iter()
+            .map(|p| (p.kind.clone(), p.statement.clone()))
+            .unzip();
+        // Residual items are stored as one length-prefixed list of five-field
+        // groups, in the upstream's own vocabulary — never mapped onto Docket's
+        // obligation kinds.
+        let mut residual_fields: Vec<String> = Vec::new();
+        for r in &i.residuals {
+            residual_fields.push(r.source_system.clone());
+            residual_fields.push(r.obligation_id.clone());
+            residual_fields.push(r.subject.clone());
+            residual_fields.push(r.kind.clone());
+            residual_fields.push(r.statement.clone());
+        }
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO authz_issuance
+                 (issuance_id, attempt, decision_id, issuer_principal, issuer_key_id,
+                  target_id, request_raw_sha256, request_upstream_digest, prepared_digest,
+                  requested_actor, issued_at, expires_at, premise_kinds, premise_statements,
+                  residual_status, residual_items, consumption_ledger, consumption_use_digest,
+                  body_b64, accepted_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                params![
+                    i.issuance_id,
+                    id16(i.attempt.as_bytes()),
+                    i.decision_id,
+                    i.issuer_principal,
+                    i.issuer_key_id,
+                    i.target_id,
+                    i.request_raw_sha256,
+                    i.request_upstream_digest,
+                    i.prepared_digest.to_hex(),
+                    i.requested_actor,
+                    i.issued_at.0 as i64,
+                    i.expires_at.0 as i64,
+                    join_list(&kinds),
+                    join_list(&statements),
+                    i.residual_status.tag(),
+                    join_list(&residual_fields),
+                    i.consumption_ledger,
+                    i.consumption_use_digest,
+                    i.body_b64,
+                    i.accepted_at.0 as i64
+                ],
+            )
+            .map_err(backend)?;
+        if changed == 0 {
+            // An identity already present must name exactly the same accepted
+            // record; a different body under the same identity is substitution.
+            let existing = self.get_authz_issuance(&i.issuance_id)?;
+            match existing {
+                Some(e) if e.body_b64 == i.body_b64 && e.attempt == i.attempt => Ok(()),
+                Some(_) => Err(StoreError::ImmutableRebind),
+                None => Err(StoreError::Backend(
+                    "issuance insert reported no change but no row exists".into(),
+                )),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_authz_issuance(
+        &mut self,
+        issuance_id: &str,
+    ) -> Result<Option<AcceptedIssuance>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT attempt, decision_id, issuer_principal, issuer_key_id, target_id,
+                        request_raw_sha256, request_upstream_digest, prepared_digest,
+                        requested_actor, issued_at, expires_at, premise_kinds,
+                        premise_statements, residual_status, residual_items,
+                        consumption_ledger, consumption_use_digest, body_b64, accepted_at
+                 FROM authz_issuance WHERE issuance_id=?1",
+                params![issuance_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
+                        r.get::<_, i64>(9)?,
+                        r.get::<_, i64>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, String>(12)?,
+                        r.get::<_, String>(13)?,
+                        r.get::<_, String>(14)?,
+                        r.get::<_, String>(15)?,
+                        r.get::<_, String>(16)?,
+                        r.get::<_, String>(17)?,
+                        r.get::<_, i64>(18)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?;
+        let Some(row) = row else { return Ok(None) };
+        let kinds = split_list(&row.11);
+        let statements = split_list(&row.12);
+        if kinds.len() != statements.len() {
+            return Err(StoreError::Corrupt(
+                "authz_issuance premise columns disagree in length".into(),
+            ));
+        }
+        let residual_fields = split_list(&row.14);
+        if !residual_fields.len().is_multiple_of(5) {
+            return Err(StoreError::Corrupt(
+                "authz_issuance residual items are not whole five-field groups".into(),
+            ));
+        }
+        let residual_status = UpstreamResidualStatus::from_tag(&row.13)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown residual status {:?}", row.13)))?;
+        Ok(Some(AcceptedIssuance {
+            issuance_id: issuance_id.to_string(),
+            attempt: parse_id16(&row.0).map_err(|e| StoreError::Corrupt(e.to_string()))?,
+            decision_id: row.1,
+            issuer_principal: row.2,
+            issuer_key_id: row.3,
+            target_id: row.4,
+            request_raw_sha256: row.5,
+            request_upstream_digest: row.6,
+            prepared_digest: parse_digest(&row.7)
+                .map_err(|e| StoreError::Corrupt(e.to_string()))?,
+            requested_actor: row.8,
+            issued_at: ClockReading(row.9 as u64),
+            expires_at: ClockReading(row.10 as u64),
+            premises: kinds
+                .into_iter()
+                .zip(statements)
+                .map(|(kind, statement)| UpstreamPremise { kind, statement })
+                .collect(),
+            residual_status,
+            residuals: residual_fields
+                .chunks(5)
+                .map(|c| UpstreamResidual {
+                    source_system: c[0].clone(),
+                    obligation_id: c[1].clone(),
+                    subject: c[2].clone(),
+                    kind: c[3].clone(),
+                    statement: c[4].clone(),
+                })
+                .collect(),
+            consumption_ledger: row.15,
+            consumption_use_digest: row.16,
+            body_b64: row.17,
+            accepted_at: ClockReading(row.18 as u64),
+        }))
+    }
+
+    fn find_attempt_issuance(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<AcceptedIssuance>, StoreError> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT issuance_id FROM authz_issuance WHERE attempt=?1
+                 ORDER BY accepted_at, issuance_id LIMIT 1",
+                params![id16(attempt.as_bytes())],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        match id {
+            Some(id) => self.get_authz_issuance(&id),
+            None => Ok(None),
+        }
+    }
+
+    fn create_upstream_standing_grant(
+        &mut self,
+        grant: &StandingGrant,
+        issuance_id: &str,
+    ) -> Result<(), StoreError> {
+        // One issuance justifies at most one grant, across attempts and
+        // repetitions. Checked explicitly so the refusal is legible rather than
+        // an ignored insert.
+        let existing_for_issuance: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM standing_grant WHERE issuance_id=?1",
+                params![issuance_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(existing) = existing_for_issuance {
+            if existing != id16(grant.id().as_bytes()) {
+                return Err(StoreError::ImmutableRebind);
+            }
+            return Ok(());
+        }
+        let tx = self.tx()?;
+        let changed = tx
+            .execute(
+                "INSERT OR IGNORE INTO standing_grant
+                 (id, actor, act, repository, attempt_digest, expires_at, source, issuance_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,'upstream',?7)",
+                params![
+                    id16(grant.id().as_bytes()),
+                    id16(grant.scope().actor.as_bytes()),
+                    act_tag(grant.scope().act),
+                    grant.scope().repository.as_str(),
+                    grant.scope().attempt_digest.to_hex(),
+                    grant.expires_at().0 as i64,
+                    issuance_id
+                ],
+            )
+            .map_err(|e| {
+                if e.to_string().contains("UNIQUE") {
+                    StoreError::ImmutableRebind
+                } else {
+                    backend(e)
+                }
+            })?;
+        if changed == 0 {
+            drop(tx);
+            let existing = self.get_standing_grant(grant.id())?;
+            if existing.scope() != grant.scope() || existing.expires_at() != grant.expires_at() {
+                return Err(StoreError::ImmutableRebind);
+            }
+            return Ok(());
+        }
+        tx.execute(
+            "INSERT INTO standing_projection (grant_id, consumed_by, version) VALUES (?1, NULL, 0)",
+            params![id16(grant.id().as_bytes())],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    fn get_grant_authorization(
+        &mut self,
+        grant: StandingGrantId,
+    ) -> Result<Option<(AuthorizationSource, Option<String>)>, StoreError> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT source, issuance_id FROM standing_grant WHERE id=?1",
+                params![id16(grant.as_bytes())],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        match row {
+            None | Some((None, _)) => Ok(None),
+            Some((Some(tag), issuance)) => {
+                let source = AuthorizationSource::from_tag(&tag).ok_or_else(|| {
+                    StoreError::Corrupt(format!("unknown authorization source {tag:?}"))
+                })?;
+                Ok(Some((source, issuance)))
+            }
+        }
     }
 }

@@ -283,7 +283,7 @@ fn complete_happy_path_through_the_cli() {
         assert!(human.contains(fact), "human output missing {fact}");
         assert!(json.contains(fact), "json output missing {fact}");
     }
-    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v1\""));
+    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v2\""));
     assert!(human.contains("human_review_before_merge"), "{human}");
     assert!(
         json.contains("\"kind\":\"human_review_before_merge\""),

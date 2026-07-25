@@ -8,8 +8,18 @@ license.workspace = true
 gwr-core = { path = "../gwr-core" }
 gwr-runtime = { path = "../gwr-runtime" }
 hmac = "0.12"
+# Wire-format adapters only: Ed25519 verification of upstream authorization
+# issuances (ring), and strict decoding of the upstream wire records (serde).
+# The store substrate stays serde-free and length-prefixed as before.
+ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
+
+[dev-dependencies]
+ring = "0.17"
+serde_json = "1"
 
 [lints]
 workspace = true

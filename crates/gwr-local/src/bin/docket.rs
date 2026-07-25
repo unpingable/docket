@@ -22,6 +22,8 @@ use gwr_local::store::SqliteStore;
 use gwr_runtime::ports::adapters::{Clock, IdSource};
 use gwr_runtime::ports::labor_provider::BoundedAssignment;
 use gwr_runtime::ports::store::Store;
+use gwr_runtime::services::authz_request;
+use gwr_runtime::services::authz_standing;
 use gwr_runtime::services::dispatch::{dispatch, DispatchOutcome};
 use gwr_runtime::services::dossier;
 use gwr_runtime::services::journal;
@@ -593,6 +595,89 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("resolution: {:?}", resolution.verdict);
             Ok(())
         }
+        ["authz", "request"] => {
+            // Export the canonical authorization-request projection for an
+            // exact prepared attempt. This mints nothing and grants nothing:
+            // it is testimony about a proposal, for an upstream office to
+            // decide on.
+            let mut st = State::open(args)?;
+            let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
+            let actor = need(args, "--actor")?;
+            let r = authz_request::assemble(&mut st.store, attempt, &actor)
+                .map_err(|e| format!("{e:?}"))?;
+            if has(args, "--json") {
+                println!("{}", authz_request::render_json(&r));
+            } else {
+                print!("{}", authz_request::render_text(&r));
+            }
+            Ok(())
+        }
+        ["authz", "accept"] => {
+            // Verify an authenticated upstream issuance against this runtime's
+            // stored prepared attempt and, only then, mint local standing.
+            // Docket does not re-decide the upstream policy question; it checks
+            // authenticity, freshness, and exact binding.
+            let mut st = State::open(args)?;
+            let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
+            let issuance_bytes = std::fs::read(need(args, "--issuance")?)
+                .map_err(|e| format!("reading issuance: {e}"))?;
+            let trust_bytes = std::fs::read(
+                flag(args, "--trust")
+                    .unwrap_or_else(|| st.dir.join("authz-issuers.json").display().to_string()),
+            )
+            .map_err(|e| format!("reading issuer trust configuration: {e}"))?;
+            let trust = gwr_local::authz_intake::IssuerTrustConfig::parse(&trust_bytes)
+                .map_err(|e| format!("refused: {e}"))?;
+            let projected = st
+                .store
+                .get_attempt(attempt)
+                .map_err(|e| format!("{e:?}"))?;
+            let now = st.clock.now();
+            let verified = gwr_local::authz_intake::verify_issuance(
+                &issuance_bytes,
+                &projected.attempt,
+                attempt,
+                &trust,
+                now,
+            )
+            .map_err(|e| format!("refused: {e}"))?;
+            // Optional loop closure: if the caller still holds the exact request
+            // bytes it exported, confirm the issuance names them.
+            if let Some(path) = flag(args, "--request") {
+                let request_bytes =
+                    std::fs::read(&path).map_err(|e| format!("reading request: {e}"))?;
+                gwr_local::authz_intake::confirm_request_bytes(&verified, &request_bytes)
+                    .map_err(|e| format!("refused: {e}"))?;
+                println!("request_bytes_confirmed: true");
+            }
+            let act = match flag(args, "--act").as_deref() {
+                Some("resolve-recovery") => StandingAct::ResolveRecovery,
+                _ => StandingAct::Ratify,
+            };
+            let ttl: u64 = flag(args, "--ttl-ms")
+                .map(|s| s.parse().unwrap_or(3_600_000))
+                .unwrap_or(3_600_000);
+            let grant = authz_standing::mint_from_issuance(
+                &mut st.store,
+                &verified.accepted,
+                actor_id(&verified.accepted.requested_actor),
+                act,
+                StandingGrantId::from_bytes(st.ids.fresh16()),
+                now,
+                ttl,
+            )
+            .map_err(|e| format!("refused: {e:?}"))?;
+            let token = st.codec()?.issue(&grant);
+            println!("issuance_accepted: {}", verified.accepted.issuance_id);
+            println!("authorization_source: upstream");
+            println!("grant: {}", hex16s(grant.id().as_bytes()));
+            println!("token: {token}");
+            println!(
+                "note: the issuance is the recorded basis for this grant; it is not \
+                 authority and was never presented to the broker"
+            );
+            Ok(())
+        }
         ["docket", "list"] | ["list"] => {
             let mut st = State::open(args)?;
             // One canonical list model sources both renderings; the human
@@ -660,8 +745,8 @@ fn run(args: &[String]) -> Result<(), String> {
         _ => Err(format!(
             "unknown command {cmd:?}; commands: request create, prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
-             rely review-queue, reconcile, recover fact, recover resolve, docket list, \
-             docket show, docket journal"
+             rely review-queue, reconcile, recover fact, recover resolve, authz request, \
+             authz accept, docket list, docket show, docket journal"
         )),
     }
 }
