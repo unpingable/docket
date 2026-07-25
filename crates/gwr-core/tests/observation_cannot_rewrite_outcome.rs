@@ -16,14 +16,17 @@ fn failing_observation_leaves_commitment_intact() {
             standing_use: StandingUseId::from_bytes([2; 16]),
         })
         .unwrap()
-        .reserve(ReservationRef {
-            reservation: ReservationId::from_bytes([3; 16]),
-            reservation_use: ReservationUseId::from_bytes([4; 16]),
-        })
+        .reserve(ReservationId::from_bytes([3; 16]))
         .unwrap()
-        .dispatch(DispatchRef {
-            dispatch: DispatchId::from_bytes([5; 16]),
-        })
+        .dispatch(
+            ReservationRef {
+                reservation: ReservationId::from_bytes([3; 16]),
+                reservation_use: ReservationUseId::from_bytes([4; 16]),
+            },
+            DispatchRef {
+                dispatch: DispatchId::from_bytes([5; 16]),
+            },
+        )
         .unwrap()
         .commit()
         .unwrap();

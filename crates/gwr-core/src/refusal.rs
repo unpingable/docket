@@ -58,6 +58,8 @@ pub enum TransitionRefusal {
     NotIndeterminate,
     AlreadyDispatched,
     AlreadyTerminal,
+    /// The presented reservation use does not belong to the reserved claim.
+    ReservationMismatch,
 }
 
 /// Refusals from the observation admission path.

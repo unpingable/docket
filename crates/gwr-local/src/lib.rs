@@ -2,3 +2,5 @@
 //! observations, CLI, clocks, and identity generation.
 
 #![forbid(unsafe_code)]
+
+pub mod store;

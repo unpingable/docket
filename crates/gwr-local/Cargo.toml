@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 gwr-core = { path = "../gwr-core" }
 gwr-runtime = { path = "../gwr-runtime" }
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [lints]
 workspace = true

@@ -61,7 +61,9 @@ pub enum AttemptState {
     },
     Reserved {
         ratification: RatificationRef,
-        reservation: ReservationRef,
+        /// The claim exists; its one use is not yet spent. The use is minted at
+        /// dispatch, which consumes the claim.
+        reservation: ReservationId,
     },
     Dispatching {
         ratification: RatificationRef,
@@ -106,7 +108,7 @@ impl AttemptState {
         }
     }
 
-    pub fn reserve(&self, reservation: ReservationRef) -> Result<Self, TransitionRefusal> {
+    pub fn reserve(&self, reservation: ReservationId) -> Result<Self, TransitionRefusal> {
         match self {
             Self::Ratified { ratification } => Ok(Self::Reserved {
                 ratification: ratification.clone(),
@@ -116,19 +118,29 @@ impl AttemptState {
         }
     }
 
-    /// Begin the one dispatch. Only reachable from `Reserved`; every later state
-    /// refuses with `AlreadyDispatched` — a second dispatch identity is never
-    /// minted for an attempt.
-    pub fn dispatch(&self, dispatch: DispatchRef) -> Result<Self, TransitionRefusal> {
+    /// Begin the one dispatch. Only reachable from `Reserved`, with the consumed
+    /// use of the same reservation the state holds; every later state refuses
+    /// with `AlreadyDispatched` — a second dispatch identity is never minted for
+    /// an attempt.
+    pub fn dispatch(
+        &self,
+        reservation: ReservationRef,
+        dispatch: DispatchRef,
+    ) -> Result<Self, TransitionRefusal> {
         match self {
             Self::Reserved {
                 ratification,
-                reservation,
-            } => Ok(Self::Dispatching {
-                ratification: ratification.clone(),
-                reservation: reservation.clone(),
-                dispatch,
-            }),
+                reservation: reserved,
+            } => {
+                if reservation.reservation != *reserved {
+                    return Err(TransitionRefusal::ReservationMismatch);
+                }
+                Ok(Self::Dispatching {
+                    ratification: ratification.clone(),
+                    reservation,
+                    dispatch,
+                })
+            }
             Self::Prepared | Self::Ratified { .. } => Err(TransitionRefusal::NotReserved),
             _ => Err(TransitionRefusal::AlreadyDispatched),
         }
@@ -252,9 +264,13 @@ mod tests {
         }
     }
 
+    fn rsv_id() -> ReservationId {
+        ReservationId::from_bytes([3; 16])
+    }
+
     fn rsv() -> ReservationRef {
         ReservationRef {
-            reservation: ReservationId::from_bytes([3; 16]),
+            reservation: rsv_id(),
             reservation_use: ReservationUseId::from_bytes([4; 16]),
         }
     }
@@ -274,7 +290,10 @@ mod tests {
     #[test]
     fn dispatch_before_ratification_is_impossible() {
         let s = AttemptState::Prepared;
-        assert_eq!(s.dispatch(dsp()), Err(TransitionRefusal::NotReserved));
+        assert_eq!(
+            s.dispatch(rsv(), dsp()),
+            Err(TransitionRefusal::NotReserved)
+        );
         assert_eq!(
             s,
             AttemptState::Prepared,
@@ -285,7 +304,10 @@ mod tests {
     #[test]
     fn dispatch_before_reservation_is_impossible() {
         let s = AttemptState::Prepared.ratify(rat()).unwrap();
-        assert_eq!(s.dispatch(dsp()), Err(TransitionRefusal::NotReserved));
+        assert_eq!(
+            s.dispatch(rsv(), dsp()),
+            Err(TransitionRefusal::NotReserved)
+        );
     }
 
     #[test]
@@ -293,20 +315,40 @@ mod tests {
         let s = AttemptState::Prepared
             .ratify(rat())
             .unwrap()
-            .reserve(rsv())
+            .reserve(rsv_id())
             .unwrap()
-            .dispatch(dsp())
+            .dispatch(rsv(), dsp())
             .unwrap();
         assert_eq!(
-            s.dispatch(DispatchRef {
-                dispatch: DispatchId::from_bytes([9; 16])
-            }),
+            s.dispatch(
+                rsv(),
+                DispatchRef {
+                    dispatch: DispatchId::from_bytes([9; 16])
+                }
+            ),
             Err(TransitionRefusal::AlreadyDispatched)
         );
         let committed = s.commit().unwrap();
         assert_eq!(
-            committed.dispatch(dsp()),
+            committed.dispatch(rsv(), dsp()),
             Err(TransitionRefusal::AlreadyDispatched)
+        );
+    }
+
+    #[test]
+    fn dispatch_with_foreign_reservation_use_is_refused() {
+        let s = AttemptState::Prepared
+            .ratify(rat())
+            .unwrap()
+            .reserve(rsv_id())
+            .unwrap();
+        let foreign = ReservationRef {
+            reservation: ReservationId::from_bytes([99; 16]),
+            reservation_use: ReservationUseId::from_bytes([4; 16]),
+        };
+        assert_eq!(
+            s.dispatch(foreign, dsp()),
+            Err(TransitionRefusal::ReservationMismatch)
         );
     }
 
@@ -315,9 +357,9 @@ mod tests {
         let s = AttemptState::Prepared
             .ratify(rat())
             .unwrap()
-            .reserve(rsv())
+            .reserve(rsv_id())
             .unwrap()
-            .dispatch(dsp())
+            .dispatch(rsv(), dsp())
             .unwrap()
             .mark_indeterminate()
             .unwrap();
@@ -340,7 +382,7 @@ mod tests {
         let s = AttemptState::Prepared
             .ratify(rat())
             .unwrap()
-            .reserve(rsv())
+            .reserve(rsv_id())
             .unwrap();
         let before = s.clone();
         assert!(s.commit().is_err());
@@ -356,15 +398,15 @@ mod tests {
         let s = AttemptState::Prepared
             .ratify(rat())
             .unwrap()
-            .reserve(rsv())
+            .reserve(rsv_id())
             .unwrap()
-            .dispatch(dsp())
+            .dispatch(rsv(), dsp())
             .unwrap()
             .commit()
             .unwrap();
         assert!(s.is_terminal());
         assert!(s.ratify(rat()).is_err());
-        assert!(s.reserve(rsv()).is_err());
+        assert!(s.reserve(rsv_id()).is_err());
         assert!(s.commit().is_err());
         assert!(s
             .resolve(res(), RecoveryVerdict::CommittedViaRecovery)
