@@ -198,26 +198,50 @@ fn run(args: &[String]) -> Result<(), String> {
             st.store
                 .create_preparation_run(&run)
                 .map_err(|e| format!("{e:?}"))?;
-            let patch_file = need(args, "--fake-patch")?;
-            let patch = std::fs::read(&patch_file).map_err(|e| e.to_string())?;
-            let mut provider = ScriptedProvider::new(Script::Produce {
-                patch,
-                reported_digest: None,
-            });
+            let basis = flag(args, "--basis").unwrap_or_default();
+            let workspace = st.dir.join("workspace");
             let assignment = BoundedAssignment {
                 preparation_run: run.id,
                 goal: wr.goal.clone(),
-                basis: CommitHash::new(flag(args, "--basis").unwrap_or_default()),
-                workspace: st.dir.join("workspace"),
+                basis: CommitHash::new(basis.clone()),
+                workspace: workspace.clone(),
                 deadline: run.deadline,
             };
             let mut artifacts = FsArtifactStore::new(st.dir.join("artifacts"))?;
             let mut provenance = FsProvenanceSink::new(st.dir.join("provenance"))?;
             let clock = SystemClock;
             let mut ids = HashChainIds::new();
+            let mut provider: Box<dyn gwr_runtime::ports::labor_provider::LaborProvider> =
+                match flag(args, "--provider").as_deref() {
+                    Some("codex") => {
+                        gwr_local::providers::codex::populate_workspace(
+                            wr.repository.as_str(),
+                            &basis,
+                            &workspace,
+                        )?;
+                        let mut p = gwr_local::providers::codex::CodexExecProvider::new();
+                        if let Some(bin) = std::env::var_os("GWR_CODEX_BIN") {
+                            p.codex_bin = PathBuf::from(bin);
+                        }
+                        if let Some(t) = flag(args, "--timeout-ms") {
+                            p.timeout = std::time::Duration::from_millis(
+                                t.parse().map_err(|_| "bad --timeout-ms")?,
+                            );
+                        }
+                        Box::new(p)
+                    }
+                    _ => {
+                        let patch_file = need(args, "--fake-patch")?;
+                        let patch = std::fs::read(&patch_file).map_err(|e| e.to_string())?;
+                        Box::new(ScriptedProvider::new(Script::Produce {
+                            patch,
+                            reported_digest: None,
+                        }))
+                    }
+                };
             let result = run_preparation(
                 &mut st.store,
-                &mut provider,
+                provider.as_mut(),
                 &run,
                 &assignment,
                 &mut artifacts,
