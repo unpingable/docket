@@ -49,6 +49,23 @@ pub fn dispatch(
     // Idempotency: one persisted DispatchId per attempt, ever. Same identity
     // inspects; a different identity for the same attempt is never minted.
     if store.find_attempt_dispatch(attempt_id)?.is_some() {
+        // A dispatch persisted but the attempt is still `Dispatching`: the
+        // runtime died between handing the envelope to the broker and recording
+        // what came back. Re-present the envelope — the broker inspects its
+        // journal and never repeats the effect — and settle from what it
+        // establishes. Without this, an acknowledged effect is stranded outside
+        // any recoverable state, which is worse than indeterminacy.
+        if matches!(projected.state, AttemptState::Dispatching { .. }) {
+            let envelope = store.get_dispatch_envelope(attempt_id)?;
+            return settle(
+                store,
+                &projected.state,
+                projected.version,
+                &envelope,
+                broker,
+                clock,
+            );
+        }
         return Ok(DispatchOutcome::AlreadyDispatched {
             state: projected.state,
         });
@@ -86,8 +103,22 @@ pub fn dispatch(
     )?;
     let version = projected.version + 1;
 
-    // The effect. Whatever comes back is recorded exactly; nothing is guessed.
-    match broker.execute(&out.envelope) {
+    settle(store, &dispatching, version, &out.envelope, broker, clock)
+}
+
+/// Hand the envelope to the broker and record exactly what came back. Safe to
+/// call again after a crash: the broker inspects an existing journal rather
+/// than repeating the effect, so re-entry settles rather than re-executes.
+fn settle(
+    store: &mut dyn Store,
+    dispatching: &AttemptState,
+    version: u64,
+    envelope: &gwr_core::receipt::DispatchEnvelope,
+    broker: &mut dyn EffectBroker,
+    clock: &dyn Clock,
+) -> Result<DispatchOutcome, DispatchError> {
+    let attempt_id = envelope.attempt;
+    match broker.execute(envelope) {
         BrokerOutcome::Committed {
             previous,
             result_commit,
@@ -95,8 +126,8 @@ pub fn dispatch(
         } => {
             let commitment = Commitment {
                 attempt: attempt_id,
-                dispatch: out.envelope.dispatch,
-                target_ref: out.envelope.target_ref.clone(),
+                dispatch: envelope.dispatch,
+                target_ref: envelope.target_ref.clone(),
                 previous_value: previous,
                 result_commit,
                 journal_digest,
@@ -112,7 +143,7 @@ pub fn dispatch(
         } => {
             let record = DispatchRefusalRecord {
                 attempt: attempt_id,
-                dispatch: out.envelope.dispatch,
+                dispatch: envelope.dispatch,
                 ground,
                 journal_digest,
                 refused_at: clock.now(),
@@ -128,7 +159,7 @@ pub fn dispatch(
         } => {
             let record = IndeterminateRecord {
                 attempt: attempt_id,
-                dispatch: out.envelope.dispatch,
+                dispatch: envelope.dispatch,
                 last_journal_digest,
                 recorded_at: clock.now(),
             };

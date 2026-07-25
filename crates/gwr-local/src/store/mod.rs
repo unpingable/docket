@@ -675,6 +675,33 @@ impl Store for SqliteStore {
             .map_err(backend)
     }
 
+    fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, prepared_digest, reservation_use, repository, target_ref,
+                        expected_basis, patch_digest, allowed_paths, created_at
+                 FROM dispatch WHERE attempt=?1",
+                params![id16(id.as_bytes())],
+                |r| {
+                    Ok(DispatchEnvelope {
+                        dispatch: parse_id16(&r.get::<_, String>(0)?),
+                        attempt: id,
+                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(1)?),
+                        reservation_use: parse_id16(&r.get::<_, String>(2)?),
+                        repository: repo(&r.get::<_, String>(3)?),
+                        target_ref: refname(&r.get::<_, String>(4)?),
+                        expected_basis: commit(&r.get::<_, String>(5)?),
+                        patch_digest: parse_digest(&r.get::<_, String>(6)?),
+                        allowed_paths: split_list(&r.get::<_, String>(7)?),
+                        created_at: ClockReading(r.get::<_, i64>(8)? as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
+    }
+
     fn create_standing_grant(&mut self, grant: &StandingGrant) -> Result<(), StoreError> {
         let tx = self.tx()?;
         let changed = tx

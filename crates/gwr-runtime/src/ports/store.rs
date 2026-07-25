@@ -73,6 +73,9 @@ pub trait Store {
     fn admit_attempt(&mut self, attempt: &PreparedAttempt) -> Result<(), StoreError>;
     fn get_attempt(&mut self, id: AttemptId) -> Result<ProjectedAttempt, StoreError>;
     fn find_attempt_dispatch(&mut self, id: AttemptId) -> Result<Option<DispatchId>, StoreError>;
+    /// The dispatch envelope persisted for an attempt, so a runtime that died
+    /// mid-dispatch can present it to the broker again for inspection.
+    fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError>;
 
     // Standing.
     fn create_standing_grant(&mut self, grant: &StandingGrant) -> Result<(), StoreError>;

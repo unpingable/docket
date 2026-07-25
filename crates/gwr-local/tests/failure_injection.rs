@@ -1010,3 +1010,121 @@ fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
     let after = fx.store.get_attempt(fx.att.attempt_id).unwrap();
     assert!(matches!(after.state, AttemptState::Indeterminate { .. }));
 }
+
+/// V3: the runtime dies inside `Dispatching`, after the broker acknowledged the
+/// ref update. On restart the attempt must settle from the journal, not strand.
+#[test]
+fn runtime_death_inside_dispatching_settles_on_re_entry() {
+    let mut fx = fixture("strand");
+    ratify_and_reserve(&mut fx);
+
+    // Drive the broker to a real, acknowledged commit, but do not let the
+    // runtime record it: mint the dispatch, persist Dispatching, run the
+    // broker, and stop there — exactly the window a kill -9 leaves behind.
+    let projected = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    let AttemptState::Reserved { reservation, .. } = &projected.state else {
+        panic!("expected reserved");
+    };
+    let claim = fx.store.get_reservation(*reservation).unwrap();
+    let ratification = match &projected.state {
+        AttemptState::Reserved { ratification, .. } => ratification.clone(),
+        _ => unreachable!(),
+    };
+    let out = gwr_core::bridge::reservation_to_dispatch::cross(
+        gwr_core::bridge::reservation_to_dispatch::Input {
+            version: 1,
+            claim: &claim,
+            ratification: &ratification,
+            attempt: &projected.attempt,
+            existing_dispatch: None,
+            now: ClockReading(20),
+            new_dispatch: DispatchId::from_bytes([8; 16]),
+            new_use: ReservationUseId::from_bytes([9; 16]),
+        },
+    )
+    .unwrap();
+    let dispatching = projected
+        .state
+        .dispatch(out.reservation_ref.clone(), out.dispatch_ref.clone())
+        .unwrap();
+    fx.store
+        .record_dispatch(
+            projected.version,
+            &out.envelope,
+            &dispatching,
+            &out.consumed_claim,
+        )
+        .unwrap();
+    // The effect happens; its outcome is never recorded.
+    let broker_outcome = {
+        use gwr_runtime::ports::effect_broker::EffectBroker;
+        fx.broker.execute(&out.envelope)
+    };
+    assert!(matches!(
+        broker_outcome,
+        gwr_runtime::ports::effect_broker::BrokerOutcome::Committed { .. }
+    ));
+    let ref_after_effect = sh(&fx.repo, &["git", "rev-parse", TARGET_REF]);
+    assert_ne!(ref_after_effect, fx.basis, "the effect did land");
+
+    // Restart: the ledger says Dispatching, the world says committed.
+    drop(std::mem::replace(
+        &mut fx.store,
+        SqliteStore::open(&fx.db).unwrap(),
+    ));
+    let stranded = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    assert!(matches!(stranded.state, AttemptState::Dispatching { .. }));
+
+    // Re-entering dispatch settles from the journal without repeating anything.
+    let clock = FixedClock(ClockReading(30));
+    let outcome = dispatch(
+        &mut fx.store,
+        fx.att.attempt_id,
+        &mut fx.broker,
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap();
+    let DispatchOutcome::Committed(commitment) = outcome else {
+        panic!("re-entry stranded the effect: {outcome:?}");
+    };
+    assert_eq!(commitment.result_commit.as_str(), ref_after_effect);
+    let settled = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    assert!(matches!(settled.state, AttemptState::Committed { .. }));
+    // The effect did not repeat: the ref is where the single effect left it.
+    assert_eq!(
+        sh(&fx.repo, &["git", "rev-parse", TARGET_REF]),
+        ref_after_effect
+    );
+}
+
+/// The same window, but the broker died before touching the ref: re-entry must
+/// settle to indeterminacy, the recoverable state.
+#[test]
+fn runtime_death_inside_dispatching_settles_to_indeterminate_when_journal_is_incomplete() {
+    let mut fx = fixture("strand-uncertain");
+    ratify_and_reserve(&mut fx);
+    fx.broker.crash_after = Some("commit_created".into());
+    let clock = FixedClock(ClockReading(20));
+    let outcome = dispatch(
+        &mut fx.store,
+        fx.att.attempt_id,
+        &mut fx.broker,
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap();
+    assert!(matches!(outcome, DispatchOutcome::Indeterminate(_)));
+    fx.broker.crash_after = None;
+    // Re-entry from Indeterminate does not re-run: it reports the settled state.
+    let again = dispatch(
+        &mut fx.store,
+        fx.att.attempt_id,
+        &mut fx.broker,
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap();
+    assert!(matches!(again, DispatchOutcome::AlreadyDispatched { .. }));
+    assert_eq!(sh(&fx.repo, &["git", "rev-parse", TARGET_REF]), fx.basis);
+}
