@@ -268,3 +268,20 @@ the one this campaign established and is worth keeping.
 **Satisfied 2026-07-25.** The re-audit classifies no `proved`-tagged invariant as
 `tested-only` or `unenforced`, and row 25 — the sole remaining blocker — is now
 `tested-only`, the minimum its tag requires. N-1, N-2, and N-3 were closed before tagging.
+
+## Post-v0.1 dispositions — 2026-07-25 (addendum; nothing above is rewritten)
+
+Recorded after the first pilot and its follow-up work (commits `2e30762`, `df43d67`;
+the frozen tag has not moved):
+
+- **N-5 — closed.** Persisted reliance refusals now retain observation, consumer, and
+  claim (migration `0002_reliance_subject.sql`). Rows written before the migration read
+  back as *subject not recorded* — absence, not a default.
+- **Codec panics (unwitnessed list: "corrupt hex column" asserts) — closed.** Store
+  decode is fully fallible; malformed persisted columns surface as
+  `StoreError::Corrupt`, incomplete projections as typed dossier errors.
+- **New surfaces.** The canonical attempt dossier
+  ([`attempt-dossier.md`](attempt-dossier.md)) is the supported read surface, and
+  effect-class admission ([`effect-classes.md`](effect-classes.md)) refuses
+  inexpressible proposals before authority. Neither change reopens any classification
+  above; N-4, N-6, N-7, N-8, and the V4 confinement boundary remain open as recorded.

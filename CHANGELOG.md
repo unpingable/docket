@@ -2,6 +2,45 @@
 
 Notable changes to the governed work runtime.
 
+## Unreleased — post-pilot legibility and effect boundary — 2026-07-25
+
+Two changes motivated by the first pilot's findings
+([`docs/pilot-01.md`](docs/pilot-01.md), dispositions in
+[`docs/pilot-01-followup.md`](docs/pilot-01-followup.md)). The frozen tag has not moved.
+
+### Added
+
+- **Canonical attempt dossier** (`2e30762`) — one read model sources both `docket show`
+  surfaces; JSON is versioned as `gwr:attempt-dossier:v1`. Exposes goal, actor, grant
+  scope and consumption, reservation, dispatch, digests, evidence, obligations,
+  reliance records, and timestamped timeline. Recovery verdicts render **qualified**:
+  proof basis, the asserted `ExclusiveRefCustody` premise, observed ref, expected result
+  commit, and whether the records agree. `proven_not_committed` is no longer presented
+  as unconditional history. [`docs/governed-runtime/attempt-dossier.md`](docs/governed-runtime/attempt-dossier.md)
+- **Explicit effect-class admission** (`df43d67`) — `GitRefEffect`
+  (`git-ref-update:v1`) is the one admitted effect class; its tag was already bound into
+  every prepared-attempt digest, and its settlement model is now declared as typed
+  premises. Inexpressible proposals refuse with a typed `EffectClassRefusal` at request
+  creation / preparation / admission, before authority, reservation, dispatch, provider
+  execution, or Git. [`docs/governed-runtime/effect-classes.md`](docs/governed-runtime/effect-classes.md)
+
+### Fixed
+
+- Persisted reliance refusals retain their subject — observation, consumer, claim
+  (freeze finding N-5). Narrow migration `0002_reliance_subject.sql`; rows written
+  before it read back as subject-absent, never defaulted.
+- Store decode is fully fallible: malformed persisted columns surface as
+  `StoreError::Corrupt` instead of panicking.
+- The CLI's command listing now includes `recover fact` and `recover resolve`
+  (pilot finding P-3).
+
+### Compatibility
+
+Pilot-era state opens unchanged under the migration; pre-boundary records (including
+the pilot's run-N `mailto` attempt) remain byte-exact readable, and their dossiers
+display the historical category error rather than hiding it. 144 tests, identical in
+debug and release; all four gates exit 0.
+
 ## [gwr-greenfield-v0.1] — 2026-07-25
 
 The frozen greenfield comparison baseline. Tag `gwr-greenfield-v0.1`, commit `c93c747`.
