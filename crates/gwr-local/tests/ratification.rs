@@ -254,9 +254,10 @@ fn tampered_token_fails_integrity() {
     let verified = codec.verify(&token).unwrap();
     assert_eq!(verified.id, g.id);
     assert_eq!(verified.scope, g.scope);
-    // Tamper with the expiry inside the payload.
-    let tampered = token.replace("|1000|", "|999999|");
-    assert_ne!(token, tampered);
+    // Tamper with the expiry inside the payload. Fields are length-prefixed,
+    // so a longer value carries its own new prefix.
+    let tampered = token.replace("4:1000|", "6:999999|");
+    assert_ne!(token, tampered, "the tamper must actually change the token");
     assert_eq!(
         codec.verify(&tampered).unwrap_err(),
         StandingRefusal::IntegrityFailure
@@ -272,4 +273,63 @@ fn tampered_token_fails_integrity() {
         other.verify(&token).unwrap_err(),
         StandingRefusal::IntegrityFailure
     );
+}
+
+/// V7: the serializer and the parser must agree about what was signed. A
+/// repository containing the old `|` separator previously authenticated as a
+/// different scope — attacker-chosen attempt digest and unbounded expiry —
+/// with the HMAC fully intact.
+#[test]
+fn token_scope_survives_separator_injection() {
+    let codec = StandingTokenCodec::new([7; 32]);
+    let att = attempt(9);
+    let mut g = grant(&att, StandingAct::Ratify, 4, 1000);
+    // The exact witness shape from the blind review.
+    g.scope.repository = RepositoryIdentity::new(format!(
+        "/repo|{}|99999999999999",
+        Sha256Digest::of_bytes(b"attacker digest").to_hex()
+    ));
+    let token = codec.issue(&g);
+    let verified = codec.verify(&token).unwrap();
+    assert_eq!(
+        verified.scope.repository, g.scope.repository,
+        "repository was re-partitioned by the parser"
+    );
+    assert_eq!(verified.scope.attempt_digest, g.scope.attempt_digest);
+    assert_eq!(verified.expires_at, g.expires_at);
+    assert_eq!(verified.scope, g.scope);
+}
+
+/// Every field can carry the delimiter characters without changing the scope.
+#[test]
+fn token_round_trips_awkward_repository_paths() {
+    let codec = StandingTokenCodec::new([9; 32]);
+    let att = attempt(9);
+    for repo in [
+        "/plain/path",
+        "/with|pipes",
+        "/with:colons",
+        "/with|pipes:and:colons|",
+        "/with spaces and \"quotes\"",
+        "",
+        "/日本語",
+    ] {
+        let mut g = grant(&att, StandingAct::Ratify, 4, 1000);
+        g.scope.repository = RepositoryIdentity::new(repo);
+        let verified = codec.verify(&codec.issue(&g)).unwrap();
+        assert_eq!(verified.scope, g.scope, "scope changed for repo {repo:?}");
+        assert_eq!(verified.expires_at, g.expires_at);
+    }
+}
+
+/// Trailing bytes after the signed fields are refused rather than ignored.
+#[test]
+fn trailing_content_after_the_signed_fields_is_refused() {
+    let codec = StandingTokenCodec::new([11; 32]);
+    let att = attempt(9);
+    let g = grant(&att, StandingAct::Ratify, 4, 1000);
+    let token = codec.issue(&g);
+    let (payload, tag) = token.rsplit_once('|').unwrap();
+    let extended = format!("{payload}trailing|{tag}");
+    assert!(codec.verify(&extended).is_err());
 }

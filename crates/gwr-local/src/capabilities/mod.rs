@@ -49,16 +49,43 @@ impl StandingTokenCodec {
         Self { key }
     }
 
+    /// The one canonical transcript. Every field is length-prefixed, so no
+    /// field's content can be read as structure — a repository path containing
+    /// the old `|` separator previously authenticated as a *different* scope,
+    /// because the parser and the serializer disagreed about what had been
+    /// signed. Signing, serialization, parsing, and verification all go through
+    /// this function.
     fn payload(grant: &StandingGrant) -> String {
-        format!(
-            "{TOKEN_PREFIX}|{}|{}|{}|{}|{}|{}",
-            hex16(grant.id.as_bytes()),
-            hex16(grant.scope.actor.as_bytes()),
-            act_tag(grant.scope.act),
-            grant.scope.repository.as_str(),
-            grant.scope.attempt_digest.to_hex(),
-            grant.expires_at.0
-        )
+        fn field(out: &mut String, value: &str) {
+            out.push_str(&value.len().to_string());
+            out.push(':');
+            out.push_str(value);
+        }
+        let mut out = String::new();
+        field(&mut out, TOKEN_PREFIX);
+        field(&mut out, &hex16(grant.id.as_bytes()));
+        field(&mut out, &hex16(grant.scope.actor.as_bytes()));
+        field(&mut out, act_tag(grant.scope.act));
+        field(&mut out, grant.scope.repository.as_str());
+        field(&mut out, &grant.scope.attempt_digest.to_hex());
+        field(&mut out, &grant.expires_at.0.to_string());
+        out
+    }
+
+    /// Read one length-prefixed field, returning it and the rest.
+    fn take_field(rest: &str) -> Result<(String, &str), StandingRefusal> {
+        let colon = rest.find(':').ok_or(StandingRefusal::IntegrityFailure)?;
+        let len: usize = rest[..colon]
+            .parse()
+            .map_err(|_| StandingRefusal::IntegrityFailure)?;
+        let start = colon + 1;
+        let end = start
+            .checked_add(len)
+            .ok_or(StandingRefusal::IntegrityFailure)?;
+        if end > rest.len() || !rest.is_char_boundary(end) {
+            return Err(StandingRefusal::IntegrityFailure);
+        }
+        Ok((rest[start..end].to_string(), &rest[end..]))
     }
 
     fn mac(&self, payload: &str) -> String {
@@ -96,38 +123,36 @@ impl StandingTokenCodec {
             .map_err(|_| StandingRefusal::IntegrityFailure)?;
         debug_assert_eq!(expected, tag);
 
-        let mut parts = payload.split('|');
-        let prefix = parts.next().ok_or(StandingRefusal::IntegrityFailure)?;
+        let (prefix, rest) = Self::take_field(payload)?;
         if prefix != TOKEN_PREFIX {
             return Err(StandingRefusal::IntegrityFailure);
         }
+        let (grant_hex, rest) = Self::take_field(rest)?;
         let mut grant_id = [0u8; 16];
-        unhex(
-            parts.next().ok_or(StandingRefusal::IntegrityFailure)?,
-            &mut grant_id,
-        )?;
+        unhex(&grant_hex, &mut grant_id)?;
+        let (actor_hex, rest) = Self::take_field(rest)?;
         let mut actor = [0u8; 16];
-        unhex(
-            parts.next().ok_or(StandingRefusal::IntegrityFailure)?,
-            &mut actor,
-        )?;
-        let act = match parts.next().ok_or(StandingRefusal::IntegrityFailure)? {
+        unhex(&actor_hex, &mut actor)?;
+        let (act_str, rest) = Self::take_field(rest)?;
+        let act = match act_str.as_str() {
             "ratify" => StandingAct::Ratify,
             "resolve_recovery" => StandingAct::ResolveRecovery,
             _ => return Err(StandingRefusal::IntegrityFailure),
         };
-        let repository = parts.next().ok_or(StandingRefusal::IntegrityFailure)?;
+        let (repository, rest) = Self::take_field(rest)?;
+        let (digest_hex, rest) = Self::take_field(rest)?;
         let mut digest = [0u8; 32];
-        unhex(
-            parts.next().ok_or(StandingRefusal::IntegrityFailure)?,
-            &mut digest,
-        )?;
-        let expires_at: u64 = parts
-            .next()
-            .ok_or(StandingRefusal::IntegrityFailure)?
+        unhex(&digest_hex, &mut digest)?;
+        let (expiry_str, rest) = Self::take_field(rest)?;
+        let expires_at: u64 = expiry_str
             .parse()
             .map_err(|_| StandingRefusal::IntegrityFailure)?;
-        Ok(StandingGrant {
+        // Nothing may trail the signed fields.
+        if !rest.is_empty() {
+            return Err(StandingRefusal::IntegrityFailure);
+        }
+
+        let grant = StandingGrant {
             id: StandingGrantId::from_bytes(grant_id),
             scope: StandingScope {
                 actor: ActorId::from_bytes(actor),
@@ -137,6 +162,13 @@ impl StandingTokenCodec {
             },
             expires_at: ClockReading(expires_at),
             state: GrantState::Available,
-        })
+        };
+        // Every accepted parse must re-encode to exactly the bytes that were
+        // signed. This is what makes "the scope this token names" and "the
+        // scope whose bytes carry the MAC" the same object by construction.
+        if Self::payload(&grant) != payload {
+            return Err(StandingRefusal::IntegrityFailure);
+        }
+        Ok(grant)
     }
 }

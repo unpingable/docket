@@ -15,23 +15,51 @@ use gwr_core::refusal::{DispatchRefusalGround, ObservationRefusal, RelianceRefus
 use gwr_core::work_request::{CommitHash, RefName, RepositoryIdentity};
 use gwr_runtime::ports::store::StoreError;
 
-/// List encoding: unit-separator joined. Explicit store format, versioned with
-/// the schema.
-const SEP: char = '\u{1f}';
-
+/// List encoding: length-prefixed, so `decode(encode(x)) == x` for every list
+/// of strings the admitted domain can contain.
+///
+/// A delimiter-joined encoding was not injective: a path containing the
+/// delimiter split into two on read, so an admitted attempt came back as a
+/// different object with a different binding digest, and the digest handed to
+/// the operator could never be ratified. Length prefixes cannot be forged by
+/// content because the content is never scanned for structure.
+///
+/// Format: `<byte-len>:<utf8 bytes>` per element, concatenated.
 pub fn join_list<S: AsRef<str>>(items: &[S]) -> String {
-    items
-        .iter()
-        .map(|s| s.as_ref())
-        .collect::<Vec<_>>()
-        .join(&SEP.to_string())
+    let mut out = String::new();
+    for item in items {
+        let s = item.as_ref();
+        out.push_str(&s.len().to_string());
+        out.push(':');
+        out.push_str(s);
+    }
+    out
 }
 
-pub fn split_list(joined: &str) -> Vec<String> {
-    if joined.is_empty() {
-        return Vec::new();
+pub fn split_list(encoded: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = encoded.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(colon) = bytes[i..].iter().position(|b| *b == b':') else {
+            break;
+        };
+        let colon = i + colon;
+        let Ok(len) = std::str::from_utf8(&bytes[i..colon])
+            .unwrap_or("")
+            .parse::<usize>()
+        else {
+            break;
+        };
+        let start = colon + 1;
+        let end = start + len;
+        if end > bytes.len() {
+            break;
+        }
+        out.push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+        i = end;
     }
-    joined.split(SEP).map(str::to_string).collect()
+    out
 }
 
 pub fn id16(bytes: &[u8; 16]) -> String {
@@ -302,4 +330,47 @@ pub fn reconstruct_state(
         },
         other => return Err(StoreError::Backend(format!("unknown state tag {other}"))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_list, split_list};
+
+    /// V5: `decode(encode(x)) = x` over the whole admitted domain, including
+    /// the control characters a delimiter encoding silently re-partitioned.
+    #[test]
+    fn list_encoding_round_trips_arbitrary_content() {
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["".into()],
+            vec!["src/lib.rs".into()],
+            vec!["src/lib.rs".into(), "src/main.rs".into()],
+            // The exact witness: the former delimiter, inside one element.
+            vec!["src/lib.rs\u{1f}evil/pwned.rs".into()],
+            vec!["a:b".into(), "12:not-a-length".into()],
+            vec![
+                "with space".into(),
+                "with\nnewline".into(),
+                "quote\"".into(),
+            ],
+            vec!["\u{1f}".into(), "".into(), "\u{1f}\u{1f}".into()],
+            vec!["7:sneaky".into()],
+            vec!["日本語のパス.rs".into()],
+        ];
+        for case in cases {
+            let round = split_list(&join_list(&case));
+            assert_eq!(round, case, "round trip failed for {case:?}");
+        }
+    }
+
+    /// Distinct lists must not share an encoding — the injectivity the old
+    /// delimiter format lacked.
+    #[test]
+    fn distinct_lists_encode_distinctly() {
+        let one = vec!["src/lib.rs\u{1f}evil/pwned.rs".to_string()];
+        let two = vec!["src/lib.rs".to_string(), "evil/pwned.rs".to_string()];
+        assert_ne!(join_list(&one), join_list(&two));
+        assert_eq!(split_list(&join_list(&one)), one);
+        assert_eq!(split_list(&join_list(&two)), two);
+    }
 }
