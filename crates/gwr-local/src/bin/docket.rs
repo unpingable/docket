@@ -451,6 +451,52 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["recover", "fact"] => {
+            let mut st = State::open(args)?;
+            let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
+            let clock = SystemClock;
+            let mut ids = HashChainIds::new();
+            let journal_dir = st.dir.join("journals");
+            let fact = gwr_local::recover::produce_fact(
+                &mut st.store,
+                attempt,
+                &journal_dir,
+                &clock,
+                &mut ids,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            println!("recovery_fact: {}", hex16s(fact.id.as_bytes()));
+            println!("observed_ref: {}", fact.observed_ref.as_str());
+            match &fact.expected_result_commit {
+                Some(c) => println!("expected_result_commit: {}", c.as_str()),
+                None => println!("expected_result_commit: unknown"),
+            }
+            Ok(())
+        }
+        ["recover", "resolve"] => {
+            let mut st = State::open(args)?;
+            let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
+            let fact = RecoveryFactId::from_bytes(parse16(&need(args, "--fact")?)?);
+            let token = need(args, "--token")?;
+            let verified = st
+                .codec()?
+                .verify(&token)
+                .map_err(|e| format!("token integrity: {e:?}"))?;
+            let clock = SystemClock;
+            let mut ids = HashChainIds::new();
+            let resolution = gwr_runtime::services::recovery::resolve(
+                &mut st.store,
+                attempt,
+                fact,
+                verified.id,
+                actor_id(&need(args, "--actor")?),
+                &clock,
+                &mut ids,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            println!("resolution: {:?}", resolution.verdict);
+            Ok(())
+        }
         ["docket", "list"] | ["list"] => {
             let mut st = State::open(args)?;
             let json = has(args, "--json");

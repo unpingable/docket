@@ -8,6 +8,7 @@ pub mod broker;
 pub mod capabilities;
 pub mod observe;
 pub mod providers;
+pub mod recover;
 pub mod store;
 
 pub use gwr_runtime::services::preparation::REPORTED_DIGEST_LABEL;
