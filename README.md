@@ -41,6 +41,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | First governed execution (pilot) | [`pilot-01.md`](docs/pilot-01.md) · [`pilot-01-followup.md`](docs/pilot-01-followup.md) |
 | The supported evidence/read surface | [`attempt-dossier.md`](docs/governed-runtime/attempt-dossier.md) |
 | What effects are admissible | [`effect-classes.md`](docs/governed-runtime/effect-classes.md) |
+| What each outcome means and what to do next | [`operator-runbook.md`](docs/governed-runtime/operator-runbook.md) |
 
 Documents cite an external "normative packet" as their requirements source. That packet is
 held privately and is not part of this repository; the citations are to an external source,

@@ -71,8 +71,30 @@ resolved in either direction. The preserved custody-boundary specimen
 (`crates/gwr-local/tests/ref_custody_boundary.rs`, pilot run C) renders exactly this
 way; `crates/gwr-local/tests/dossier.rs` asserts it.
 
+## Companion read surfaces
+
+The same evidence model backs two further read-only surfaces; neither assembles facts
+independently of the store's records:
+
+- **`docket list [--json]`** — one canonical summary model
+  (`gwr:attempt-list:v1`): identity, admission time, state, effect class, repository,
+  target ref, concise admitted scope, settlement, premise qualification, and
+  outstanding-obligation count. The human table truncates long values; the JSON carries
+  them complete.
+- **`docket journal (--attempt <id> | --dispatch <id>) [--json]`** — the broker journal
+  for the attempt's one dispatch, rendered as evidence **only after its bytes hash to
+  the digest the runtime persisted** with the outcome record. Statuses: `unavailable`,
+  `missing`, `digest_mismatch`, `corrupt`, `verified_partial` (crash-shaped, no terminal
+  phase), `verified_complete`. Unverified or out-of-vocabulary content is withheld with
+  an explicit notice, never rendered. Format: `gwr:journal-view:v1`.
+
+`docket show` and `docket journal` both resolve by attempt or by dispatch identity —
+the dispatch id embedded in every governed commit subject (`gwr governed effect <id>`)
+resolves to its attempt. Unknown, malformed, or doubly-given identifiers are typed
+refusals.
+
 ## Stability
 
-The JSON form is intended to be stable enough for later ingestion by external tooling
-(a cockpit, a witness system). No such integration exists yet, and none is implied by
-the format.
+The JSON forms (`gwr:attempt-dossier:v1`, `gwr:attempt-list:v1`, `gwr:journal-view:v1`)
+are intended to be stable enough for later ingestion by external tooling (a cockpit, a
+witness system). No such integration exists yet, and none is implied by the formats.

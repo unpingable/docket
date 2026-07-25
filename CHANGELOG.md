@@ -2,6 +2,31 @@
 
 Notable changes to the governed work runtime.
 
+## Unreleased — read-surface completion — 2026-07-25
+
+Completes the read-only operator surface over the canonical evidence model (`e923bf0`),
+with no second truth source, plus the operator runbook.
+
+### Added
+
+- **Canonical attempt list** — `docket list` renders one summary model
+  (`gwr:attempt-list:v1`) as human table and JSON: admission time, state, effect class,
+  repository, target ref, concise scope, settlement, premise qualification, and
+  outstanding obligations. Human truncates; JSON is complete.
+- **Lookup by dispatch identity** — `docket show`/`docket journal` accept `--dispatch`;
+  the dispatch id in every governed commit subject now resolves. Unknown, malformed, or
+  doubly-given identifiers are typed refusals.
+- **Verified journal inspection** — `docket journal` displays the broker journal only
+  after its bytes hash to the persisted digest; statuses `unavailable` / `missing` /
+  `digest_mismatch` / `corrupt` / `verified_partial` / `verified_complete`; unverified
+  or out-of-vocabulary content is withheld explicitly (`gwr:journal-view:v1`).
+- **Operator runbook** —
+  [`docs/governed-runtime/operator-runbook.md`](docs/governed-runtime/operator-runbook.md):
+  per-outcome statements of what is established, what is not, retry safety, standing
+  requirements, escalation, and what to inspect next.
+
+153 tests; all four gates exit 0 in debug and release.
+
 ## Unreleased — post-pilot legibility and effect boundary — 2026-07-25
 
 Two changes motivated by the first pilot's findings
