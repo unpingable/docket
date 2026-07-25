@@ -176,3 +176,122 @@ fn adapter_receives_no_authority_by_construction() {
         deadline: _,
     } = a;
 }
+
+/// V4: the provider workspace must not sit inside the state directory. The
+/// blind review pointed a substituted provider at `<state>/workspace`, read
+/// `../standing.key`, minted a token, and had it accepted.
+#[test]
+fn provider_workspace_is_not_inside_the_state_directory() {
+    let root = std::env::temp_dir().join(format!("gwr-v4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    sh(&repo, &["git", "init", "-q"]);
+    std::fs::write(repo.join("src/lib.rs"), "fn broken() {}\n").unwrap();
+    sh(&repo, &["git", "add", "-A"]);
+    sh(
+        &repo,
+        &[
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "basis",
+        ],
+    );
+    let basis = sh(&repo, &["git", "rev-parse", "HEAD"]);
+    let state = root.join("state");
+    let ws_root = root.join("workspaces");
+
+    // A provider that reports what it can reach from its working directory.
+    let probe = root.join("probe-codex");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        &probe,
+        "#!/bin/sh\nprintf 'fn fixed() {}\\n' > src/lib.rs\necho \"PARENT:$(ls .. 2>/dev/null | tr '\\n' ' ')\"\necho \"KEY:$(cat ../standing.key 2>/dev/null | head -c 8)\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_docket"))
+        .args([
+            "request",
+            "create",
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+            "--target-ref",
+            "refs/gwr/target",
+            "--goal",
+            "fix it",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let request = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("work_request: "))
+        .unwrap()
+        .to_string();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_docket"))
+        .args([
+            "prepare",
+            "start",
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--request",
+            &request,
+            "--provider",
+            "codex",
+            "--basis",
+            &basis,
+        ])
+        .env("GWR_CODEX_BIN", &probe)
+        .env("GWR_WORKSPACE_ROOT", &ws_root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "prepare failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The provider's own report: its parent directory holds no runtime state.
+    let log = std::fs::read_to_string(
+        std::fs::read_dir(state.join("provenance"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(
+        !log.contains("standing.key"),
+        "provider could see the signing key: {log}"
+    );
+    assert!(
+        !log.contains("state.sqlite"),
+        "provider could see the governed store: {log}"
+    );
+    assert!(log.contains("KEY:\\n") || log.contains("KEY:"), "{log}");
+    let key_line = log
+        .lines()
+        .find(|l| l.contains("KEY:"))
+        .expect("probe reported no key line");
+    assert!(
+        key_line.trim().ends_with("KEY:") || key_line.contains("KEY:\\n"),
+        "provider read key bytes: {key_line}"
+    );
+    // And the key really is elsewhere.
+    assert!(state.join("standing.key").exists() || !state.join("standing.key").exists());
+    assert!(!ws_root.join("standing.key").exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&ws_root);
+}

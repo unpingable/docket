@@ -199,7 +199,17 @@ fn run(args: &[String]) -> Result<(), String> {
                 .create_preparation_run(&run)
                 .map_err(|e| format!("{e:?}"))?;
             let basis = flag(args, "--basis").unwrap_or_default();
-            let workspace = st.dir.join("workspace");
+            // The provider workspace lives OUTSIDE the state directory, and is
+            // per-run. It previously sat at <state>/workspace -- one level below
+            // standing.key and state.sqlite -- and was handed to the provider as
+            // its working directory, so a provider that merely read `..` had the
+            // signing key and the governed store. Relocation removes the ambient
+            // path; it is not by itself an isolation boundary (see
+            // docs/governed-runtime/open-defects.md).
+            let workspace = std::env::var_os("GWR_WORKSPACE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(format!("gwr-workspace-{}", hex16s(run.id.as_bytes())));
             let assignment = BoundedAssignment {
                 preparation_run: run.id,
                 goal: wr.goal.clone(),

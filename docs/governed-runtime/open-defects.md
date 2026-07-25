@@ -156,6 +156,36 @@ is never read; `DispatchIdentityConflict` is dead code; `reserve()` can orphan a
 Held under attack, with witnesses: invariants 2, 3, 4, 5, 9, 10, 11, 12, 13, 18, 19, 21,
 22, 28, 29, 30; digest transcript collision resistance; projection concurrency.
 
+## Repair campaign, 2026-07-24 — status
+
+| Finding | Status |
+|---|---|
+| V1 broker path allowlist bypass | **fixed** — authorization runs on `git diff-index --raw -z` over the temporary index and covers both endpoints of every transition |
+| V2 false `CommittedViaRecovery` | **fixed** — verdict derived from `AuthoritativeBinding`; journal digest verified against the indeterminacy record; commit attribution checked |
+| V3 stranded acknowledged effect | **fixed** — re-entry from `Dispatching` re-presents the envelope and settles from the journal |
+| V4 provider reads authority material | **partially fixed — see below** |
+| V5 persistence mutates admitted content | **fixed** — length-prefixed encoding, round-trip proved over control characters |
+| V6 permissive `Store` port | **hardened** — the store validates the successor relation, not just the version |
+| V7 token serializer/parser disagreement | **fixed** — one canonical length-prefixed transcript; every accepted parse must re-encode to the signed bytes |
+| V8 mutable authority objects | **hardened** — private fields, `issue`/`claim` constructors, non-revival asserted directly |
+
+### V4 remains open, and relocation is not the boundary
+
+The workspace no longer sits inside the state directory: it is per-run, under
+`GWR_WORKSPACE_ROOT` or the system temp directory, so `..` from the provider's working
+directory no longer reaches `standing.key` or `state.sqlite`. A test drives a probe
+provider through the real CLI and asserts from the runtime's own provenance log that
+neither is visible.
+
+**This is layout hygiene, and the operator's ruling already named it as such.** The defect
+is ambient authority: a provider running as the same UID can still read the state
+directory by absolute path. Closing it needs an OS boundary — separate UID, mount
+namespace, or container — plus binding the provider executable's identity. That is not
+implementable from inside this process and is the one item of the campaign that remains
+open. Until it is closed, the honest claim is: *the adapter hands the provider no
+authority, and no longer places it adjacent to authority material, but does not confine
+it.*
+
 ## Freeze gate
 
 Task 13 remains blocked until Task 12 is re-run against the patched tree and shows no
