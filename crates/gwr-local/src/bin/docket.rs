@@ -165,10 +165,17 @@ fn run(args: &[String]) -> Result<(), String> {
     match cmd.as_slice() {
         ["request", "create"] => {
             let mut st = State::open(args)?;
+            let target = need(args, "--target-ref")?;
+            // Effect-class boundary: the runtime admits exactly one effect
+            // class, and a target that is not a Git ref name is not a proposal
+            // in any admitted class. Refused here — before a request exists,
+            // before any provider runs, before any standing or reservation —
+            // not eleven steps later as a mechanical Git refusal.
+            GitRefEffect::validate_target_ref(&target).map_err(|e| format!("{e:?}"))?;
             let wr = WorkRequest {
                 id: WorkRequestId::from_bytes(st.ids.fresh16()),
                 repository: RepositoryIdentity::new(need(args, "--repo")?),
-                target_ref: RefName::new(need(args, "--target-ref")?),
+                target_ref: RefName::new(target),
                 goal: need(args, "--goal")?,
                 created_at: st.clock.now(),
             };
@@ -184,6 +191,11 @@ fn run(args: &[String]) -> Result<(), String> {
             let wr = st
                 .store
                 .get_work_request(request)
+                .map_err(|e| format!("{e:?}"))?;
+            // A stored request predating the effect-class boundary may carry
+            // an inexpressible target. Provider labor is spent only on work in
+            // an admitted class, so it is (re)checked before the provider runs.
+            GitRefEffect::validate_target_ref(wr.target_ref.as_str())
                 .map_err(|e| format!("{e:?}"))?;
             let deadline_ms: u64 = flag(args, "--deadline-ms")
                 .map(|s| s.parse().unwrap_or(600_000))
@@ -307,19 +319,25 @@ fn run(args: &[String]) -> Result<(), String> {
             if observe_cmd.split_whitespace().next().is_none() {
                 return Err("--observe names no command".into());
             }
+            let effect = GitRefEffect {
+                target_ref: wr.target_ref.clone(),
+                expected_basis: basis.clone(),
+                patch_digest: cand.content_digest,
+                allowed_paths: allow,
+            };
+            // Effect-class boundary: an attempt is minted only for a proposal
+            // fully expressible in the one admitted class. A refusal here
+            // creates no attempt, so nothing downstream — standing,
+            // reservation, dispatch, broker — can ever see the proposal.
+            effect.validate().map_err(|e| format!("{e:?}"))?;
             let attempt = PreparedAttempt::admit(
                 AttemptId::from_bytes(st.ids.fresh16()),
                 request,
                 candidate,
                 wr.repository.clone(),
-                basis.clone(),
+                basis,
                 cand.content_digest,
-                GitRefEffect {
-                    target_ref: wr.target_ref.clone(),
-                    expected_basis: basis,
-                    patch_digest: cand.content_digest,
-                    allowed_paths: allow,
-                },
+                effect,
                 ObservationPlan {
                     argv: observe_cmd.split_whitespace().map(String::from).collect(),
                     environment_description: "operator workstation".into(),

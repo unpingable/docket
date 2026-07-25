@@ -71,6 +71,32 @@ impl DispatchRefusalGround {
     }
 }
 
+/// Refusals from effect-class admission.
+///
+/// v0 admits exactly one effect class — the atomic Git target-ref transition,
+/// `git-ref-update:v1`. A proposal that cannot be expressed in an admitted
+/// class is refused **here**, at request creation and candidate admission:
+/// before any standing is issued or consumed, before any reservation is
+/// created, before any dispatch identity is minted, and before any provider
+/// or Git invocation. A category error must not travel eleven steps to die as
+/// a mechanical Git refusal.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum EffectClassRefusal {
+    /// No admitted effect class can describe the proposal: the target is not a
+    /// Git ref name, so this is not a Git ref effect, and there is no other
+    /// kind. Carries the proposed target so the refusal says what was refused.
+    UnsupportedEffectClass { target: String },
+    /// Expressible only as a Git ref effect, but the basis is not an exact
+    /// lowercase-hex commit hash, so no exact effect is being proposed.
+    BasisNotACommitHash { basis: String },
+    /// The Git class admits no effect over zero paths: an effect that may
+    /// touch nothing is not an effect.
+    NoAdmittedPaths,
+    /// An admitted path is not repository-relative (absolute, traversing, or
+    /// malformed), so the path authorization it names is not expressible.
+    PathNotAdmissible { path: String },
+}
+
 /// Refusals of pure lifecycle transitions. An invalid transition mutates nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TransitionRefusal {

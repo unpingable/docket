@@ -558,7 +558,8 @@ pub fn render_json(d: &AttemptDossier) -> String {
     let a = &d.attempt;
     let identity = format!(
         "{{\"work_request\":{},\"goal\":{},\"repository\":{},\"target_ref\":{},\"basis\":{},\
-         \"effect_class\":{},\"allowed_paths\":{},\"candidate\":{},\"candidate_digest\":{},\
+         \"effect_class\":{},\"settlement_premises\":{},\"allowed_paths\":{},\
+         \"candidate\":{},\"candidate_digest\":{},\
          \"patch_digest\":{},\"preparation_run\":{},\"candidate_ingested_at_ms\":{},\
          \"prepared_attempt_digest\":{},\"observation_plan\":{{\"argv\":{},\"environment\":{}}},\
          \"request_created_at_ms\":{},\"admitted_at_ms\":{}}}",
@@ -568,6 +569,12 @@ pub fn render_json(d: &AttemptDossier) -> String {
         js(a.effect.target_ref.as_str()),
         js(a.basis.as_str()),
         js(gwr_core::effect_spec::GitRefEffect::KIND),
+        js_arr(
+            gwr_core::effect_spec::GitRefEffect::SETTLEMENT_PREMISES
+                .iter()
+                .map(|p| js(p.tag()))
+                .collect()
+        ),
         js_str_arr(&a.effect.allowed_paths),
         js(&hx(a.candidate.as_bytes())),
         js(&a.artifact_digest.to_hex()),
@@ -877,6 +884,15 @@ pub fn render_text(d: &AttemptDossier) -> String {
         w,
         "  effect_class {}",
         gwr_core::effect_spec::GitRefEffect::KIND
+    );
+    let premises: Vec<&str> = gwr_core::effect_spec::GitRefEffect::SETTLEMENT_PREMISES
+        .iter()
+        .map(|p| p.tag())
+        .collect();
+    let _ = writeln!(
+        w,
+        "  settlement_premises {} (properties of this effect class, not universal guarantees)",
+        premises.join(" ")
     );
     for p in &a.effect.allowed_paths {
         let _ = writeln!(w, "  allowed_path {p}");
