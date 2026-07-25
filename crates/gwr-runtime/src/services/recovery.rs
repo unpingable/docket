@@ -116,7 +116,7 @@ pub fn resolve(
         .map_err(ResolveError::Transition)?;
     let standing_use = StandingUse {
         id: out.resolution.recovery_standing_use,
-        grant: grant.id,
+        grant: grant.id(),
         used_at: now,
     };
     store.record_recovery_resolution(

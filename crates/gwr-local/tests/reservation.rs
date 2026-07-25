@@ -2,7 +2,7 @@
 
 use gwr_core::bridge::reservation_to_dispatch as rsv_bridge;
 use gwr_core::digest::Sha256Digest;
-use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
+use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::*;
 use gwr_core::lifecycle::AttemptState;
@@ -46,23 +46,22 @@ fn admit_and_ratify(
     grant_byte: u8,
 ) -> gwr_core::lifecycle::RatificationRef {
     store.admit_attempt(att).unwrap();
-    let grant = StandingGrant {
-        id: StandingGrantId::from_bytes([grant_byte; 16]),
-        scope: StandingScope {
+    let grant = StandingGrant::issue(
+        StandingGrantId::from_bytes([grant_byte; 16]),
+        StandingScope {
             actor: ActorId::from_bytes([4; 16]),
             act: StandingAct::Ratify,
             repository: att.repository.clone(),
             attempt_digest: att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(10_000),
-        state: GrantState::Available,
-    };
+        ClockReading(10_000),
+    );
     store.create_standing_grant(&grant).unwrap();
     let clock = FixedClock(ClockReading(10));
     ratify(
         store,
         att.attempt_id,
-        grant.id,
+        grant.id(),
         ActorId::from_bytes([4; 16]),
         att.prepared_attempt_digest,
         att.basis.clone(),
@@ -160,8 +159,16 @@ fn wrong_attempt_reservation_cannot_dispatch_and_replay_is_refused() {
 
     // A claim doctored to name another attempt cannot permit dispatch for it.
     let other = attempt(10);
-    let mut foreign_claim = claim.clone();
-    foreign_claim.attempt = other.attempt_id;
+    // A claim can no longer be edited to name another attempt: it is issued
+    // bound, so the adversary has to construct a whole separate claim.
+    let foreign_claim = gwr_core::domain::reservation::ReservationClaim::claim(
+        claim.id(),
+        claim.repository().clone(),
+        claim.target_ref().clone(),
+        claim.basis().clone(),
+        other.attempt_id,
+        claim.expires_at(),
+    );
     // (The store's claim is authoritative; but even at the pure layer the
     // bridge refuses the mismatch between claim and attempt.)
     let out = rsv_bridge::cross(rsv_bridge::Input {

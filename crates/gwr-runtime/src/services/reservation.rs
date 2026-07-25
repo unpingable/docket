@@ -3,7 +3,7 @@
 
 use crate::ports::adapters::{Clock, IdSource};
 use crate::ports::store::{Store, StoreError};
-use gwr_core::domain::reservation::{ClaimState, ReservationClaim};
+use gwr_core::domain::reservation::ReservationClaim;
 use gwr_core::ids::{AttemptId, ReservationId};
 use gwr_core::refusal::TransitionRefusal;
 
@@ -35,20 +35,19 @@ pub fn reserve(
 ) -> Result<ReservationClaim, ReserveError> {
     let projected = store.get_attempt(attempt_id)?;
     let now = clock.now();
-    let claim = ReservationClaim {
-        id: ReservationId::from_bytes(ids.fresh16()),
-        repository: projected.attempt.repository.clone(),
-        target_ref: projected.attempt.effect.target_ref.clone(),
-        basis: projected.attempt.effect.expected_basis.clone(),
-        attempt: attempt_id,
-        expires_at: gwr_core::work_request::ClockReading(now.0 + ttl_ms),
-        state: ClaimState::Active,
-    };
+    let claim = ReservationClaim::claim(
+        ReservationId::from_bytes(ids.fresh16()),
+        projected.attempt.repository.clone(),
+        projected.attempt.effect.target_ref.clone(),
+        projected.attempt.effect.expected_basis.clone(),
+        attempt_id,
+        gwr_core::work_request::ClockReading(now.0 + ttl_ms),
+    );
     // Validate the transition before creating the claim, so a malformed request
     // does not leave an orphan reservation holding the ref.
     let new_state = projected
         .state
-        .reserve(claim.id)
+        .reserve(claim.id())
         .map_err(ReserveError::Transition)?;
     store.create_reservation(&claim, now)?;
     store.record_reserved(projected.version, attempt_id, &new_state, now)?;

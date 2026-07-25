@@ -269,6 +269,24 @@ fn projection_columns(
     }
 }
 
+/// The successor relation of the lifecycle, in projection-tag form. It mirrors
+/// `AttemptState`'s transition methods exactly; the type system enforces this
+/// for in-process callers, and this enforces it for anything reaching the store
+/// directly.
+fn transition_permitted(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("prepared", "ratified")
+            | ("ratified", "reserved")
+            | ("reserved", "dispatching")
+            | ("dispatching", "committed")
+            | ("dispatching", "dispatch_refused")
+            | ("dispatching", "indeterminate")
+            | ("indeterminate", "committed_via_recovery")
+            | ("indeterminate", "proven_not_committed")
+    )
+}
+
 /// Atomically advance the attempt projection from `expected_version` and append
 /// the timeline row. The single writer for the projection.
 fn advance_projection(
@@ -279,6 +297,28 @@ fn advance_projection(
     at: ClockReading,
 ) -> Result<(), StoreError> {
     let (tag, rat_id, rat_use, rsv_id, rsv_use, dsp, ground, res) = projection_columns(state);
+
+    // The store validates the transition it is asked to persist. A persistence
+    // port that accepts any caller-supplied next state is not a neutral port —
+    // it is a second authority path around the lifecycle, and it was one: a
+    // caller could persist Committed with no dispatch row, then regress to
+    // Prepared, with the timeline dutifully recording the impossible sequence.
+    let current_tag: String = tx
+        .query_row(
+            "SELECT state FROM attempt_projection WHERE attempt=?1",
+            params![id16(attempt.as_bytes())],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(backend)?
+        .ok_or(StoreError::NotFound)?;
+    if !transition_permitted(&current_tag, tag) {
+        return Err(StoreError::IllegalTransition {
+            from: current_tag,
+            to: tag.to_string(),
+        });
+    }
+
     let changed = tx
         .execute(
             "UPDATE attempt_projection SET state=?1, version=?2, rat_id=?3, rat_standing_use=?4,
@@ -339,7 +379,7 @@ fn consume_standing(
         .execute(
             "UPDATE standing_projection SET consumed_by=?1, version=version+1
              WHERE grant_id=?2 AND consumed_by IS NULL",
-            params![id16(use_record.id.as_bytes()), id16(grant.id.as_bytes())],
+            params![id16(use_record.id.as_bytes()), id16(grant.id().as_bytes())],
         )
         .map_err(backend)?;
     if changed == 0 {
@@ -349,7 +389,7 @@ fn consume_standing(
         "INSERT INTO standing_use (id, grant_id, used_at) VALUES (?1, ?2, ?3)",
         params![
             id16(use_record.id.as_bytes()),
-            id16(grant.id.as_bytes()),
+            id16(grant.id().as_bytes()),
             use_record.used_at.0 as i64
         ],
     )
@@ -710,30 +750,26 @@ impl Store for SqliteStore {
                  (id, actor, act, repository, attempt_digest, expires_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
-                    id16(grant.id.as_bytes()),
-                    id16(grant.scope.actor.as_bytes()),
-                    act_tag(grant.scope.act),
-                    grant.scope.repository.as_str(),
-                    grant.scope.attempt_digest.to_hex(),
-                    grant.expires_at.0 as i64
+                    id16(grant.id().as_bytes()),
+                    id16(grant.scope().actor.as_bytes()),
+                    act_tag(grant.scope().act),
+                    grant.scope().repository.as_str(),
+                    grant.scope().attempt_digest.to_hex(),
+                    grant.expires_at().0 as i64
                 ],
             )
             .map_err(backend)?;
         if changed == 0 {
             drop(tx);
-            let existing = self.get_standing_grant(grant.id)?;
-            let mut fresh = existing.clone();
-            fresh.state = GrantState::Available;
-            let mut given = grant.clone();
-            given.state = GrantState::Available;
-            if fresh != given {
+            let existing = self.get_standing_grant(grant.id())?;
+            if existing.scope() != grant.scope() || existing.expires_at() != grant.expires_at() {
                 return Err(StoreError::ImmutableRebind);
             }
             return Ok(());
         }
         tx.execute(
             "INSERT INTO standing_projection (grant_id, consumed_by, version) VALUES (?1, NULL, 0)",
-            params![id16(grant.id.as_bytes())],
+            params![id16(grant.id().as_bytes())],
         )
         .map_err(backend)?;
         tx.commit().map_err(backend)
@@ -749,22 +785,22 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     let consumed: Option<String> = r.get(5)?;
-                    Ok(StandingGrant {
+                    Ok(StandingGrant::from_persisted(
                         id,
-                        scope: StandingScope {
+                        StandingScope {
                             actor: parse_id16(&r.get::<_, String>(0)?),
                             act: parse_act_tag(&r.get::<_, String>(1)?),
                             repository: repo(&r.get::<_, String>(2)?),
                             attempt_digest: parse_digest(&r.get::<_, String>(3)?),
                         },
-                        expires_at: ClockReading(r.get::<_, i64>(4)? as u64),
-                        state: match consumed {
+                        ClockReading(r.get::<_, i64>(4)? as u64),
+                        match consumed {
                             None => GrantState::Available,
                             Some(u) => GrantState::Consumed {
                                 used_as: parse_id16(&u),
                             },
                         },
-                    })
+                    ))
                 },
             )
             .optional()
@@ -787,10 +823,10 @@ impl Store for SqliteStore {
                  WHERE r.repository=?1 AND r.target_ref=?2 AND p.consumed_by IS NULL
                    AND r.expires_at > ?3 AND r.id <> ?4",
                 params![
-                    claim.repository.as_str(),
-                    claim.target_ref.as_str(),
+                    claim.repository().as_str(),
+                    claim.target_ref().as_str(),
                     now.0 as i64,
-                    id16(claim.id.as_bytes())
+                    id16(claim.id().as_bytes())
                 ],
                 |r| r.get(0),
             )
@@ -804,23 +840,24 @@ impl Store for SqliteStore {
                  (id, repository, target_ref, basis, attempt, expires_at)
                  VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
-                    id16(claim.id.as_bytes()),
-                    claim.repository.as_str(),
-                    claim.target_ref.as_str(),
-                    claim.basis.as_str(),
-                    id16(claim.attempt.as_bytes()),
-                    claim.expires_at.0 as i64
+                    id16(claim.id().as_bytes()),
+                    claim.repository().as_str(),
+                    claim.target_ref().as_str(),
+                    claim.basis().as_str(),
+                    id16(claim.attempt().as_bytes()),
+                    claim.expires_at().0 as i64
                 ],
             )
             .map_err(backend)?;
         if changed == 0 {
             drop(tx);
-            let existing = self.get_reservation(claim.id)?;
-            let mut fresh = existing.clone();
-            fresh.state = ClaimState::Active;
-            let mut given = claim.clone();
-            given.state = ClaimState::Active;
-            if fresh != given {
+            let existing = self.get_reservation(claim.id())?;
+            if existing.repository() != claim.repository()
+                || existing.target_ref() != claim.target_ref()
+                || existing.basis() != claim.basis()
+                || existing.attempt() != claim.attempt()
+                || existing.expires_at() != claim.expires_at()
+            {
                 return Err(StoreError::ImmutableRebind);
             }
             return Ok(());
@@ -828,7 +865,7 @@ impl Store for SqliteStore {
         tx.execute(
             "INSERT INTO reservation_projection (reservation_id, consumed_by, version)
              VALUES (?1, NULL, 0)",
-            params![id16(claim.id.as_bytes())],
+            params![id16(claim.id().as_bytes())],
         )
         .map_err(backend)?;
         tx.commit().map_err(backend)
@@ -844,20 +881,20 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     let consumed: Option<String> = r.get(5)?;
-                    Ok(ReservationClaim {
+                    Ok(ReservationClaim::from_persisted(
                         id,
-                        repository: repo(&r.get::<_, String>(0)?),
-                        target_ref: refname(&r.get::<_, String>(1)?),
-                        basis: commit(&r.get::<_, String>(2)?),
-                        attempt: parse_id16(&r.get::<_, String>(3)?),
-                        expires_at: ClockReading(r.get::<_, i64>(4)? as u64),
-                        state: match consumed {
+                        repo(&r.get::<_, String>(0)?),
+                        refname(&r.get::<_, String>(1)?),
+                        commit(&r.get::<_, String>(2)?),
+                        parse_id16(&r.get::<_, String>(3)?),
+                        ClockReading(r.get::<_, i64>(4)? as u64),
+                        match consumed {
                             None => ClaimState::Active,
                             Some(u) => ClaimState::Consumed {
                                 used_as: parse_id16(&u),
                             },
                         },
-                    })
+                    ))
                 },
             )
             .optional()
@@ -917,7 +954,7 @@ impl Store for SqliteStore {
         new_state: &AttemptState,
         consumed_claim: &ReservationClaim,
     ) -> Result<(), StoreError> {
-        let ClaimState::Consumed { used_as } = &consumed_claim.state else {
+        let ClaimState::Consumed { used_as } = consumed_claim.state() else {
             return Err(StoreError::Backend(
                 "record_dispatch requires a consumed claim".into(),
             ));
@@ -927,7 +964,10 @@ impl Store for SqliteStore {
             .execute(
                 "UPDATE reservation_projection SET consumed_by=?1, version=version+1
                  WHERE reservation_id=?2 AND consumed_by IS NULL",
-                params![id16(used_as.as_bytes()), id16(consumed_claim.id.as_bytes())],
+                params![
+                    id16(used_as.as_bytes()),
+                    id16(consumed_claim.id().as_bytes())
+                ],
             )
             .map_err(backend)?;
         if changed == 0 {
@@ -937,7 +977,7 @@ impl Store for SqliteStore {
             "INSERT INTO reservation_use (id, reservation_id, used_at) VALUES (?1, ?2, ?3)",
             params![
                 id16(used_as.as_bytes()),
-                id16(consumed_claim.id.as_bytes()),
+                id16(consumed_claim.id().as_bytes()),
                 envelope.created_at.0 as i64
             ],
         )

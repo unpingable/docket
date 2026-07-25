@@ -58,7 +58,7 @@ pub fn ratify(
         .map_err(RatifyError::Transition)?;
     let standing_use = StandingUse {
         id: out.receipt.standing_use,
-        grant: grant.id,
+        grant: grant.id(),
         used_at: now,
     };
     store.record_ratification(

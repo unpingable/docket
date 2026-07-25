@@ -35,6 +35,12 @@ pub enum StoreError {
     ReservationConflict,
     /// A standing or reservation use was already consumed.
     AlreadyConsumed,
+    /// The caller asked to persist a state that is not a legal successor of the
+    /// attempt's current state.
+    IllegalTransition {
+        from: String,
+        to: String,
+    },
     Backend(String),
 }
 

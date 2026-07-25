@@ -15,15 +15,89 @@ pub enum ClaimState {
     Consumed { used_as: ReservationUseId },
 }
 
+/// Claimed once, consumed once. Fields are private for the same reason as
+/// `StandingGrant`: a claim whose expiry can be edited is not a lease.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReservationClaim {
-    pub id: ReservationId,
-    pub repository: RepositoryIdentity,
-    pub target_ref: RefName,
-    pub basis: CommitHash,
-    pub attempt: AttemptId,
-    pub expires_at: ClockReading,
-    pub state: ClaimState,
+    id: ReservationId,
+    repository: RepositoryIdentity,
+    target_ref: RefName,
+    basis: CommitHash,
+    attempt: AttemptId,
+    expires_at: ClockReading,
+    state: ClaimState,
+}
+
+impl ReservationClaim {
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim(
+        id: ReservationId,
+        repository: RepositoryIdentity,
+        target_ref: RefName,
+        basis: CommitHash,
+        attempt: AttemptId,
+        expires_at: ClockReading,
+    ) -> Self {
+        Self {
+            id,
+            repository,
+            target_ref,
+            basis,
+            attempt,
+            expires_at,
+            state: ClaimState::Active,
+        }
+    }
+
+    /// Rebuild a claim as the store recorded it. Adapter-only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted(
+        id: ReservationId,
+        repository: RepositoryIdentity,
+        target_ref: RefName,
+        basis: CommitHash,
+        attempt: AttemptId,
+        expires_at: ClockReading,
+        state: ClaimState,
+    ) -> Self {
+        Self {
+            id,
+            repository,
+            target_ref,
+            basis,
+            attempt,
+            expires_at,
+            state,
+        }
+    }
+
+    pub fn id(&self) -> ReservationId {
+        self.id
+    }
+
+    pub fn repository(&self) -> &RepositoryIdentity {
+        &self.repository
+    }
+
+    pub fn target_ref(&self) -> &RefName {
+        &self.target_ref
+    }
+
+    pub fn basis(&self) -> &CommitHash {
+        &self.basis
+    }
+
+    pub fn attempt(&self) -> AttemptId {
+        self.attempt
+    }
+
+    pub fn expires_at(&self) -> ClockReading {
+        self.expires_at
+    }
+
+    pub fn state(&self) -> &ClaimState {
+        &self.state
+    }
 }
 
 /// The immutable record of the one reservation use.

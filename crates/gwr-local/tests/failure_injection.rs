@@ -146,17 +146,16 @@ impl Drop for Fx {
 }
 
 fn grant_for(fx: &Fx, byte: u8, act: StandingAct) -> StandingGrant {
-    StandingGrant {
-        id: StandingGrantId::from_bytes([byte; 16]),
-        scope: StandingScope {
+    StandingGrant::issue(
+        StandingGrantId::from_bytes([byte; 16]),
+        StandingScope {
             actor: ACTOR,
             act,
             repository: fx.att.repository.clone(),
             attempt_digest: fx.att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(1_000_000),
-        state: GrantState::Available,
-    }
+        ClockReading(1_000_000),
+    )
 }
 
 fn ratify_and_reserve(fx: &mut Fx) {
@@ -166,7 +165,7 @@ fn ratify_and_reserve(fx: &mut Fx) {
     ratify(
         &mut fx.store,
         fx.att.attempt_id,
-        grant.id,
+        grant.id(),
         ACTOR,
         fx.att.prepared_attempt_digest,
         fx.att.basis.clone(),
@@ -349,7 +348,7 @@ fn ratification_rejects_wrong_basis() {
     let err = ratify(
         &mut fx.store,
         fx.att.attempt_id,
-        grant.id,
+        grant.id(),
         ACTOR,
         fx.att.prepared_attempt_digest,
         CommitHash::new("some-other-basis"),
@@ -357,12 +356,15 @@ fn ratification_rejects_wrong_basis() {
         &mut fx.ids,
     )
     .unwrap_err();
-    assert!(matches!(
-        err,
-        RatifyError::Bridge(gwr_core::bridge::standing_to_ratification::Refusal::BasisMismatch)
-    ));
-    let g = fx.store.get_standing_grant(grant.id).unwrap();
-    assert_eq!(g.state, GrantState::Available);
+    assert!(
+        matches!(
+            err,
+            RatifyError::Bridge(gwr_core::bridge::standing_to_ratification::Refusal::BasisMismatch)
+        ),
+        "unexpected: {err:?}"
+    );
+    let g = fx.store.get_standing_grant(grant.id()).unwrap();
+    assert_eq!(*g.state(), GrantState::Available);
 }
 
 // 5
@@ -375,7 +377,7 @@ fn standing_cannot_be_replayed() {
     ratify(
         &mut fx.store,
         fx.att.attempt_id,
-        grant.id,
+        grant.id(),
         ACTOR,
         fx.att.prepared_attempt_digest,
         fx.att.basis.clone(),
@@ -386,7 +388,7 @@ fn standing_cannot_be_replayed() {
     let err = ratify(
         &mut fx.store,
         fx.att.attempt_id,
-        grant.id,
+        grant.id(),
         ACTOR,
         fx.att.prepared_attempt_digest,
         fx.att.basis.clone(),
@@ -531,7 +533,7 @@ fn lost_ack_after_ref_update_requires_recovery() {
         &mut fx.store,
         fx.att.attempt_id,
         fact.id,
-        grant.id,
+        grant.id(),
         ACTOR,
         &mut ev,
         &clock,
@@ -662,7 +664,7 @@ fn recovery_fact_for_other_attempt_is_rejected() {
         &mut fx.store,
         fx.att.attempt_id,
         foreign.id,
-        grant.id,
+        grant.id(),
         ACTOR,
         &mut ev,
         &clock,
@@ -679,8 +681,8 @@ fn recovery_fact_for_other_attempt_is_rejected() {
     let after = fx.store.get_attempt(fx.att.attempt_id).unwrap();
     assert_eq!(before.state, after.state);
     assert_eq!(before.version, after.version);
-    let g = fx.store.get_standing_grant(grant.id).unwrap();
-    assert_eq!(g.state, GrantState::Available);
+    let g = fx.store.get_standing_grant(grant.id()).unwrap();
+    assert_eq!(*g.state(), GrantState::Available);
 }
 
 // 13
@@ -707,7 +709,7 @@ fn recovery_requires_separate_standing() {
         &mut fx.store,
         fx.att.attempt_id,
         fact.id,
-        grant.id,
+        grant.id(),
         ACTOR,
         &mut ev,
         &clock,
@@ -951,7 +953,7 @@ fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
         &mut fx.store,
         fx.att.attempt_id,
         fact.id,
-        grant.id,
+        grant.id(),
         ACTOR,
         &mut ev,
         &clock,
@@ -969,7 +971,7 @@ fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
     assert_eq!(before.state, after.state);
     assert!(matches!(after.state, AttemptState::Indeterminate { .. }));
     assert_eq!(
-        fx.store.get_standing_grant(grant.id).unwrap().state,
+        *fx.store.get_standing_grant(grant.id()).unwrap().state(),
         GrantState::Available
     );
 
@@ -994,7 +996,7 @@ fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
         &mut fx.store,
         fx.att.attempt_id,
         fact2.id,
-        grant.id,
+        grant.id(),
         ACTOR,
         &mut ev,
         &clock,

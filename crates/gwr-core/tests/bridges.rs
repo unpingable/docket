@@ -6,7 +6,7 @@ use gwr_core::bridge::{
 };
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::evidence::Claim;
-use gwr_core::domain::reservation::{ClaimState, ReservationClaim};
+use gwr_core::domain::reservation::ReservationClaim;
 use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::*;
@@ -42,17 +42,16 @@ fn attempt(id_byte: u8) -> PreparedAttempt {
 }
 
 fn ratify_grant(att: &PreparedAttempt, act: StandingAct, expires: u64) -> StandingGrant {
-    StandingGrant {
-        id: StandingGrantId::from_bytes([3; 16]),
-        scope: StandingScope {
+    StandingGrant::issue(
+        StandingGrantId::from_bytes([3; 16]),
+        StandingScope {
             actor: ActorId::from_bytes([4; 16]),
             act,
             repository: att.repository.clone(),
             attempt_digest: att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(expires),
-        state: GrantState::Available,
-    }
+        ClockReading(expires),
+    )
 }
 
 fn rat_input<'a>(grant: &'a StandingGrant, att: &'a PreparedAttempt) -> rat_bridge::Input<'a> {
@@ -79,7 +78,7 @@ fn expired_standing_cannot_authorize_ratification() {
         rat_bridge::Refusal::Standing(StandingRefusal::Expired)
     );
     assert_eq!(
-        grant.state,
+        *grant.state(),
         GrantState::Available,
         "refusal consumed nothing"
     );
@@ -108,7 +107,7 @@ fn wrong_digest_ratification_refuses_without_consuming() {
         rat_bridge::cross(input).unwrap_err(),
         rat_bridge::Refusal::DigestMismatch
     );
-    assert_eq!(grant.state, GrantState::Available);
+    assert_eq!(*grant.state(), GrantState::Available);
 }
 
 #[test]
@@ -118,15 +117,14 @@ fn reservation_for_another_attempt_cannot_permit_dispatch() {
     let grant = ratify_grant(&att, StandingAct::Ratify, 100);
     let rat = rat_bridge::cross(rat_input(&grant, &att)).unwrap();
     // Reservation claims the *other* attempt.
-    let claim = ReservationClaim {
-        id: ReservationId::from_bytes([7; 16]),
-        repository: att.repository.clone(),
-        target_ref: att.effect.target_ref.clone(),
-        basis: att.basis.clone(),
-        attempt: other.attempt_id,
-        expires_at: ClockReading(100),
-        state: ClaimState::Active,
-    };
+    let claim = ReservationClaim::claim(
+        ReservationId::from_bytes([7; 16]),
+        att.repository.clone(),
+        att.effect.target_ref.clone(),
+        att.basis.clone(),
+        other.attempt_id,
+        ClockReading(100),
+    );
     let out = rsv_bridge::cross(rsv_bridge::Input {
         version: 1,
         claim: &claim,
@@ -148,15 +146,14 @@ fn different_dispatch_identity_for_same_attempt_is_refused() {
     let att = attempt(9);
     let grant = ratify_grant(&att, StandingAct::Ratify, 100);
     let rat = rat_bridge::cross(rat_input(&grant, &att)).unwrap();
-    let claim = ReservationClaim {
-        id: ReservationId::from_bytes([7; 16]),
-        repository: att.repository.clone(),
-        target_ref: att.effect.target_ref.clone(),
-        basis: att.basis.clone(),
-        attempt: att.attempt_id,
-        expires_at: ClockReading(100),
-        state: ClaimState::Active,
-    };
+    let claim = ReservationClaim::claim(
+        ReservationId::from_bytes([7; 16]),
+        att.repository.clone(),
+        att.effect.target_ref.clone(),
+        att.basis.clone(),
+        att.attempt_id,
+        ClockReading(100),
+    );
     let out = rsv_bridge::cross(rsv_bridge::Input {
         version: 1,
         claim: &claim,
@@ -317,7 +314,7 @@ fn recovery_evidence_for_attempt_a_cannot_resolve_attempt_b() {
         out.unwrap_err(),
         rec_bridge::Refusal::Recovery(RecoveryRefusal::AttemptMismatch { .. })
     ));
-    assert_eq!(grant.state, GrantState::Available, "nothing consumed");
+    assert_eq!(*grant.state(), GrantState::Available, "nothing consumed");
 }
 
 #[test]
@@ -346,7 +343,7 @@ fn valid_recovery_evidence_with_insufficient_standing_produces_a_refusal() {
         out.unwrap_err(),
         rec_bridge::Refusal::Recovery(RecoveryRefusal::StandingInsufficient)
     );
-    assert_eq!(grant.state, GrantState::Available);
+    assert_eq!(*grant.state(), GrantState::Available);
 }
 
 #[test]

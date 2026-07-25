@@ -7,7 +7,7 @@
 //! standing.
 
 use gwr_core::digest::Sha256Digest;
-use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
+use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::ids::{ActorId, StandingGrantId};
 use gwr_core::refusal::StandingRefusal;
 use gwr_core::work_request::{ClockReading, RepositoryIdentity};
@@ -63,12 +63,12 @@ impl StandingTokenCodec {
         }
         let mut out = String::new();
         field(&mut out, TOKEN_PREFIX);
-        field(&mut out, &hex16(grant.id.as_bytes()));
-        field(&mut out, &hex16(grant.scope.actor.as_bytes()));
-        field(&mut out, act_tag(grant.scope.act));
-        field(&mut out, grant.scope.repository.as_str());
-        field(&mut out, &grant.scope.attempt_digest.to_hex());
-        field(&mut out, &grant.expires_at.0.to_string());
+        field(&mut out, &hex16(grant.id().as_bytes()));
+        field(&mut out, &hex16(grant.scope().actor.as_bytes()));
+        field(&mut out, act_tag(grant.scope().act));
+        field(&mut out, grant.scope().repository.as_str());
+        field(&mut out, &grant.scope().attempt_digest.to_hex());
+        field(&mut out, &grant.expires_at().0.to_string());
         out
     }
 
@@ -152,17 +152,16 @@ impl StandingTokenCodec {
             return Err(StandingRefusal::IntegrityFailure);
         }
 
-        let grant = StandingGrant {
-            id: StandingGrantId::from_bytes(grant_id),
-            scope: StandingScope {
+        let grant = StandingGrant::issue(
+            StandingGrantId::from_bytes(grant_id),
+            StandingScope {
                 actor: ActorId::from_bytes(actor),
                 act,
                 repository: RepositoryIdentity::new(repository),
                 attempt_digest: Sha256Digest::from_bytes(digest),
             },
-            expires_at: ClockReading(expires_at),
-            state: GrantState::Available,
-        };
+            ClockReading(expires_at),
+        );
         // Every accepted parse must re-encode to exactly the bytes that were
         // signed. This is what makes "the scope this token names" and "the
         // scope whose bytes carry the MAC" the same object by construction.

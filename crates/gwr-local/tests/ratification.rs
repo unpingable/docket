@@ -40,17 +40,16 @@ fn attempt(byte: u8) -> PreparedAttempt {
 }
 
 fn grant(att: &PreparedAttempt, act: StandingAct, actor: u8, expires: u64) -> StandingGrant {
-    StandingGrant {
-        id: StandingGrantId::from_bytes([3; 16]),
-        scope: StandingScope {
+    StandingGrant::issue(
+        StandingGrantId::from_bytes([3; 16]),
+        StandingScope {
             actor: ActorId::from_bytes([actor; 16]),
             act,
             repository: att.repository.clone(),
             attempt_digest: att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(expires),
-        state: GrantState::Available,
-    }
+        ClockReading(expires),
+    )
 }
 
 struct Fx {
@@ -92,7 +91,7 @@ fn happy_path_consumes_the_standing_use_exactly_once() {
     .unwrap();
     assert_eq!(receipt.attempt, f.att.attempt_id);
     let g = f.store.get_standing_grant(GRANT).unwrap();
-    assert!(matches!(g.state, GrantState::Consumed { .. }));
+    assert!(matches!(g.state(), GrantState::Consumed { .. }));
     let projected = f.store.get_attempt(f.att.attempt_id).unwrap();
     assert!(matches!(projected.state, AttemptState::Ratified { .. }));
 }
@@ -117,7 +116,7 @@ fn wrong_attempt_digest_refuses_and_consumes_nothing() {
         RatifyError::Bridge(rat_bridge::Refusal::DigestMismatch)
     );
     let g = f.store.get_standing_grant(GRANT).unwrap();
-    assert_eq!(g.state, GrantState::Available);
+    assert_eq!(*g.state(), GrantState::Available);
 }
 
 #[test]
@@ -252,8 +251,8 @@ fn tampered_token_fails_integrity() {
     let token = codec.issue(&g);
     // Round trip works.
     let verified = codec.verify(&token).unwrap();
-    assert_eq!(verified.id, g.id);
-    assert_eq!(verified.scope, g.scope);
+    assert_eq!(verified.id(), g.id());
+    assert_eq!(verified.scope(), g.scope());
     // Tamper with the expiry inside the payload. Fields are length-prefixed,
     // so a longer value carries its own new prefix.
     let tampered = token.replace("4:1000|", "6:999999|");
@@ -283,21 +282,31 @@ fn tampered_token_fails_integrity() {
 fn token_scope_survives_separator_injection() {
     let codec = StandingTokenCodec::new([7; 32]);
     let att = attempt(9);
-    let mut g = grant(&att, StandingAct::Ratify, 4, 1000);
-    // The exact witness shape from the blind review.
-    g.scope.repository = RepositoryIdentity::new(format!(
-        "/repo|{}|99999999999999",
-        Sha256Digest::of_bytes(b"attacker digest").to_hex()
-    ));
+    // The exact witness shape from the blind review, issued as a scope rather
+    // than edited in afterwards.
+    let g = StandingGrant::issue(
+        StandingGrantId::from_bytes([3; 16]),
+        StandingScope {
+            actor: ActorId::from_bytes([4; 16]),
+            act: StandingAct::Ratify,
+            repository: RepositoryIdentity::new(format!(
+                "/repo|{}|99999999999999",
+                Sha256Digest::of_bytes(b"attacker digest").to_hex()
+            )),
+            attempt_digest: att.prepared_attempt_digest,
+        },
+        ClockReading(1000),
+    );
     let token = codec.issue(&g);
     let verified = codec.verify(&token).unwrap();
     assert_eq!(
-        verified.scope.repository, g.scope.repository,
+        verified.scope().repository,
+        g.scope().repository,
         "repository was re-partitioned by the parser"
     );
-    assert_eq!(verified.scope.attempt_digest, g.scope.attempt_digest);
-    assert_eq!(verified.expires_at, g.expires_at);
-    assert_eq!(verified.scope, g.scope);
+    assert_eq!(verified.scope().attempt_digest, g.scope().attempt_digest);
+    assert_eq!(verified.expires_at(), g.expires_at());
+    assert_eq!(verified.scope(), g.scope());
 }
 
 /// Every field can carry the delimiter characters without changing the scope.
@@ -314,11 +323,23 @@ fn token_round_trips_awkward_repository_paths() {
         "",
         "/日本語",
     ] {
-        let mut g = grant(&att, StandingAct::Ratify, 4, 1000);
-        g.scope.repository = RepositoryIdentity::new(repo);
+        let g = StandingGrant::issue(
+            StandingGrantId::from_bytes([3; 16]),
+            StandingScope {
+                actor: ActorId::from_bytes([4; 16]),
+                act: StandingAct::Ratify,
+                repository: RepositoryIdentity::new(repo),
+                attempt_digest: att.prepared_attempt_digest,
+            },
+            ClockReading(1000),
+        );
         let verified = codec.verify(&codec.issue(&g)).unwrap();
-        assert_eq!(verified.scope, g.scope, "scope changed for repo {repo:?}");
-        assert_eq!(verified.expires_at, g.expires_at);
+        assert_eq!(
+            verified.scope(),
+            g.scope(),
+            "scope changed for repo {repo:?}"
+        );
+        assert_eq!(verified.expires_at(), g.expires_at());
     }
 }
 

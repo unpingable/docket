@@ -6,7 +6,7 @@
 
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::evidence::Claim;
-use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
+use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::*;
 use gwr_core::lifecycle::AttemptState;
@@ -333,22 +333,21 @@ fn run(args: &[String]) -> Result<(), String> {
             let ttl: u64 = flag(args, "--ttl-ms")
                 .map(|s| s.parse().unwrap_or(3_600_000))
                 .unwrap_or(3_600_000);
-            let grant = StandingGrant {
-                id: StandingGrantId::from_bytes(st.ids.fresh16()),
-                scope: StandingScope {
+            let grant = StandingGrant::issue(
+                StandingGrantId::from_bytes(st.ids.fresh16()),
+                StandingScope {
                     actor: actor_id(&need(args, "--actor")?),
                     act,
                     repository: projected.attempt.repository.clone(),
                     attempt_digest: projected.attempt.prepared_attempt_digest,
                 },
-                expires_at: ClockReading(st.clock.now().0 + ttl),
-                state: GrantState::Available,
-            };
+                ClockReading(st.clock.now().0 + ttl),
+            );
             st.store
                 .create_standing_grant(&grant)
                 .map_err(|e| format!("{e:?}"))?;
             let token = st.codec()?.issue(&grant);
-            println!("grant: {}", hex16s(grant.id.as_bytes()));
+            println!("grant: {}", hex16s(grant.id().as_bytes()));
             println!("token: {token}");
             Ok(())
         }
@@ -367,7 +366,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let receipt = ratify(
                 &mut st.store,
                 attempt,
-                verified.id,
+                verified.id(),
                 actor_id(&need(args, "--actor")?),
                 digest,
                 basis,
@@ -388,7 +387,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut ids = HashChainIds::new();
             let claim = reserve(&mut st.store, attempt, ttl, &clock, &mut ids)
                 .map_err(|e| format!("{e:?}"))?;
-            println!("reservation: {}", hex16s(claim.id.as_bytes()));
+            println!("reservation: {}", hex16s(claim.id().as_bytes()));
             Ok(())
         }
         ["dispatch"] => {
@@ -514,7 +513,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 &mut st.store,
                 attempt,
                 fact,
-                verified.id,
+                verified.id(),
                 actor_id(&need(args, "--actor")?),
                 &mut evidence,
                 &clock,

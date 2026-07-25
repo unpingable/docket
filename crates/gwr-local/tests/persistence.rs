@@ -42,29 +42,27 @@ fn attempt(byte: u8) -> PreparedAttempt {
 }
 
 fn grant_for(att: &PreparedAttempt, byte: u8) -> StandingGrant {
-    StandingGrant {
-        id: StandingGrantId::from_bytes([byte; 16]),
-        scope: StandingScope {
+    StandingGrant::issue(
+        StandingGrantId::from_bytes([byte; 16]),
+        StandingScope {
             actor: ActorId::from_bytes([4; 16]),
             act: StandingAct::Ratify,
             repository: att.repository.clone(),
             attempt_digest: att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(1000),
-        state: GrantState::Available,
-    }
+        ClockReading(1000),
+    )
 }
 
 fn claim_for(att: &PreparedAttempt, byte: u8) -> ReservationClaim {
-    ReservationClaim {
-        id: ReservationId::from_bytes([byte; 16]),
-        repository: att.repository.clone(),
-        target_ref: att.effect.target_ref.clone(),
-        basis: att.basis.clone(),
-        attempt: att.attempt_id,
-        expires_at: ClockReading(1000),
-        state: ClaimState::Active,
-    }
+    ReservationClaim::claim(
+        ReservationId::from_bytes([byte; 16]),
+        att.repository.clone(),
+        att.effect.target_ref.clone(),
+        att.basis.clone(),
+        att.attempt_id,
+        ClockReading(1000),
+    )
 }
 
 /// Drive an attempt admission → ratified → reserved → dispatching. Returns the
@@ -91,7 +89,7 @@ fn drive_to_dispatching(store: &mut SqliteStore, att: &PreparedAttempt) -> Attem
         .unwrap();
     let standing_use = StandingUse {
         id: StandingUseId::from_bytes([6; 16]),
-        grant: grant.id,
+        grant: grant.id(),
         used_at: ClockReading(10),
     };
     store
@@ -100,7 +98,7 @@ fn drive_to_dispatching(store: &mut SqliteStore, att: &PreparedAttempt) -> Attem
 
     let claim = claim_for(att, 7);
     store.create_reservation(&claim, ClockReading(11)).unwrap();
-    let reserved = ratified.reserve(claim.id).unwrap();
+    let reserved = ratified.reserve(claim.id()).unwrap();
     store
         .record_reserved(1, att.attempt_id, &reserved, ClockReading(11))
         .unwrap();
@@ -225,7 +223,7 @@ fn stale_optimistic_writes_fail() {
         .unwrap();
     let standing_use = StandingUse {
         id: StandingUseId::from_bytes([6; 16]),
-        grant: grant.id,
+        grant: grant.id(),
         used_at: ClockReading(10),
     };
     let err = store
@@ -239,8 +237,8 @@ fn stale_optimistic_writes_fail() {
         }
     );
     // The refused write consumed nothing: the grant is still available.
-    let g = store.get_standing_grant(grant.id).unwrap();
-    assert_eq!(g.state, GrantState::Available);
+    let g = store.get_standing_grant(grant.id()).unwrap();
+    assert_eq!(*g.state(), GrantState::Available);
 }
 
 #[test]
@@ -335,15 +333,15 @@ fn standing_and_reservation_uses_are_single_use() {
     let grant = store
         .get_standing_grant(StandingGrantId::from_bytes([3; 16]))
         .unwrap();
-    assert!(matches!(grant.state, GrantState::Consumed { .. }));
+    assert!(matches!(grant.state(), GrantState::Consumed { .. }));
     let reservation = store
         .get_reservation(ReservationId::from_bytes([7; 16]))
         .unwrap();
-    assert!(matches!(reservation.state, ClaimState::Consumed { .. }));
+    assert!(matches!(reservation.state(), ClaimState::Consumed { .. }));
     // Direct replay at the store layer refuses and consumes nothing further.
     let fresh_use = StandingUse {
         id: StandingUseId::from_bytes([99; 16]),
-        grant: grant.id,
+        grant: grant.id(),
         used_at: ClockReading(60),
     };
     let rat_receipt = gwr_core::receipt::RatificationReceipt {
@@ -422,4 +420,101 @@ fn historical_records_cannot_be_rewritten() {
         kinds,
         vec!["admitted", "ratified", "reserved", "dispatching"]
     );
+}
+
+/// V6: the store validates the transition it is asked to persist. The blind
+/// review reached `Committed` with no ratification, reservation, or dispatch
+/// row, then regressed to `Prepared` — through the port, bypassing the
+/// lifecycle entirely.
+#[test]
+fn the_store_refuses_illegal_transitions() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let att = attempt(9);
+    store.admit_attempt(&att).unwrap();
+
+    // Prepared -> Committed, skipping everything.
+    let forged_committed = AttemptState::Committed {
+        ratification: gwr_core::lifecycle::RatificationRef {
+            ratification: RatificationId::from_bytes([1; 16]),
+            prepared_attempt_digest: att.prepared_attempt_digest,
+            standing_use: StandingUseId::from_bytes([2; 16]),
+        },
+        reservation: gwr_core::lifecycle::ReservationRef {
+            reservation: ReservationId::from_bytes([3; 16]),
+            reservation_use: ReservationUseId::from_bytes([4; 16]),
+        },
+        dispatch: gwr_core::lifecycle::DispatchRef {
+            dispatch: DispatchId::from_bytes([5; 16]),
+        },
+    };
+    let commitment = Commitment {
+        attempt: att.attempt_id,
+        dispatch: DispatchId::from_bytes([5; 16]),
+        target_ref: att.effect.target_ref.clone(),
+        previous_value: att.basis.clone(),
+        result_commit: CommitHash::new("deadbeef"),
+        journal_digest: Sha256Digest::of_bytes(b"forged"),
+        committed_at: ClockReading(10),
+    };
+    let err = store
+        .record_commitment(0, &commitment, &forged_committed)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::IllegalTransition {
+            from: "prepared".into(),
+            to: "committed".into()
+        }
+    );
+    // Nothing moved, and no commitment was written.
+    let projected = store.get_attempt(att.attempt_id).unwrap();
+    assert_eq!(projected.state, AttemptState::Prepared);
+    assert_eq!(projected.version, 0);
+    assert_eq!(
+        store.get_commitment(att.attempt_id).unwrap_err(),
+        StoreError::NotFound
+    );
+
+    // And a legal forward step still works, so the gate is a successor check
+    // rather than a blanket refusal.
+    let grant = grant_for(&att, 3);
+    store.create_standing_grant(&grant).unwrap();
+    let rat = rat_bridge::cross(rat_bridge::Input {
+        version: 1,
+        grant: &grant,
+        actor: ActorId::from_bytes([4; 16]),
+        attempt: &att,
+        ratified_digest: att.prepared_attempt_digest,
+        ratified_basis: att.basis.clone(),
+        now: ClockReading(10),
+        new_ratification: RatificationId::from_bytes([5; 16]),
+        new_use: StandingUseId::from_bytes([6; 16]),
+    })
+    .unwrap();
+    let ratified = AttemptState::Prepared
+        .ratify(rat.ratification_ref.clone())
+        .unwrap();
+    let standing_use = StandingUse {
+        id: StandingUseId::from_bytes([6; 16]),
+        grant: grant.id(),
+        used_at: ClockReading(10),
+    };
+    store
+        .record_ratification(0, &rat.receipt, &ratified, &grant, &standing_use)
+        .unwrap();
+
+    // Ratified -> Prepared: a regression, refused.
+    let err = store
+        .record_reserved(1, att.attempt_id, &AttemptState::Prepared, ClockReading(11))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        StoreError::IllegalTransition {
+            from: "ratified".into(),
+            to: "prepared".into()
+        }
+    );
+    let timeline = store.timeline(att.attempt_id).unwrap();
+    let kinds: Vec<&str> = timeline.iter().map(|t| t.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["admitted", "ratified"]);
 }

@@ -3,7 +3,7 @@
 //! process termination.
 
 use gwr_core::digest::Sha256Digest;
-use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
+use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::*;
 use gwr_core::lifecycle::AttemptState;
@@ -124,23 +124,22 @@ fn fixture(name: &str, patch_override: Option<Vec<u8>>) -> Fx {
     let mut store = SqliteStore::open(&repo.join(".gwr-state.sqlite")).unwrap();
     let mut ids = HashChainIds::new();
     store.admit_attempt(&att).unwrap();
-    let grant = StandingGrant {
-        id: StandingGrantId::from_bytes([3; 16]),
-        scope: StandingScope {
+    let grant = StandingGrant::issue(
+        StandingGrantId::from_bytes([3; 16]),
+        StandingScope {
             actor: ActorId::from_bytes([4; 16]),
             act: StandingAct::Ratify,
             repository: att.repository.clone(),
             attempt_digest: att.prepared_attempt_digest,
         },
-        expires_at: ClockReading(1_000_000),
-        state: GrantState::Available,
-    };
+        ClockReading(1_000_000),
+    );
     store.create_standing_grant(&grant).unwrap();
     let clock = FixedClock(ClockReading(10));
     ratify(
         &mut store,
         att.attempt_id,
-        grant.id,
+        grant.id(),
         ActorId::from_bytes([4; 16]),
         att.prepared_attempt_digest,
         att.basis.clone(),

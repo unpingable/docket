@@ -88,7 +88,7 @@ pub fn cross(input: Input<'_>) -> Result<Output, Refusal> {
         created_at: input.now,
     };
     let reservation_ref = ReservationRef {
-        reservation: input.claim.id,
+        reservation: input.claim.id(),
         reservation_use: reservation_use.id,
     };
     let dispatch_ref = DispatchRef {
