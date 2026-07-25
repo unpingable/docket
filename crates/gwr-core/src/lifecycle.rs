@@ -64,6 +64,17 @@ pub enum RecoveryVerdict {
     ProvenNotCommitted,
 }
 
+impl RecoveryVerdict {
+    /// The one tag vocabulary, shared by the store encoding and every read
+    /// surface.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::CommittedViaRecovery => "committed_via_recovery",
+            Self::ProvenNotCommitted => "proven_not_committed",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AttemptState {
     Prepared,

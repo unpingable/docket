@@ -763,7 +763,7 @@ fn unsafe_refusal_reliance_is_rejected() {
     // reliance refusal, recorded, and the source refusal is not mutated.
     let before = fx.store.get_attempt(fx.att.attempt_id).unwrap();
     fx.store
-        .record_reliance_refusal(fx.att.attempt_id, &RelianceRefusal::NoBridge, clock.0)
+        .record_reliance_refusal(fx.att.attempt_id, &RelianceRefusal::NoBridge, None, clock.0)
         .unwrap();
     let after = fx.store.get_attempt(fx.att.attempt_id).unwrap();
     assert_eq!(before.state, after.state);
@@ -863,7 +863,7 @@ fn unsupported_bridge_version_is_rejected() {
     );
     // The refusal is recordable as a first-class reliance record.
     fx.store
-        .record_reliance_refusal(fx.att.attempt_id, &refusal, ClockReading(40))
+        .record_reliance_refusal(fx.att.attempt_id, &refusal, None, ClockReading(40))
         .unwrap();
 }
 

@@ -11,7 +11,7 @@ use gwr_core::lifecycle::{
 use gwr_core::preparation::PreparationEnd;
 use gwr_core::reconciliation::ObligationKind;
 use gwr_core::recovery::FactSource;
-use gwr_core::refusal::{DispatchRefusalGround, ObservationRefusal, RelianceRefusal};
+use gwr_core::refusal::{DispatchRefusalGround, RelianceRefusal};
 use gwr_core::work_request::{CommitHash, RefName, RepositoryIdentity};
 use gwr_runtime::ports::store::StoreError;
 
@@ -103,24 +103,48 @@ impl_from16!(
     ActorId,
 );
 
-fn hex_bytes(hex: &str, out: &mut [u8]) {
-    assert_eq!(hex.len(), out.len() * 2, "corrupt hex column: {hex}");
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(chunk).expect("corrupt hex column");
-        out[i] = u8::from_str_radix(s, 16).expect("corrupt hex column");
+/// A persisted column that failed to decode. Carried through `rusqlite`'s
+/// row-mapping error channel and surfaced as `StoreError::Corrupt` — a typed
+/// read error, never a panic and never a defaulted value.
+#[derive(Debug)]
+pub struct CorruptColumn(pub String);
+
+impl std::fmt::Display for CorruptColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "corrupt persisted column: {}", self.0)
     }
 }
 
-pub fn parse_id16<T: FromBytes16>(hex: &str) -> T {
-    let mut bytes = [0u8; 16];
-    hex_bytes(hex, &mut bytes);
-    T::from16(bytes)
+impl std::error::Error for CorruptColumn {}
+
+/// Wrap a decode failure so it can cross a `rusqlite` row-mapping closure.
+pub fn sql_corrupt(e: CorruptColumn) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
 }
 
-pub fn parse_digest(hex: &str) -> Sha256Digest {
+fn hex_bytes(hex: &str, out: &mut [u8]) -> Result<(), CorruptColumn> {
+    if hex.len() != out.len() * 2 || !hex.is_ascii() {
+        return Err(CorruptColumn(format!("bad hex length or bytes: {hex:?}")));
+    }
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk)
+            .map_err(|_| CorruptColumn(format!("bad hex bytes: {hex:?}")))?;
+        out[i] = u8::from_str_radix(s, 16)
+            .map_err(|_| CorruptColumn(format!("bad hex digit in {hex:?}")))?;
+    }
+    Ok(())
+}
+
+pub fn parse_id16<T: FromBytes16>(hex: &str) -> Result<T, CorruptColumn> {
+    let mut bytes = [0u8; 16];
+    hex_bytes(hex, &mut bytes)?;
+    Ok(T::from16(bytes))
+}
+
+pub fn parse_digest(hex: &str) -> Result<Sha256Digest, CorruptColumn> {
     let mut bytes = [0u8; 32];
-    hex_bytes(hex, &mut bytes);
-    Sha256Digest::from_bytes(bytes)
+    hex_bytes(hex, &mut bytes)?;
+    Ok(Sha256Digest::from_bytes(bytes))
 }
 
 pub fn repo(s: &str) -> RepositoryIdentity {
@@ -156,92 +180,71 @@ pub fn parse_end_tag(tag: &str) -> Result<PreparationEnd, StoreError> {
     })
 }
 
+// Tag vocabularies live on the core types; the store encodes with them and
+// refuses to decode anything outside them.
+
 pub fn act_tag(act: StandingAct) -> &'static str {
-    match act {
-        StandingAct::Ratify => "ratify",
-        StandingAct::ResolveRecovery => "resolve_recovery",
-    }
+    act.tag()
 }
 
-pub fn parse_act_tag(tag: &str) -> StandingAct {
-    match tag {
-        "ratify" => StandingAct::Ratify,
-        "resolve_recovery" => StandingAct::ResolveRecovery,
-        other => panic!("unknown act tag {other}"),
-    }
+pub fn parse_act_tag(tag: &str) -> Result<StandingAct, CorruptColumn> {
+    StandingAct::from_tag(tag).ok_or_else(|| CorruptColumn(format!("unknown act tag {tag:?}")))
 }
 
 pub fn ground_tag(ground: DispatchRefusalGround) -> &'static str {
-    match ground {
-        DispatchRefusalGround::BasisMoved => "basis_moved",
-        DispatchRefusalGround::ForbiddenPath => "forbidden_path",
-        DispatchRefusalGround::InvalidPatch => "invalid_patch",
-        DispatchRefusalGround::EnvelopeMismatch => "envelope_mismatch",
-    }
+    ground.tag()
 }
 
 pub fn parse_ground_tag(tag: &str) -> Result<DispatchRefusalGround, StoreError> {
-    Ok(match tag {
-        "basis_moved" => DispatchRefusalGround::BasisMoved,
-        "forbidden_path" => DispatchRefusalGround::ForbiddenPath,
-        "invalid_patch" => DispatchRefusalGround::InvalidPatch,
-        "envelope_mismatch" => DispatchRefusalGround::EnvelopeMismatch,
-        other => return Err(StoreError::Backend(format!("unknown ground tag {other}"))),
-    })
+    DispatchRefusalGround::from_tag(tag)
+        .ok_or_else(|| StoreError::Corrupt(format!("unknown ground tag {tag:?}")))
 }
 
 pub fn verdict_tag(verdict: RecoveryVerdict) -> &'static str {
-    match verdict {
-        RecoveryVerdict::CommittedViaRecovery => "committed_via_recovery",
-        RecoveryVerdict::ProvenNotCommitted => "proven_not_committed",
-    }
+    verdict.tag()
+}
+
+pub fn parse_verdict_tag(tag: &str) -> Result<RecoveryVerdict, CorruptColumn> {
+    Ok(match tag {
+        "committed_via_recovery" => RecoveryVerdict::CommittedViaRecovery,
+        "proven_not_committed" => RecoveryVerdict::ProvenNotCommitted,
+        other => return Err(CorruptColumn(format!("unknown verdict tag {other:?}"))),
+    })
 }
 
 pub fn obligation_tag(kind: ObligationKind) -> &'static str {
-    match kind {
-        ObligationKind::HumanReviewBeforeMerge => "human_review_before_merge",
-    }
+    kind.tag()
 }
 
-pub fn parse_obligation_tag(tag: &str) -> ObligationKind {
-    match tag {
-        "human_review_before_merge" => ObligationKind::HumanReviewBeforeMerge,
-        other => panic!("unknown obligation tag {other}"),
-    }
+pub fn parse_obligation_tag(tag: &str) -> Result<ObligationKind, CorruptColumn> {
+    ObligationKind::from_tag(tag)
+        .ok_or_else(|| CorruptColumn(format!("unknown obligation tag {tag:?}")))
 }
 
 pub fn source_tags(source: &FactSource) -> (&'static str, Option<String>) {
-    match source {
-        FactSource::BrokerJournal => ("broker_journal", None),
-        FactSource::RefInspection => ("ref_inspection", None),
-        FactSource::OperatorSupplied(detail) => ("operator_supplied", Some(detail.clone())),
-    }
+    source.tags()
 }
 
-pub fn parse_source(kind: &str, detail: Option<String>) -> FactSource {
-    match kind {
-        "broker_journal" => FactSource::BrokerJournal,
-        "ref_inspection" => FactSource::RefInspection,
-        "operator_supplied" => FactSource::OperatorSupplied(detail.unwrap_or_default()),
-        other => panic!("unknown fact source {other}"),
-    }
+pub fn parse_source(kind: &str, detail: Option<String>) -> Result<FactSource, CorruptColumn> {
+    FactSource::from_tags(kind, detail)
+        .ok_or_else(|| CorruptColumn(format!("unknown fact source {kind:?}")))
 }
 
 pub fn reliance_refusal_tags(refusal: &RelianceRefusal) -> (&'static str, Option<String>) {
-    match refusal {
-        RelianceRefusal::NoBridge => ("no_bridge", None),
-        RelianceRefusal::BridgeVersionUnsupported { presented } => {
-            ("bridge_version_unsupported", Some(presented.to_string()))
-        }
-        RelianceRefusal::ClaimNotAdmissible => ("claim_not_admissible", None),
-        RelianceRefusal::OutOfScope => ("out_of_scope", None),
-        RelianceRefusal::Observation(ObservationRefusal::ScopeMismatch) => {
-            ("observation_scope_mismatch", None)
-        }
-        RelianceRefusal::Observation(ObservationRefusal::ObservationFailed) => {
-            ("observation_failed", None)
-        }
-    }
+    refusal.tags()
+}
+
+pub fn parse_reliance_refusal(
+    kind: &str,
+    detail: Option<&str>,
+) -> Result<RelianceRefusal, CorruptColumn> {
+    RelianceRefusal::from_tags(kind, detail)
+        .ok_or_else(|| CorruptColumn(format!("unknown reliance refusal kind {kind:?}")))
+}
+
+pub fn parse_claim_tag(tag: &str) -> Result<gwr_core::domain::evidence::Claim, CorruptColumn> {
+    gwr_core::domain::evidence::Claim::from_tag(tag)
+        .ok_or_else(|| CorruptColumn(format!("unknown claim tag {tag:?}")))
 }
 
 /// Nullable projection columns, as read.
@@ -262,28 +265,29 @@ pub fn reconstruct_state(
     cols: &ProjCols,
     prepared_digest: &Sha256Digest,
 ) -> Result<AttemptState, StoreError> {
-    let corrupt = || StoreError::Backend(format!("projection columns incomplete for {tag}"));
+    let corrupt = || StoreError::Corrupt(format!("projection columns incomplete for {tag}"));
+    let bad = |e: CorruptColumn| StoreError::Corrupt(e.to_string());
     let rat = || -> Result<RatificationRef, StoreError> {
         Ok(RatificationRef {
-            ratification: parse_id16(cols.rat_id.as_ref().ok_or_else(corrupt)?),
+            ratification: parse_id16(cols.rat_id.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
             prepared_attempt_digest: *prepared_digest,
-            standing_use: parse_id16(cols.rat_use.as_ref().ok_or_else(corrupt)?),
+            standing_use: parse_id16(cols.rat_use.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
         })
     };
     let rsv = || -> Result<ReservationRef, StoreError> {
         Ok(ReservationRef {
-            reservation: parse_id16(cols.rsv_id.as_ref().ok_or_else(corrupt)?),
-            reservation_use: parse_id16(cols.rsv_use.as_ref().ok_or_else(corrupt)?),
+            reservation: parse_id16(cols.rsv_id.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
+            reservation_use: parse_id16(cols.rsv_use.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
         })
     };
     let dsp = || -> Result<DispatchRef, StoreError> {
         Ok(DispatchRef {
-            dispatch: parse_id16(cols.dispatch.as_ref().ok_or_else(corrupt)?),
+            dispatch: parse_id16(cols.dispatch.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
         })
     };
     let res = || -> Result<RecoveryResolutionRef, StoreError> {
         Ok(RecoveryResolutionRef {
-            resolution: parse_id16(cols.resolution.as_ref().ok_or_else(corrupt)?),
+            resolution: parse_id16(cols.resolution.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
         })
     };
     Ok(match tag {
@@ -293,7 +297,7 @@ pub fn reconstruct_state(
         },
         "reserved" => AttemptState::Reserved {
             ratification: rat()?,
-            reservation: parse_id16(cols.rsv_id.as_ref().ok_or_else(corrupt)?),
+            reservation: parse_id16(cols.rsv_id.as_ref().ok_or_else(corrupt)?).map_err(bad)?,
         },
         "dispatching" => AttemptState::Dispatching {
             ratification: rat()?,
@@ -328,7 +332,7 @@ pub fn reconstruct_state(
             dispatch: dsp()?,
             resolution: res()?,
         },
-        other => return Err(StoreError::Backend(format!("unknown state tag {other}"))),
+        other => return Err(StoreError::Corrupt(format!("unknown state tag {other}"))),
     })
 }
 

@@ -274,14 +274,21 @@ fn complete_happy_path_through_the_cli() {
     assert!(json.contains(&attempt));
     assert!(human.contains("committed"));
     assert!(json.contains("\"state\":\"committed\""));
+    // The canonical dossier: both surfaces are rendered from one read model,
+    // and both state the same facts (interface changed deliberately post-pilot;
+    // the dossier exposes goal, scope, digests, and evidence, not just state).
     let human = docket(&state, &["docket", "show", "--attempt", &attempt]);
     let json = docket(&state, &["docket", "show", "--attempt", &attempt, "--json"]);
     for fact in ["committed", &attempt] {
         assert!(human.contains(fact), "human output missing {fact}");
         assert!(json.contains(fact), "json output missing {fact}");
     }
-    assert!(human.contains("residual_obligation HumanReviewBeforeMerge"));
-    assert!(json.contains("\"residual_obligations\":1"));
+    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v1\""));
+    assert!(human.contains("human_review_before_merge"), "{human}");
+    assert!(
+        json.contains("\"kind\":\"human_review_before_merge\""),
+        "{json}"
+    );
 
     let _ = std::fs::remove_dir_all(&repo);
 }

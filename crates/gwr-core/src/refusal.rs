@@ -48,6 +48,29 @@ pub enum DispatchRefusalGround {
     EnvelopeMismatch,
 }
 
+impl DispatchRefusalGround {
+    /// The one tag vocabulary, shared by the store encoding and every read
+    /// surface.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::BasisMoved => "basis_moved",
+            Self::ForbiddenPath => "forbidden_path",
+            Self::InvalidPatch => "invalid_patch",
+            Self::EnvelopeMismatch => "envelope_mismatch",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "basis_moved" => Self::BasisMoved,
+            "forbidden_path" => Self::ForbiddenPath,
+            "invalid_patch" => Self::InvalidPatch,
+            "envelope_mismatch" => Self::EnvelopeMismatch,
+            _ => return None,
+        })
+    }
+}
+
 /// Refusals of pure lifecycle transitions. An invalid transition mutates nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TransitionRefusal {
@@ -88,6 +111,41 @@ pub enum RelianceRefusal {
     /// The source record is outside the scope the bridge transports.
     OutOfScope,
     Observation(ObservationRefusal),
+}
+
+impl RelianceRefusal {
+    /// Stable kind tag plus optional detail, shared by the store encoding and
+    /// every read surface.
+    pub fn tags(&self) -> (&'static str, Option<String>) {
+        match self {
+            Self::NoBridge => ("no_bridge", None),
+            Self::BridgeVersionUnsupported { presented } => {
+                ("bridge_version_unsupported", Some(presented.to_string()))
+            }
+            Self::ClaimNotAdmissible => ("claim_not_admissible", None),
+            Self::OutOfScope => ("out_of_scope", None),
+            Self::Observation(ObservationRefusal::ScopeMismatch) => {
+                ("observation_scope_mismatch", None)
+            }
+            Self::Observation(ObservationRefusal::ObservationFailed) => {
+                ("observation_failed", None)
+            }
+        }
+    }
+
+    pub fn from_tags(kind: &str, detail: Option<&str>) -> Option<Self> {
+        Some(match kind {
+            "no_bridge" => Self::NoBridge,
+            "bridge_version_unsupported" => Self::BridgeVersionUnsupported {
+                presented: detail?.parse().ok()?,
+            },
+            "claim_not_admissible" => Self::ClaimNotAdmissible,
+            "out_of_scope" => Self::OutOfScope,
+            "observation_scope_mismatch" => Self::Observation(ObservationRefusal::ScopeMismatch),
+            "observation_failed" => Self::Observation(ObservationRefusal::ObservationFailed),
+            _ => return None,
+        })
+    }
 }
 
 /// Refusals from recovery resolution.

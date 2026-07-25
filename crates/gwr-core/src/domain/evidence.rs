@@ -25,6 +25,34 @@ pub enum Claim {
     WorkMayBeClosed,
 }
 
+impl Claim {
+    /// The one claim vocabulary, shared by the CLI, the store encoding, and the
+    /// read surfaces. A claim that round-trips through persistence must come
+    /// back as the same claim.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::ExactResultCommitProducedAndCommandExitedZero => "effect-and-command",
+            Self::PatchIsCorrect => "patch-correct",
+            Self::TaskIsComplete => "task-complete",
+            Self::SafeToMerge => "safe-to-merge",
+            Self::ObligationDischarged => "obligation-discharged",
+            Self::WorkMayBeClosed => "work-closed",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "effect-and-command" => Self::ExactResultCommitProducedAndCommandExitedZero,
+            "patch-correct" => Self::PatchIsCorrect,
+            "task-complete" => Self::TaskIsComplete,
+            "safe-to-merge" => Self::SafeToMerge,
+            "obligation-discharged" => Self::ObligationDischarged,
+            "work-closed" => Self::WorkMayBeClosed,
+            _ => return None,
+        })
+    }
+}
+
 /// Pure scope check: does this observation speak about this commitment at all?
 /// An observation of commit A supports no claim about commit B.
 pub fn observation_in_scope(

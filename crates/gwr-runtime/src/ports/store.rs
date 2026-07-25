@@ -41,6 +41,9 @@ pub enum StoreError {
         from: String,
         to: String,
     },
+    /// A persisted record failed to decode: a malformed column is a typed read
+    /// error, never a panic and never a defaulted value.
+    Corrupt(String),
     Backend(String),
 }
 
@@ -57,6 +60,27 @@ pub struct ProjectedAttempt {
 pub struct TimelineEntry {
     pub seq: u64,
     pub kind: String,
+    pub at: ClockReading,
+}
+
+/// What a reliance refusal was about: which observation, presented to which
+/// consumer, for which claim. Persisted with the refusal so a stored refusal
+/// can say what was refused for whom (finding N-5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelianceSubject {
+    pub observation: ObservationId,
+    pub consumer: String,
+    pub claim: gwr_core::domain::evidence::Claim,
+}
+
+/// A persisted reliance refusal as read back from the ledger. Rows written
+/// before the subject columns existed genuinely lack a subject; that absence is
+/// exposed as absence, never defaulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelianceRefusalRecord {
+    pub attempt: AttemptId,
+    pub refusal: RelianceRefusal,
+    pub subject: Option<RelianceSubject>,
     pub at: ClockReading,
 }
 
@@ -168,10 +192,14 @@ pub trait Store {
         result_commit: &CommitHash,
     ) -> Result<Option<AttemptId>, StoreError>;
     fn record_reliance_admission(&mut self, adm: &ReviewQueueAdmission) -> Result<(), StoreError>;
+    /// Record a reliance refusal with its subject where one exists. A refusal
+    /// produced outside any observation context (e.g. a missing-bridge
+    /// crossing) has no subject to record.
     fn record_reliance_refusal(
         &mut self,
         attempt: AttemptId,
         refusal: &RelianceRefusal,
+        subject: Option<&RelianceSubject>,
         at: ClockReading,
     ) -> Result<(), StoreError>;
     fn create_residual_obligation(&mut self, ob: &ResidualObligation) -> Result<(), StoreError>;
@@ -184,4 +212,34 @@ pub trait Store {
     // Projections for the operator.
     fn timeline(&mut self, attempt: AttemptId) -> Result<Vec<TimelineEntry>, StoreError>;
     fn list_attempts(&mut self) -> Result<Vec<AttemptId>, StoreError>;
+
+    // Read paths over ledger records the runtime already owns. These exist so
+    // the operator read surface can expose what was recorded; none of them
+    // manufactures a fact or mutates anything.
+    fn get_ratification(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<RatificationReceipt>, StoreError>;
+    fn get_standing_use(&mut self, id: StandingUseId) -> Result<Option<StandingUse>, StoreError>;
+    fn get_dispatch_refusal(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<DispatchRefusalRecord>, StoreError>;
+    fn get_recovery_facts(&mut self, attempt: AttemptId) -> Result<Vec<RecoveryFact>, StoreError>;
+    fn get_recovery_resolution(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<RecoveryResolution>, StoreError>;
+    fn get_reliance_admissions(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Vec<ReviewQueueAdmission>, StoreError>;
+    fn get_reliance_refusals(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Vec<RelianceRefusalRecord>, StoreError>;
+    fn get_reconciliation(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<Reconciliation>, StoreError>;
 }

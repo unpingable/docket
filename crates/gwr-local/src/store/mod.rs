@@ -17,17 +17,28 @@ use gwr_core::reconciliation::{Reconciliation, ResidualObligation};
 use gwr_core::recovery::{RecoveryFact, RecoveryResolution};
 use gwr_core::refusal::RelianceRefusal;
 use gwr_core::work_request::{ClockReading, WorkRequest};
-use gwr_runtime::ports::store::{ProjectedAttempt, Store, StoreError, TimelineEntry};
+use gwr_runtime::ports::store::{
+    ProjectedAttempt, RelianceRefusalRecord, RelianceSubject, Store, StoreError, TimelineEntry,
+};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
 
 const MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
+const MIGRATION_0002: &str = include_str!("../../migrations/0002_reliance_subject.sql");
 
 pub struct SqliteStore {
     conn: Connection,
 }
 
 fn backend(e: rusqlite::Error) -> StoreError {
+    // A decode failure raised inside a row-mapping closure travels through
+    // rusqlite's conversion-error channel; surface it as the typed corruption
+    // error rather than a generic backend failure.
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &e {
+        if let Some(corrupt) = source.downcast_ref::<CorruptColumn>() {
+            return StoreError::Corrupt(corrupt.to_string());
+        }
+    }
     StoreError::Backend(e.to_string())
 }
 
@@ -37,14 +48,40 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(backend)?;
-        conn.execute_batch(MIGRATION).map_err(backend)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
-        conn.execute_batch(MIGRATION).map_err(backend)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Apply migrations. 0001 is idempotent (`IF NOT EXISTS`); 0002 adds the
+    /// reliance-refusal subject columns and is applied only when a database
+    /// predates them, so a pre-0002 store (including the pilot's) opens
+    /// unchanged except for the added nullable columns.
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        conn.execute_batch(MIGRATION).map_err(backend)?;
+        let has_subject: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('reliance_refusal')
+                 WHERE name='observation'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if has_subject == 0 {
+            conn.execute_batch(MIGRATION_0002).map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    /// Raw SQL escape hatch for boundary tests that need to corrupt persisted
+    /// records. Test support only.
+    pub fn execute_raw_for_test(&mut self, sql: &str) -> Result<usize, StoreError> {
+        self.conn.execute(sql, []).map_err(backend)
     }
 
     fn tx(&mut self) -> Result<Transaction<'_>, StoreError> {
@@ -429,7 +466,7 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     Ok(WorkRequest {
-                        id: parse_id16(&r.get::<_, String>(0)?),
+                        id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                         repository: repo(&r.get::<_, String>(1)?),
                         target_ref: refname(&r.get::<_, String>(2)?),
                         goal: r.get(3)?,
@@ -477,8 +514,10 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     Ok((
-                        parse_id16::<PreparationRunId>(&r.get::<_, String>(0)?),
-                        parse_id16::<WorkRequestId>(&r.get::<_, String>(1)?),
+                        parse_id16::<PreparationRunId>(&r.get::<_, String>(0)?)
+                            .map_err(sql_corrupt)?,
+                        parse_id16::<WorkRequestId>(&r.get::<_, String>(1)?)
+                            .map_err(sql_corrupt)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
                     ))
@@ -570,9 +609,11 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     Ok(CandidateArtifact {
-                        id: parse_id16(&r.get::<_, String>(0)?),
-                        preparation_run: parse_id16(&r.get::<_, String>(1)?),
-                        content_digest: parse_digest(&r.get::<_, String>(2)?),
+                        id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        preparation_run: parse_id16(&r.get::<_, String>(1)?)
+                            .map_err(sql_corrupt)?,
+                        content_digest: parse_digest(&r.get::<_, String>(2)?)
+                            .map_err(sql_corrupt)?,
                         content_len: r.get::<_, i64>(3)? as u64,
                         ingested_at: ClockReading(r.get::<_, i64>(4)? as u64),
                     })
@@ -646,15 +687,16 @@ impl Store for SqliteStore {
                 |r| {
                     Ok(PreparedAttempt::admit(
                         id,
-                        parse_id16(&r.get::<_, String>(0)?),
-                        parse_id16(&r.get::<_, String>(1)?),
+                        parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        parse_id16(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
                         repo(&r.get::<_, String>(2)?),
                         commit(&r.get::<_, String>(3)?),
-                        parse_digest(&r.get::<_, String>(4)?),
+                        parse_digest(&r.get::<_, String>(4)?).map_err(sql_corrupt)?,
                         gwr_core::effect_spec::GitRefEffect {
                             target_ref: refname(&r.get::<_, String>(5)?),
                             expected_basis: commit(&r.get::<_, String>(6)?),
-                            patch_digest: parse_digest(&r.get::<_, String>(7)?),
+                            patch_digest: parse_digest(&r.get::<_, String>(7)?)
+                                .map_err(sql_corrupt)?,
                             allowed_paths: split_list(&r.get::<_, String>(8)?),
                         },
                         ObservationPlan {
@@ -709,7 +751,7 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT id FROM dispatch WHERE attempt=?1",
                 params![id16(id.as_bytes())],
-                |r| Ok(parse_id16::<DispatchId>(&r.get::<_, String>(0)?)),
+                |r| parse_id16::<DispatchId>(&r.get::<_, String>(0)?).map_err(sql_corrupt),
             )
             .optional()
             .map_err(backend)
@@ -724,14 +766,16 @@ impl Store for SqliteStore {
                 params![id16(id.as_bytes())],
                 |r| {
                     Ok(DispatchEnvelope {
-                        dispatch: parse_id16(&r.get::<_, String>(0)?),
+                        dispatch: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                         attempt: id,
-                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(1)?),
-                        reservation_use: parse_id16(&r.get::<_, String>(2)?),
+                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(1)?)
+                            .map_err(sql_corrupt)?,
+                        reservation_use: parse_id16(&r.get::<_, String>(2)?)
+                            .map_err(sql_corrupt)?,
                         repository: repo(&r.get::<_, String>(3)?),
                         target_ref: refname(&r.get::<_, String>(4)?),
                         expected_basis: commit(&r.get::<_, String>(5)?),
-                        patch_digest: parse_digest(&r.get::<_, String>(6)?),
+                        patch_digest: parse_digest(&r.get::<_, String>(6)?).map_err(sql_corrupt)?,
                         allowed_paths: split_list(&r.get::<_, String>(7)?),
                         created_at: ClockReading(r.get::<_, i64>(8)? as u64),
                     })
@@ -788,16 +832,17 @@ impl Store for SqliteStore {
                     Ok(StandingGrant::from_persisted(
                         id,
                         StandingScope {
-                            actor: parse_id16(&r.get::<_, String>(0)?),
-                            act: parse_act_tag(&r.get::<_, String>(1)?),
+                            actor: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                            act: parse_act_tag(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
                             repository: repo(&r.get::<_, String>(2)?),
-                            attempt_digest: parse_digest(&r.get::<_, String>(3)?),
+                            attempt_digest: parse_digest(&r.get::<_, String>(3)?)
+                                .map_err(sql_corrupt)?,
                         },
                         ClockReading(r.get::<_, i64>(4)? as u64),
                         match consumed {
                             None => GrantState::Available,
                             Some(u) => GrantState::Consumed {
-                                used_as: parse_id16(&u),
+                                used_as: parse_id16(&u).map_err(sql_corrupt)?,
                             },
                         },
                     ))
@@ -886,12 +931,12 @@ impl Store for SqliteStore {
                         repo(&r.get::<_, String>(0)?),
                         refname(&r.get::<_, String>(1)?),
                         commit(&r.get::<_, String>(2)?),
-                        parse_id16(&r.get::<_, String>(3)?),
+                        parse_id16(&r.get::<_, String>(3)?).map_err(sql_corrupt)?,
                         ClockReading(r.get::<_, i64>(4)? as u64),
                         match consumed {
                             None => ClaimState::Active,
                             Some(u) => ClaimState::Consumed {
-                                used_as: parse_id16(&u),
+                                used_as: parse_id16(&u).map_err(sql_corrupt)?,
                             },
                         },
                     ))
@@ -1184,19 +1229,22 @@ impl Store for SqliteStore {
                 |r| {
                     Ok(RecoveryFact {
                         id,
-                        attempt: parse_id16(&r.get::<_, String>(0)?),
-                        dispatch: parse_id16(&r.get::<_, String>(1)?),
-                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(2)?),
+                        attempt: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        dispatch: parse_id16(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
+                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(2)?)
+                            .map_err(sql_corrupt)?,
                         repository: repo(&r.get::<_, String>(3)?),
                         target_ref: refname(&r.get::<_, String>(4)?),
                         basis: commit(&r.get::<_, String>(5)?),
                         observed_ref: commit(&r.get::<_, String>(6)?),
                         expected_result_commit: r.get::<_, Option<String>>(7)?.map(|s| commit(&s)),
-                        journal_digest: parse_digest(&r.get::<_, String>(8)?),
+                        journal_digest: parse_digest(&r.get::<_, String>(8)?)
+                            .map_err(sql_corrupt)?,
                         source: parse_source(
                             &r.get::<_, String>(9)?,
                             r.get::<_, Option<String>>(10)?,
-                        ),
+                        )
+                        .map_err(sql_corrupt)?,
                         recorded_at: ClockReading(r.get::<_, i64>(11)? as u64),
                     })
                 },
@@ -1256,15 +1304,15 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map(params![id16(attempt.as_bytes())], |r| {
                 Ok(ObservationRecord {
-                    id: parse_id16(&r.get::<_, String>(0)?),
+                    id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                     attempt,
                     argv: split_list(&r.get::<_, String>(1)?),
                     working_directory_identity: r.get(2)?,
                     result_commit: commit(&r.get::<_, String>(3)?),
                     environment_description: r.get(4)?,
                     exit_status: r.get(5)?,
-                    stdout_digest: parse_digest(&r.get::<_, String>(6)?),
-                    stderr_digest: parse_digest(&r.get::<_, String>(7)?),
+                    stdout_digest: parse_digest(&r.get::<_, String>(6)?).map_err(sql_corrupt)?,
+                    stderr_digest: parse_digest(&r.get::<_, String>(7)?).map_err(sql_corrupt)?,
                     observed_at: ClockReading(r.get::<_, i64>(8)? as u64),
                 })
             })
@@ -1281,11 +1329,12 @@ impl Store for SqliteStore {
                 |r| {
                     Ok(Commitment {
                         attempt,
-                        dispatch: parse_id16(&r.get::<_, String>(0)?),
+                        dispatch: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                         target_ref: refname(&r.get::<_, String>(1)?),
                         previous_value: commit(&r.get::<_, String>(2)?),
                         result_commit: commit(&r.get::<_, String>(3)?),
-                        journal_digest: parse_digest(&r.get::<_, String>(4)?),
+                        journal_digest: parse_digest(&r.get::<_, String>(4)?)
+                            .map_err(sql_corrupt)?,
                         committed_at: ClockReading(r.get::<_, i64>(5)? as u64),
                     })
                 },
@@ -1304,10 +1353,11 @@ impl Store for SqliteStore {
                 |r| {
                     Ok(IndeterminateRecord {
                         attempt,
-                        dispatch: parse_id16(&r.get::<_, String>(0)?),
+                        dispatch: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                         last_journal_digest: r
                             .get::<_, Option<String>>(1)?
-                            .map(|d| parse_digest(&d)),
+                            .map(|d| parse_digest(&d).map_err(sql_corrupt))
+                            .transpose()?,
                         recorded_at: ClockReading(r.get::<_, i64>(2)? as u64),
                     })
                 },
@@ -1325,7 +1375,7 @@ impl Store for SqliteStore {
             .query_row(
                 "SELECT attempt FROM commitment WHERE result_commit=?1",
                 params![result_commit.as_str()],
-                |r| Ok(parse_id16::<AttemptId>(&r.get::<_, String>(0)?)),
+                |r| parse_id16::<AttemptId>(&r.get::<_, String>(0)?).map_err(sql_corrupt),
             )
             .optional()
             .map_err(backend)
@@ -1351,13 +1401,31 @@ impl Store for SqliteStore {
         &mut self,
         attempt: AttemptId,
         refusal: &RelianceRefusal,
+        subject: Option<&RelianceSubject>,
         at: ClockReading,
     ) -> Result<(), StoreError> {
         let (kind, detail) = reliance_refusal_tags(refusal);
+        let (observation, consumer, claim) = match subject {
+            Some(s) => (
+                Some(id16(s.observation.as_bytes())),
+                Some(s.consumer.clone()),
+                Some(s.claim.tag().to_string()),
+            ),
+            None => (None, None, None),
+        };
         self.conn
             .execute(
-                "INSERT INTO reliance_refusal (attempt, kind, detail, at) VALUES (?1,?2,?3,?4)",
-                params![id16(attempt.as_bytes()), kind, detail, at.0 as i64],
+                "INSERT INTO reliance_refusal (attempt, kind, detail, observation, consumer, \
+                 claim, at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    id16(attempt.as_bytes()),
+                    kind,
+                    detail,
+                    observation,
+                    consumer,
+                    claim,
+                    at.0 as i64
+                ],
             )
             .map_err(backend)?;
         Ok(())
@@ -1390,9 +1458,9 @@ impl Store for SqliteStore {
         let rows = stmt
             .query_map(params![id16(attempt.as_bytes())], |r| {
                 Ok(ResidualObligation {
-                    id: parse_id16(&r.get::<_, String>(0)?),
+                    id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
                     attempt,
-                    kind: parse_obligation_tag(&r.get::<_, String>(1)?),
+                    kind: parse_obligation_tag(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
                     recorded_at: ClockReading(r.get::<_, i64>(2)? as u64),
                 })
             })
@@ -1442,8 +1510,245 @@ impl Store for SqliteStore {
             .prepare("SELECT id FROM attempt ORDER BY admitted_at, id")
             .map_err(backend)?;
         let rows = stmt
-            .query_map([], |r| Ok(parse_id16::<AttemptId>(&r.get::<_, String>(0)?)))
+            .query_map([], |r| {
+                parse_id16::<AttemptId>(&r.get::<_, String>(0)?).map_err(sql_corrupt)
+            })
             .map_err(backend)?;
         rows.collect::<Result<_, _>>().map_err(backend)
+    }
+
+    fn get_ratification(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<RatificationReceipt>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, prepared_digest, actor, standing_use, at
+                 FROM ratification WHERE attempt=?1",
+                params![id16(attempt.as_bytes())],
+                |r| {
+                    Ok(RatificationReceipt {
+                        ratification: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        attempt,
+                        prepared_attempt_digest: parse_digest(&r.get::<_, String>(1)?)
+                            .map_err(sql_corrupt)?,
+                        actor: parse_id16(&r.get::<_, String>(2)?).map_err(sql_corrupt)?,
+                        standing_use: parse_id16(&r.get::<_, String>(3)?).map_err(sql_corrupt)?,
+                        clock_reading: ClockReading(r.get::<_, i64>(4)? as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn get_standing_use(&mut self, id: StandingUseId) -> Result<Option<StandingUse>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT grant_id, used_at FROM standing_use WHERE id=?1",
+                params![id16(id.as_bytes())],
+                |r| {
+                    Ok(StandingUse {
+                        id,
+                        grant: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        used_at: ClockReading(r.get::<_, i64>(1)? as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn get_dispatch_refusal(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<DispatchRefusalRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT dispatch, ground, journal_digest, at FROM dispatch_refusal
+                 WHERE attempt=?1",
+                params![id16(attempt.as_bytes())],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(backend)?
+            .map(|(dispatch, ground, journal, at)| {
+                Ok(DispatchRefusalRecord {
+                    attempt,
+                    dispatch: parse_id16(&dispatch)
+                        .map_err(|e| StoreError::Corrupt(e.to_string()))?,
+                    ground: parse_ground_tag(&ground)?,
+                    journal_digest: parse_digest(&journal)
+                        .map_err(|e| StoreError::Corrupt(e.to_string()))?,
+                    refused_at: ClockReading(at as u64),
+                })
+            })
+            .transpose()
+    }
+
+    fn get_recovery_facts(&mut self, attempt: AttemptId) -> Result<Vec<RecoveryFact>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, dispatch, prepared_digest, repository, target_ref, basis,
+                        observed_ref, expected_result, journal_digest, source_kind,
+                        source_detail, recorded_at
+                 FROM recovery_fact WHERE attempt=?1 ORDER BY recorded_at, id",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![id16(attempt.as_bytes())], |r| {
+                Ok(RecoveryFact {
+                    id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                    attempt,
+                    dispatch: parse_id16(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
+                    prepared_attempt_digest: parse_digest(&r.get::<_, String>(2)?)
+                        .map_err(sql_corrupt)?,
+                    repository: repo(&r.get::<_, String>(3)?),
+                    target_ref: refname(&r.get::<_, String>(4)?),
+                    basis: commit(&r.get::<_, String>(5)?),
+                    observed_ref: commit(&r.get::<_, String>(6)?),
+                    expected_result_commit: r.get::<_, Option<String>>(7)?.map(|s| commit(&s)),
+                    journal_digest: parse_digest(&r.get::<_, String>(8)?).map_err(sql_corrupt)?,
+                    source: parse_source(&r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?)
+                        .map_err(sql_corrupt)?,
+                    recorded_at: ClockReading(r.get::<_, i64>(11)? as u64),
+                })
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)
+    }
+
+    fn get_recovery_resolution(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<RecoveryResolution>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, dispatch, fact, verdict, standing_use, at
+                 FROM recovery_resolution WHERE attempt=?1",
+                params![id16(attempt.as_bytes())],
+                |r| {
+                    Ok(RecoveryResolution {
+                        id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                        attempt,
+                        dispatch: parse_id16(&r.get::<_, String>(1)?).map_err(sql_corrupt)?,
+                        fact: parse_id16(&r.get::<_, String>(2)?).map_err(sql_corrupt)?,
+                        verdict: parse_verdict_tag(&r.get::<_, String>(3)?).map_err(sql_corrupt)?,
+                        recovery_standing_use: parse_id16(&r.get::<_, String>(4)?)
+                            .map_err(sql_corrupt)?,
+                        resolved_at: ClockReading(r.get::<_, i64>(5)? as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)
+    }
+
+    fn get_reliance_admissions(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Vec<ReviewQueueAdmission>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT observation, result_commit, at FROM reliance_admission
+                 WHERE attempt=?1 ORDER BY at",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![id16(attempt.as_bytes())], |r| {
+                Ok(ReviewQueueAdmission {
+                    attempt,
+                    observation: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
+                    result_commit: commit(&r.get::<_, String>(1)?),
+                    admitted_at: ClockReading(r.get::<_, i64>(2)? as u64),
+                })
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)
+    }
+
+    fn get_reliance_refusals(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Vec<RelianceRefusalRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT kind, detail, observation, consumer, claim, at FROM reliance_refusal
+                 WHERE attempt=?1 ORDER BY id",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![id16(attempt.as_bytes())], |r| {
+                let kind: String = r.get(0)?;
+                let detail: Option<String> = r.get(1)?;
+                let observation: Option<String> = r.get(2)?;
+                let consumer: Option<String> = r.get(3)?;
+                let claim: Option<String> = r.get(4)?;
+                let refusal =
+                    parse_reliance_refusal(&kind, detail.as_deref()).map_err(sql_corrupt)?;
+                // Subject columns were added by migration 0002. Rows written
+                // before it genuinely lack a subject; a row with only part of
+                // one is corrupt, not defaulted.
+                let subject = match (observation, consumer, claim) {
+                    (None, None, None) => None,
+                    (Some(o), Some(c), Some(cl)) => Some(RelianceSubject {
+                        observation: parse_id16(&o).map_err(sql_corrupt)?,
+                        consumer: c,
+                        claim: parse_claim_tag(&cl).map_err(sql_corrupt)?,
+                    }),
+                    _ => {
+                        return Err(sql_corrupt(CorruptColumn(
+                            "partial reliance-refusal subject".into(),
+                        )))
+                    }
+                };
+                Ok(RelianceRefusalRecord {
+                    attempt,
+                    refusal,
+                    subject,
+                    at: ClockReading(r.get::<_, i64>(5)? as u64),
+                })
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<_, _>>().map_err(backend)
+    }
+
+    fn get_reconciliation(
+        &mut self,
+        attempt: AttemptId,
+    ) -> Result<Option<Reconciliation>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT retained, at FROM reconciliation WHERE attempt=?1",
+                params![id16(attempt.as_bytes())],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?
+            .map(|(retained, at)| {
+                let retained_obligations = split_list(&retained)
+                    .iter()
+                    .map(|o| {
+                        parse_id16::<ObligationId>(o)
+                            .map_err(|e| StoreError::Corrupt(e.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Reconciliation {
+                    attempt,
+                    retained_obligations,
+                    reconciled_at: ClockReading(at as u64),
+                })
+            })
+            .transpose()
     }
 }

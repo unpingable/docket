@@ -23,6 +23,7 @@ use gwr_runtime::ports::adapters::{Clock, IdSource};
 use gwr_runtime::ports::labor_provider::BoundedAssignment;
 use gwr_runtime::ports::store::Store;
 use gwr_runtime::services::dispatch::{dispatch, DispatchOutcome};
+use gwr_runtime::services::dossier;
 use gwr_runtime::services::preparation::{run_preparation, PreparationResult};
 use gwr_runtime::services::ratification::ratify;
 use gwr_runtime::services::reconcile::reconcile;
@@ -571,68 +572,21 @@ fn run(args: &[String]) -> Result<(), String> {
         ["docket", "show"] | ["show"] => {
             let mut st = State::open(args)?;
             let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
-            let p = st
-                .store
-                .get_attempt(attempt)
-                .map_err(|e| format!("{e:?}"))?;
-            let json = has(args, "--json");
-            let timeline = st.store.timeline(attempt).map_err(|e| format!("{e:?}"))?;
-            let obligations = st
-                .store
-                .get_residual_obligations(attempt)
-                .map_err(|e| format!("{e:?}"))?;
-            let observations = st
-                .store
-                .get_observations(attempt)
-                .map_err(|e| format!("{e:?}"))?;
-            if json {
-                let tl: Vec<String> = timeline
-                    .iter()
-                    .map(|t| format!("{{\"seq\":{},\"kind\":\"{}\"}}", t.seq, t.kind))
-                    .collect();
-                let obs: Vec<String> = observations
-                    .iter()
-                    .map(|o| {
-                        format!(
-                            "{{\"observation\":\"{}\",\"exit_status\":{}}}",
-                            hex16s(o.id.as_bytes()),
-                            o.exit_status
-                        )
-                    })
-                    .collect();
-                println!(
-                    "{{\"attempt\":\"{}\",\"state\":\"{}\",\"version\":{},\"timeline\":[{}],\"residual_obligations\":{},\"observations\":[{}]}}",
-                    hex16s(attempt.as_bytes()),
-                    state_tag(&p.state),
-                    p.version,
-                    tl.join(","),
-                    obligations.len(),
-                    obs.join(",")
-                );
+            // One canonical read model sources both surfaces; the human and
+            // JSON renderings are pure functions of the same assembled value.
+            let d = dossier::assemble(&mut st.store, attempt).map_err(|e| format!("{e:?}"))?;
+            if has(args, "--json") {
+                println!("{}", dossier::render_json(&d));
             } else {
-                println!("attempt {}", hex16s(attempt.as_bytes()));
-                println!("state {}", state_tag(&p.state));
-                println!("version {}", p.version);
-                for t in &timeline {
-                    println!("timeline {} {}", t.seq, t.kind);
-                }
-                for ob in &obligations {
-                    println!("residual_obligation {:?}", ob.kind);
-                }
-                for o in &observations {
-                    println!(
-                        "observation {} exit_status {}",
-                        hex16s(o.id.as_bytes()),
-                        o.exit_status
-                    );
-                }
+                print!("{}", dossier::render_text(&d));
             }
             Ok(())
         }
         _ => Err(format!(
             "unknown command {cmd:?}; commands: request create, prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
-             rely review-queue, reconcile, docket list, docket show"
+             rely review-queue, reconcile, recover fact, recover resolve, docket list, \
+             docket show"
         )),
     }
 }

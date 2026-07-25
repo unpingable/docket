@@ -1,6 +1,7 @@
 //! Use-case coordination over the neutral ports.
 
 pub mod dispatch;
+pub mod dossier;
 pub mod preparation;
 pub mod ratification;
 pub mod reconcile;

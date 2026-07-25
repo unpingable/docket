@@ -20,10 +20,14 @@ pub struct GitRefEffect {
 }
 
 impl GitRefEffect {
+    /// The effect-class tag, exactly as bound into every prepared-attempt
+    /// digest transcript. There is one admitted effect class in v0.
+    pub const KIND: &'static str = "git-ref-update:v1";
+
     /// Contribution of this effect to a versioned digest transcript.
     pub fn transcribe(&self, t: Transcript) -> Transcript {
         let mut t = t
-            .text_field("effect.kind", "git-ref-update:v1")
+            .text_field("effect.kind", Self::KIND)
             .text_field("effect.target_ref", self.target_ref.as_str())
             .text_field("effect.expected_basis", self.expected_basis.as_str())
             .field("effect.patch_digest", self.patch_digest.as_bytes());

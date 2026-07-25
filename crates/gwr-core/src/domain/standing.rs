@@ -23,6 +23,25 @@ pub enum StandingAct {
     ResolveRecovery,
 }
 
+impl StandingAct {
+    /// The one tag vocabulary, shared by the store encoding and every read
+    /// surface.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Ratify => "ratify",
+            Self::ResolveRecovery => "resolve_recovery",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "ratify" => Some(Self::Ratify),
+            "resolve_recovery" => Some(Self::ResolveRecovery),
+            _ => None,
+        }
+    }
+}
+
 /// Exact scope: this actor, this act, this repository, this exact
 /// prepared-attempt digest.
 #[derive(Clone, PartialEq, Eq, Debug)]

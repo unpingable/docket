@@ -16,6 +16,23 @@ pub enum ObligationKind {
     HumanReviewBeforeMerge,
 }
 
+impl ObligationKind {
+    /// The one tag vocabulary, shared by the store encoding and every read
+    /// surface.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::HumanReviewBeforeMerge => "human_review_before_merge",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "human_review_before_merge" => Some(Self::HumanReviewBeforeMerge),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ResidualObligation {
     pub id: ObligationId,

@@ -21,6 +21,27 @@ pub enum FactSource {
     OperatorSupplied(String),
 }
 
+impl FactSource {
+    /// Stable kind tag plus optional detail, shared by the store encoding and
+    /// every read surface.
+    pub fn tags(&self) -> (&'static str, Option<String>) {
+        match self {
+            Self::BrokerJournal => ("broker_journal", None),
+            Self::RefInspection => ("ref_inspection", None),
+            Self::OperatorSupplied(detail) => ("operator_supplied", Some(detail.clone())),
+        }
+    }
+
+    pub fn from_tags(kind: &str, detail: Option<String>) -> Option<Self> {
+        Some(match kind {
+            "broker_journal" => Self::BrokerJournal,
+            "ref_inspection" => Self::RefInspection,
+            "operator_supplied" => Self::OperatorSupplied(detail.unwrap_or_default()),
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RecoveryFact {
     pub id: RecoveryFactId,

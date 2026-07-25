@@ -3,12 +3,15 @@
 //! neither mutates the observation or the commitment.
 
 use crate::ports::adapters::Clock;
-use crate::ports::store::{Store, StoreError};
+use crate::ports::store::{RelianceSubject, Store, StoreError};
 use gwr_core::bridge::observation_to_review_queue as obs_bridge;
 use gwr_core::domain::evidence::Claim;
 use gwr_core::ids::{AttemptId, ObservationId};
 use gwr_core::receipt::ReviewQueueAdmission;
 use gwr_core::refusal::RelianceRefusal;
+
+/// The consumer this service presents claims for. One bridge, one consumer.
+pub const REVIEW_QUEUE_CONSUMER: &str = "review-queue";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RelyError {
@@ -50,7 +53,14 @@ pub fn rely_review_queue(
             Ok(admission)
         }
         Err(refusal) => {
-            store.record_reliance_refusal(attempt_id, &refusal, now)?;
+            // The refusal's subject is preserved with it: which observation,
+            // presented to which consumer, for which claim.
+            let subject = RelianceSubject {
+                observation: observation_id,
+                consumer: REVIEW_QUEUE_CONSUMER.to_string(),
+                claim,
+            };
+            store.record_reliance_refusal(attempt_id, &refusal, Some(&subject), now)?;
             Err(RelyError::Refused(refusal))
         }
     }
