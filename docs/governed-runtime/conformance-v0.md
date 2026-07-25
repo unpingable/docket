@@ -1,76 +1,138 @@
-# Conformance v0
+# Governed Runtime v0 Conformance Audit
 
-## 1. Enforcement table
+## 1 — Enforcement table
 
-The audit treats a check in the normal service path as `checked` even when another public
-component boundary can bypass it; that bypass is then recorded as a looser finding. A
-partial check that does not enforce the invariant's stated exact binding is not counted as
-enforcement of the full invariant. File references below identify executable mechanisms,
-not comments. `cargo test --workspace` passed all 88 tests.
+The classifications below describe the code that exists, including its public seams, not
+the architecture documents' intended behavior. “Checked” means there is a normal runtime
+path that validates the condition and returns a typed negative result. A “looser” finding
+records any material bypass or missing part even when that normal path is checked.
 
-| Invariant | Provenance tag | Enforced where (file + mechanism) | Enforcement kind | Finding |
+| invariant | provenance tag | enforced where (file + mechanism) | enforcement kind | finding |
 |---|---|---|---|---|
-| 1. No effect without an admitted exact attempt | proved | `crates/gwr-runtime/src/services/dispatch.rs:47-86` loads a persisted attempt, requires `Reserved`, crosses `ReservationToDispatchV1`, advances through `AttemptState::dispatch`, and persists the envelope before calling the broker. `crates/gwr-core/src/lifecycle.rs:125-146` returns `TransitionRefusal`. | checked | looser than specified — `crates/gwr-local/src/bin/gwr-git-broker.rs:18-59` and `crates/gwr-local/src/broker/mod.rs:174-318` can execute an envelope without establishing that its attempt was admitted or that the envelope was persisted; the parsed broker input discards the attempt and prepared-attempt digest. |
-| 2. No retry under the same `AttemptId` | proved | `crates/gwr-runtime/src/services/dispatch.rs:49-55` returns the existing state without broker execution once any dispatch is persisted; `crates/gwr-local/src/broker/mod.rs:370-392` inspects an existing journal; `crates/gwr-local/migrations/0001_init.sql:102-114` makes `dispatch.attempt` unique. | checked | looser than specified — the governed service path cannot retry, but direct broker input does not retain or check `AttemptId`, so a caller can invoke the broker under another `DispatchId` for the same attempt outside that path. |
-| 3. One persisted `DispatchId` per attempt | implementation-choice | `crates/gwr-local/migrations/0001_init.sql:102-114` has `UNIQUE(attempt)`; `crates/gwr-runtime/src/services/dispatch.rs:49-55` checks for the persisted dispatch before minting an ID. | checked | conformant |
-| 4. Same `DispatchId` inspects rather than repeats | implementation-choice | `crates/gwr-runtime/src/services/dispatch.rs:49-55` returns `AlreadyDispatched`; `crates/gwr-local/src/broker/mod.rs:374-391` and `crates/gwr-local/src/bin/gwr-git-broker.rs:38-55` inspect an existing journal and never call effect execution again. | checked | conformant |
-| 5. Different `DispatchId` for the same attempt is refused | proved | `crates/gwr-core/src/bridge/reservation_to_dispatch.rs:64-72` returns `DispatchIdentityConflict`; `crates/gwr-local/migrations/0001_init.sql:102-114` rejects a second persisted dispatch for an attempt. | checked | looser than specified — the broker boundary does not parse or check the attempt, so direct broker use with a different dispatch identity is not refused there. |
-| 6. No success or failure minted from indeterminacy | proved | `crates/gwr-core/src/lifecycle.rs:149-227` permits `commit`/`refuse_dispatch` only from `Dispatching` and only recovery verdicts from `Indeterminate`, returning `TransitionRefusal`; `crates/gwr-runtime/src/services/recovery.rs:44-70` requires an indeterminate projection. | checked | looser than specified — the public `Store` transition methods accept a caller-supplied `new_state`, and `crates/gwr-local/src/store/mod.rs:921-1042` advances the projection without validating that state against the current state or ledger record. A caller can therefore persist `Committed`, `DispatchRefused`, or a recovery state without the checked lifecycle path. |
-| 7. No automatic retry after ambiguous dispatch | proved | `crates/gwr-runtime/src/services/dispatch.rs:49-55` returns `AlreadyDispatched` after the first persisted dispatch, including an indeterminate one; `crates/gwr-local/src/broker/mod.rs:374-391` returns `Uncertain` for an incomplete existing journal. There is no retry loop in dispatch or recovery. | checked | conformant |
-| 8. Recovery facts bind exact attempt and dispatch | proved | `crates/gwr-core/src/recovery.rs:59-80` checks only attempt, dispatch, and prepared-attempt digest; `crates/gwr-core/src/bridge/recovery_standing_to_resolution.rs:58-67` uses that partial validator. | unenforced | looser than specified — resolution does not compare the fact's repository, target ref, basis, observed-ref context, expected result commit, broker journal digest, or fact source with the persisted attempt/dispatch. A fact with matching three checked fields and contradictory remaining bindings can resolve the attempt. |
-| 9. Recovery facts cannot resolve another attempt | proved | `crates/gwr-core/src/recovery.rs:65-79` returns typed `AttemptMismatch`, `DispatchMismatch`, or `BindingIncomplete`; `crates/gwr-runtime/src/services/recovery.rs:44-66` supplies the persisted attempt and dispatch to that validator. | checked | conformant |
-| 10. Authentic recovery evidence does not apply itself | doctrine-unproved | `crates/gwr-runtime/src/ports/store.rs:142-145` and `crates/gwr-local/src/store/mod.rs:1045-1080` record a fact as an associated record with no attempt-state parameter; state change is a separate resolution operation. | type-level | conformant |
-| 11. Recovery requires separately valid resolution standing | doctrine-unproved | `crates/gwr-core/src/bridge/recovery_standing_to_resolution.rs:68-95` consumes a grant specifically scoped to `StandingAct::ResolveRecovery` and returns typed recovery-standing refusals; `crates/gwr-runtime/src/services/recovery.rs:50-82` uses that bridge. | checked | looser than specified — `Store::record_recovery_resolution` is public, and `crates/gwr-local/src/store/mod.rs:1010-1042` consumes any available grant without rechecking its act, scope, expiry, or binding to the resolution, while also accepting the caller's state. |
-| 12. No standing use is replayed | proved | `crates/gwr-core/src/domain/standing.rs:58-109` returns `StandingRefusal::AlreadyUsed`; `crates/gwr-local/src/store/mod.rs:307-331` atomically changes only an unconsumed projection and returns `StoreError::AlreadyConsumed` on replay. | checked | conformant |
-| 13. No resource reservation is replayed | proved | `crates/gwr-core/src/domain/reservation.rs:52-79` returns `ReservationRefusal::AlreadyUsed`; `crates/gwr-local/src/store/mod.rs:867-891` atomically consumes only an unused reservation; repeated dispatch is intercepted before broker execution. | checked | conformant |
-| 14. Ratification binds the exact prepared-attempt digest | proved | `crates/gwr-core/src/bridge/standing_to_ratification.rs:58-93` checks the presented digest, basis, and standing scope and puts the exact digest in the receipt/reference, returning typed refusals. | checked | looser than specified — `crates/gwr-local/src/store/mod.rs:815-845` does not compare a directly supplied ratification receipt or `new_state` with the stored attempt digest, actor, or standing scope. The checked bridge is therefore not mandatory at the public store boundary. |
-| 15. Candidate content is immutable after admission | proved | `crates/gwr-local/src/adapters.rs:88-106` uses content-addressed storage and verifies bytes on read; `crates/gwr-local/src/store/mod.rs:474-496` and `520-568` insert immutable candidate/attempt rows and reject identity rebinding. | checked | conformant |
-| 16. Changing basis, patch, effect, or observation plan requires another attempt | proved | `crates/gwr-core/src/prepared_attempt.rs:35-65` binds the attempt ID and all fixed fields in a versioned digest; `crates/gwr-local/src/store/mod.rs:520-553` rejects different content under an existing `AttemptId`; fixed-field digest tests are in `crates/gwr-core/src/prepared_attempt.rs:96-124`. | checked | looser than specified — public record fields plus `Store::record_dispatch` allow a caller to submit an envelope whose effect fields are not compared with the stored attempt; the broker checks patch bytes and basis but not the envelope against the admitted attempt. |
-| 17. No receipt asserts more than the trusted component established | doctrine-unproved | Specimen tests in `crates/gwr-core/tests/bridges.rs:203-254`, `crates/gwr-core/tests/observation_cannot_rewrite_outcome.rs:10-55`, and `crates/gwr-core/src/reconciliation.rs:36-56` assert bounded claims. | tested-only | looser than specified — receipt structs have public fields, and public store methods such as `record_commitment`, `record_observation`, and `record_reliance_admission` persist caller-constructed records without verifying that a trusted component established their contents. |
-| 18. Effect commitment is distinct from observation success | proved | `crates/gwr-core/src/outcome.rs:13-45` and `crates/gwr-core/src/observation_plan.rs:31-50` use separate record types; `AttemptState` has no observation variant; commitment and observation use separate tables and store operations. | type-level | conformant |
-| 19. Observation success is distinct from correctness, completion, merge safety, and obligation discharge | proved | `crates/gwr-core/src/domain/evidence.rs:16-26` represents the claims distinctly; `crates/gwr-core/src/bridge/observation_to_review_queue.rs:33-58` admits only the exact effect-and-command claim and returns `ClaimNotAdmissible` for the five broader claims. | checked | conformant |
-| 20. No silent lift occurs between domains | proved | `crates/gwr-core/src/bridge/mod.rs` exposes four named modules with fixed input/output types. There is no bridge trait, registry, generic evaluator, blanket `From`, or universal judgment type in the three crates. | type-level | conformant |
-| 21. Refusals remain domain-narrow | proved | `crates/gwr-core/src/refusal.rs` defines separate refusal enums for standing, reservation, transition, observation, reliance, dispatch, and recovery, with only explicit nesting at named service/bridge boundaries and no shared refusal trait or blanket conversion. | type-level | conformant |
-| 22. Consumer-specific reliance does not broaden or mutate the source receipt/refusal | proved | `crates/gwr-core/src/bridge/observation_to_review_queue.rs:24-58` takes immutable source references and constructs only the one narrow admission; `crates/gwr-runtime/src/services/reliance.rs:27-55` records a separate admission/refusal; source ledger tables have no update API. | checked | conformant |
-| 23. Provider identity is absent from core lifecycle types and schemas | doctrine-unproved | Core types contain no provider-identity field; `crates/gwr-local/migrations/0001_init.sql` contains no provider-identity column. `crates/gwr-local/tests/persistence.rs:381-394` and `crates/gwr-local/tests/provider_contract.rs:223-264` check the boundary. | type-level | conformant |
-| 24. Provider tool requests carry no authority | doctrine-unproved | `crates/gwr-runtime/src/ports/labor_provider.rs:16-90` gives the provider only a bounded assignment and returns events/provenance/candidate bytes; it exposes no standing, reservation, dispatch, recovery, observation, reliance, or reconciliation operation. | type-level | conformant |
-| 25. Expired records do not revive | doctrine-unproved | `crates/gwr-core/src/domain/standing.rs:62-83` and `crates/gwr-core/src/domain/reservation.rs:54-68` return typed expiry refusals from runtime readings; immutable grant, reservation, and preparation-end rows reject rebinding in `crates/gwr-local/src/store/mod.rs:445-471`, `652-686`, and `722-781`. | checked | looser than specified — the core grant and claim fields are public, so a caller using the pure bridge directly can clone an expired value, extend `expires_at`, and make it valid; only the persisted store path prevents that revival. |
-| 26. Runtime clock readings control expiry | implementation-choice | `crates/gwr-runtime/src/ports/adapters.rs:10-13` defines the clock port; ratification, reservation, dispatch, preparation, and recovery services obtain `clock.now()` and pass it to the expiry checks. | checked | conformant |
-| 27. State transitions are monotone | proved | `crates/gwr-core/src/lifecycle.rs:103-227` exposes forward-only transition functions returning `TransitionRefusal`, and terminal states have no outgoing successful transition. | checked | looser than specified — `crates/gwr-local/src/store/mod.rs:246-304` serializes any caller-supplied `AttemptState` and checks only optimistic version, while every public consequential store method accepts that state without validating the prior-state/next-state pair. Arbitrary jumps and regressions can therefore be persisted by bypassing the lifecycle methods. |
-| 28. `DispatchRefused` stays distinct from `ProvenNotCommitted` | proved | `crates/gwr-core/src/lifecycle.rs:56-101` uses distinct enum variants; `crates/gwr-local/migrations/0001_init.sql:126-165` uses distinct refusal and recovery-resolution ledgers; `crates/gwr-local/src/store/codec.rs:280-302` uses distinct projection tags. | type-level | conformant |
-| 29. Residual obligations remain visible after low-level completion | proved | `crates/gwr-runtime/src/services/reconcile.rs:12-38` creates `HumanReviewBeforeMerge` when absent and retains every stored obligation; `crates/gwr-local/src/store/mod.rs:1237-1290` has append-only obligation/reconciliation APIs and no discharge/delete operation. | checked | looser than specified — the obligation is created lazily only when `reconcile` is invoked, so a committed and observed attempt has no visible `HumanReviewBeforeMerge` before that call; direct `record_reconciliation` also accepts an omitted retained-ID list without validation. |
-| 30. Absence of a bridge produces a first-class reliance refusal | doctrine-unproved | `RelianceRefusal::NoBridge` exists in `crates/gwr-core/src/refusal.rs:74-91`; `crates/gwr-core/tests/bridges.rs:326-356` constructs it. Unsupported versions are actually checked by each bridge. | tested-only | looser than specified — no runtime API accepts an undeclared crossing and produces `NoBridge`; the test manually constructs the refusal, and `unsafe_refusal_reliance_is_rejected` manually records one. Missing-bridge refusal production is therefore a caller convention, not enforcement. |
+| 1. No effect without an admitted exact attempt | proved | `crates/gwr-runtime/src/services/dispatch.rs`: `dispatch` must load a projected attempt and reach `Reserved`; `crates/gwr-core/src/lifecycle.rs`: `AttemptState::dispatch` returns `NotReserved`; `crates/gwr-local/src/store/mod.rs`: admitted attempts start at `Prepared` | checked | looser than specified — `DispatchEnvelope` has public fields, `EffectBroker::execute` is public, and the broker binary accepts an envelope file without proving that the envelope or attempt was persisted; the public `Store::record_*` port also accepts caller-supplied next states |
+| 2. No retry under the same `AttemptId` | proved | `crates/gwr-runtime/src/services/dispatch.rs`: an existing attempt dispatch returns `AlreadyDispatched`; `crates/gwr-core/src/lifecycle.rs`: every post-`Reserved` dispatch returns `AlreadyDispatched`; `crates/gwr-local/src/broker/mod.rs`: an existing journal is inspected | checked | looser than specified — the governed service path cannot retry, but direct use of the public broker with a newly fabricated envelope and journal location is outside that check |
+| 3. One persisted `DispatchId` per attempt | implementation-choice | `crates/gwr-local/migrations/0001_init.sql`: `dispatch.attempt` is `UNIQUE`; `crates/gwr-core/src/lifecycle.rs`: every dispatched state contains exactly one `DispatchRef` | type-level | conformant |
+| 4. Same `DispatchId` inspects rather than repeats | implementation-choice | `crates/gwr-local/src/broker/mod.rs` and `crates/gwr-local/src/bin/gwr-git-broker.rs`: an existing per-dispatch journal is inspected and an incomplete journal returns uncertainty; `crates/gwr-runtime/src/services/dispatch.rs`: a persisted dispatch returns its projected state | checked | conformant |
+| 5. Different `DispatchId` for the same attempt is refused | proved | `crates/gwr-core/src/bridge/reservation_to_dispatch.rs`: `existing_dispatch` mismatch returns `DispatchIdentityConflict`; `crates/gwr-local/migrations/0001_init.sql`: unique attempt in `dispatch`; `crates/gwr-core/src/lifecycle.rs`: later dispatch returns `AlreadyDispatched` | checked | conformant |
+| 6. No success or failure minted from indeterminacy | proved | `crates/gwr-core/src/lifecycle.rs`: `commit` and `refuse_dispatch` accept only `Dispatching`; `Indeterminate` exits only through `resolve`, otherwise returning typed `TransitionRefusal`; `crates/gwr-runtime/src/services/recovery.rs` uses that path | checked | looser than specified — the public store transition methods validate only optimistic version, so a caller can supply a `Committed` or `DispatchRefused` next projection after `Indeterminate` without the lifecycle check |
+| 7. No automatic retry after ambiguous dispatch | proved | `crates/gwr-runtime/src/services/dispatch.rs`: the persisted dispatch check returns `AlreadyDispatched`, including for `Indeterminate`; `crates/gwr-local/src/broker/mod.rs`: incomplete existing journal returns `Uncertain` without execution | checked | looser than specified — direct broker use is not tied to the persisted attempt projection and can evade the service-level no-retry check |
+| 8. Recovery facts bind exact attempt and dispatch | proved | `crates/gwr-core/src/recovery.rs`: `AuthoritativeBinding` plus `validate_fact_binding` compares attempt, dispatch, prepared digest, repository, target ref, and basis and returns typed mismatch refusals; `crates/gwr-core/src/bridge/recovery_standing_to_resolution.rs` derives the binding from the admitted attempt and persisted dispatch | checked | looser than specified — authenticity is not represented in the input type, and neither the fact's journal digest nor its claimed expected result commit is checked against a persisted broker journal; `Store::record_recovery_fact` accepts caller-constructed facts, so a correctly contextualized but self-authored expected result can drive a verdict |
+| 9. Recovery facts cannot resolve another attempt | proved | `crates/gwr-core/src/recovery.rs`: attempt, digest, repository, ref, basis, and dispatch mismatches are typed refusals; `crates/gwr-runtime/src/services/recovery.rs`: resolution supplies the target attempt and its persisted dispatch | checked | looser than specified — the checked recovery service refuses cross-attempt use, but the public `Store::record_recovery_resolution` method can persist a caller-supplied resolution and next state without validating their relation to the prior projection |
+| 10. Authentic recovery evidence does not apply itself | doctrine-unproved | `crates/gwr-local/src/recover.rs`: `produce_fact` only records a `RecoveryFact`; `crates/gwr-runtime/src/ports/store.rs` separates `record_recovery_fact` from resolution; `crates/gwr-core/src/recovery.rs` gives `RecoveryFact` no state-transition operation | type-level | conformant |
+| 11. Recovery requires separately valid resolution standing | doctrine-unproved | `crates/gwr-core/src/bridge/recovery_standing_to_resolution.rs`: requires a `StandingGrant` scoped to `ResolveRecovery`, validates actor, repository, digest, expiry and use, and returns typed recovery-standing refusals; the runtime service persists its consumption atomically | checked | looser than specified — the public store port can record a recovery resolution directly, bypassing the bridge and its separate-standing check |
+| 12. No standing use is replayed | proved | `crates/gwr-core/src/domain/standing.rs`: consumed grants return `AlreadyUsed`; `crates/gwr-local/src/store/mod.rs`: atomic `consumed_by IS NULL` update returns `AlreadyConsumed`; ratification and recovery persist the use in the same transaction | checked | conformant |
+| 13. No resource reservation is replayed | proved | `crates/gwr-core/src/domain/reservation.rs`: consumed claims return `AlreadyUsed`; `crates/gwr-local/src/store/mod.rs`: atomic reservation projection consumption returns `AlreadyConsumed`; `crates/gwr-runtime/src/services/dispatch.rs` consumes once before broker execution | checked | conformant |
+| 14. Ratification binds the exact prepared-attempt digest | proved | `crates/gwr-core/src/bridge/standing_to_ratification.rs`: presented digest, basis, and standing scope are checked against `PreparedAttempt`, with typed refusals; `RatificationReceipt` records the digest | checked | looser than specified — the bridge enforces the binding, but `RatificationRef`, `RatificationReceipt`, and the public store recording method are constructible/callable without that bridge and the store does not revalidate the receipt against the admitted attempt |
+| 15. Candidate content is immutable after admission | proved | `crates/gwr-local/src/store/mod.rs`: candidate and attempt inserts reject identity rebinding with `ImmutableRebind`; `crates/gwr-local/src/adapters.rs`: artifacts are content-addressed and verified on read; the broker rechecks patch bytes against the admitted digest | checked | conformant |
+| 16. Changing basis, patch, effect, or plan requires another attempt | proved | `crates/gwr-core/src/prepared_attempt.rs` and `effect_spec.rs`: the versioned prepared-attempt digest transcribes basis, artifact digest, full effect, and observation plan; `crates/gwr-local/src/store/mod.rs`: reusing an admitted `AttemptId` with changed content returns `ImmutableRebind` | checked | conformant |
+| 17. No receipt asserts more than the trusted component established | doctrine-unproved | `crates/gwr-core/src/receipt.rs`: three narrow receipt types have no correctness, completion, merge-safety, discharge, hazard, confidence, or severity fields; recovery and outcome records are separate types; `crates/gwr-core/src/bridge/observation_to_review_queue.rs` can construct only the one narrow admission | type-level | conformant |
+| 18. Effect commitment is distinct from observation success | proved | `crates/gwr-core/src/lifecycle.rs` and `outcome.rs`: commitment is an execution state/record while observations are absent from the state enum; `crates/gwr-core/src/observation_plan.rs`: observations are separate associated records with no lifecycle transition | type-level | conformant |
+| 19. Observation success is distinct from correctness, completion, merge safety, and discharge | proved | `crates/gwr-core/src/domain/evidence.rs`: these are separate `Claim` variants; `crates/gwr-core/src/bridge/observation_to_review_queue.rs`: all five broader claims return `ClaimNotAdmissible`; `ReviewQueueAdmission` has no field for them | checked | conformant |
+| 20. No silent lift between domains | proved | `crates/gwr-core/src/bridge/`: four source/target-specific modules with distinct inputs, outputs, and refusals; no bridge registry, blanket conversion, universal judgment type, or generic evaluator exists | type-level | conformant |
+| 21. Refusals remain domain-narrow | proved | `crates/gwr-core/src/refusal.rs`: standing, reservation, transition, observation, reliance, recovery, and dispatch grounds are distinct enums with no shared refusal trait or cross-domain conversions | type-level | looser than specified — the types preserve the domain, but most values do not carry the exact refused subject/scope; notably persisted reliance refusals omit observation, consumer, and claim, retaining only attempt, kind, optional detail, and time |
+| 22. Consumer-specific reliance does not mutate or broaden the source receipt or refusal | proved | `crates/gwr-core/src/bridge/observation_to_review_queue.rs`: the consumer is fixed by the named bridge, the claim is explicit, sources are borrowed, and output is a separate narrow type; `crates/gwr-runtime/src/services/reliance.rs` records a separate admission/refusal | type-level | conformant |
+| 23. Provider identity absent from core lifecycle types and schemas | doctrine-unproved | `crates/gwr-runtime/src/ports/labor_provider.rs`: provider implementation is behind a neutral trait; `crates/gwr-core` has no provider-identity type or field; `crates/gwr-local/migrations/0001_init.sql` has no provider-identity column; persistence and provider-contract tests scan this boundary | type-level | conformant |
+| 24. Provider tool requests carry no authority | doctrine-unproved | `crates/gwr-runtime/src/ports/labor_provider.rs`: `ToolRequest` contains only untrusted text and `BoundedAssignment` contains no standing, reservation, dispatch, recovery, or target credential; no provider-port method crosses into governed services | type-level | conformant |
+| 25. Expired records do not revive | doctrine-unproved | `crates/gwr-core/src/domain/standing.rs` and `domain/reservation.rs` check only the presented `now` against public `expires_at`; `crates/gwr-local/src/store/mod.rs` makes the persisted expiry immutable, but records no irreversible expired state | unenforced | looser than specified — after one expired check, a backward clock reading makes the same available record valid again; direct callers can also clone a public grant/claim and extend `expires_at`; existing tests assert expiry refusal, not non-revival |
+| 26. Runtime clock readings control expiry | implementation-choice | `crates/gwr-runtime/src/ports/adapters.rs`: services obtain `Clock::now`; ratification, reservation, dispatch and recovery pass that reading into core expiry checks; `crates/gwr-local/src/adapters.rs` supplies `SystemClock` | checked | conformant |
+| 27. State transitions are monotone | proved | `crates/gwr-core/src/lifecycle.rs`: each transition accepts only its predecessor and returns typed `TransitionRefusal`; terminal states have no legal exit; invalid methods borrow and return a new value | checked | looser than specified — `AttemptState` variants are publicly constructible and public `Store::record_*` methods accept a caller-supplied next state while checking only version, not the prior/next transition pair |
+| 28. `DispatchRefused` stays distinct from `ProvenNotCommitted` | proved | `crates/gwr-core/src/lifecycle.rs`: they are distinct enum variants reached from different predecessor states; `crates/gwr-local/migrations/0001_init.sql` stores dispatch refusals and recovery resolutions in distinct typed ledger tables and projection tags | type-level | conformant |
+| 29. Residual obligations remain visible after low-level completion | proved | `crates/gwr-runtime/src/services/reconcile.rs`: creates `HumanReviewBeforeMerge` if absent and retains every stored obligation; `crates/gwr-core/src/reconciliation.rs`: there is no discharge variant or API; CLI and vertical-slice tests expose the retained obligation | checked | looser than specified — commitment itself does not create the obligation, reconciliation can be skipped or invoked before completion, and the public store accepts an empty caller-constructed `Reconciliation` without validating retained obligations |
+| 30. Absence of a bridge produces a first-class reliance refusal | doctrine-unproved | `crates/gwr-core/src/refusal.rs`: `RelianceRefusal::NoBridge` exists; `crates/gwr-core/tests/bridges.rs` and `crates/gwr-local/tests/failure_injection.rs` manually construct and record it; unsupported versions are genuinely checked by each bridge | tested-only | looser than specified — no runtime API accepts an undeclared source/consumer/claim crossing and produces `NoBridge`; the tests assert a value callers must choose by convention |
 
-## 2. Proved negatives
+## 2 — Proved negatives
 
-| Negative | Natural drift point in this implementation | What keeps the rejected design out |
-|---|---|---|
-| N1 — universal governed-transition record is vacuous | The overlapping attempt outcomes, observations, recoveries, reliance records, reconciliations, and persistence ledgers invite one tag-plus-optional-fields record. | `crates/gwr-core/src/lifecycle.rs:56-101` uses typed lifecycle variants, `outcome.rs`, `observation_plan.rs`, `recovery.rs`, `receipt.rs`, and `reconciliation.rs` use separate records, and `0001_init.sql` uses separate typed ledger tables. The nullable `attempt_projection` columns encode only the closed lifecycle projection, not a universal cross-domain record. |
-| N2 — no unifier | The four bridge modules and the service error/result wrappers are the natural place for a `Decision`/`Verdict` trait, bridge registry, or generic evaluator. | `crates/gwr-core/src/bridge/mod.rs` names exactly four modules with unrelated exact signatures; `crates/gwr-core/src/refusal.rs` keeps refusal domains separate. Repository-wide search finds no generic bridge registry, judgment interface, or blanket conversion. |
-| N3 — no free-standing bridge | Version negotiation in every `cross` function and reliance on a source/consumer pair with no declared bridge are the natural fallback points. | Each implemented bridge rejects an unsupported version before doing work, and there is no generic registry or pass-through conversion. For a wholly absent bridge, however, nothing produces the refusal automatically: `RelianceRefusal::NoBridge` and `missing_or_unsupported_bridge_produces_a_reliance_refusal` only make the value available and manually construct it. |
-| N4 — reliance does not factor through a fixed interface projection | `rely_review_queue` could naturally have been `may_rely(observation) -> bool`. | `ObservationToReviewQueueV1::Input` requires the observation, exact commitment, and claim; the consumer is fixed by the named review-queue bridge. `Claim` preserves the claim index, and the output/refusal is typed rather than boolean. |
-| N5 — a refusal establishes what was returned, not what was true | A consumer of `DispatchRefusalRecord` could expose a convenience accessor for “not committed,” “no standing,” or “obligation undischarged.” | No bridge or accessor from a producer refusal to any such proposition exists; refusal types carry narrow grounds. `unsafe_refusal_reliance_is_rejected` confirms the source remains unchanged, but it manually records `NoBridge`, so first-class refusal production for that attempted crossing is not itself enforced. |
-| N6 — identical endpoint states are not identical transitions | Candidate ingestion and attempt admission could deduplicate on patch digest or result commit. | `AttemptId` is distinct from content and participates in `PreparedAttempt`'s binding digest; `attempt.id` is the persistence identity, while artifact digest is a separate column. `identical_candidate_bytes_may_exist_under_different_attempts` and immutable-rebind tests keep equal bytes under distinct attempts. |
-| N7 — revocation is not restoration | Extending an expired preparation deadline, standing expiry, or reservation expiry is the natural “reopen” operation. | Persistent base rows and end rows have no update API, and rebinding an existing identity to a changed expiry is rejected. This is incomplete at the pure-core boundary: `StandingGrant` and `ReservationClaim` fields are public, so a cloned expired value can have its expiry extended before calling a bridge directly; no test covers that revival. |
-| N8 — standing does not reduce to a role | Ratification and recovery authorization could have been an actor-role lookup. | `StandingScope` binds actor, act, repository, and exact attempt digest; `StandingGrant` adds expiry and one-use state; bridge and store checks consume uses. Wrong actor, act, repository/effect scope, expiry, and replay all have tests. No role type or role lookup exists. |
-| N9 — hazard belongs in reliance, not a producer-side noun | Receipt and refusal structs are the natural place to add severity, confidence, safety, hazard, or consumer-advice fields. | `crates/gwr-core/src/receipt.rs` contains only narrow mechanical fields; repository-wide search finds no such producer-side fields. Claim calibration is in `domain/evidence.rs` and `ObservationToReviewQueueV1`. |
+### N1 — The universal governed-transition record is vacuous
 
-## 3. Verdict
+The natural drift point is persistence and the lifecycle, where attempts, outcomes,
+observations, recovery, reliance, and obligations all overlap. It is kept out by the
+variant `AttemptState` in `crates/gwr-core/src/lifecycle.rs`, the separate record types in
+`outcome.rs`, `recovery.rs`, `receipt.rs`, and `reconciliation.rs`, and the separate typed
+ledger tables in `crates/gwr-local/migrations/0001_init.sql`. No universal optional-field
+record exists.
 
-The release freeze is **blocked**.
+### N2 — No unifier
 
-Exactly one `proved` row fails the Task 12 enforcement-kind gate:
+The natural drift point is the four domain crossings and their errors. It is kept out by
+the four concrete modules under `crates/gwr-core/src/bridge/` and the separate refusal
+enums in `crates/gwr-core/src/refusal.rs`. There is no `Decision`/`Verdict` trait, bridge
+registry, universal evaluator, or common refusal conversion.
 
-- **Invariant 8** is `unenforced` as stated. Its resolver performs a partial typed check,
-  but the full exact recovery binding required by the packet is not validated.
+### N3 — No free-standing bridge
 
-The `doctrine-unproved` rows classified `tested-only` are **17 and 30**; they meet the
-packet's minimum gate but have the looser gaps stated in the table. The proved rows
-classified `checked` but looser — **1, 2, 5, 6, 14, 16, 27, and 29** — do not add blockers
-under the gate's literal enforcement-kind rule, but they are divergences and must not be
-reported as conformant. Row **11** and row **25** are also checked-but-looser
-`doctrine-unproved` divergences.
+The natural drift point is unsupported bridge versions and requests for an undeclared
+source/consumer/claim crossing. Every concrete bridge rejects unsupported versions, and
+`RelianceRefusal::NoBridge` plus `unsupported_bridge_version_is_rejected` keep the
+version-fallback design out. Nothing fully keeps out the missing-crossing design:
+`missing_or_unsupported_bridge_produces_a_reliance_refusal` merely constructs `NoBridge`
+itself, and no runtime dispatcher produces it for an absent crossing.
 
-Verification completed without changing implementation files:
-`cargo test --workspace` passed all 88 tests; `cargo fmt --all -- --check` and
-`cargo clippy --workspace --all-targets --all-features -- -D warnings` also passed.
+### N4 — Reliance does not factor through a fixed interface projection
+
+The natural drift point is `rely_review_queue` in
+`crates/gwr-runtime/src/services/reliance.rs`. It is kept out by the named,
+consumer-specific `ObservationToReviewQueueV1`, whose input includes both the observation
+and the exact commitment plus an explicit `Claim`. The bridge admits one claim and
+refuses five; there is no `may_rely(receipt) -> bool` function.
+
+### N5 — A refusal establishes what the attempt returned, not what was true
+
+The natural drift point is downstream use of a `DispatchRefusalRecord` or standing
+refusal. It is kept out structurally by the absence of any bridge or accessor from those
+records to `ProvenNotCommitted`, lack-of-standing, discharge, or another negated domain
+claim. `unsafe_refusal_reliance_is_rejected` preserves the dispatch refusal while
+recording `NoBridge`, although that missing-bridge refusal is manually selected rather
+than produced by a checked crossing.
+
+### N6 — Identical endpoint states are not identical transitions
+
+The natural drift point is attempt admission and content-addressed candidate storage. It
+is kept out by `AttemptId` being included in the prepared-attempt transcript in
+`crates/gwr-core/src/prepared_attempt.rs`, by immutable identity rebinding checks in
+`crates/gwr-local/src/store/mod.rs`, and by
+`identical_candidate_bytes_may_exist_under_different_attempts`. The implementation does
+not deduplicate attempts on artifact digest or endpoint commit.
+
+### N7 — Revocation is not restoration
+
+The natural v0 drift point is `expires_at` on `StandingGrant` and `ReservationClaim`.
+Persisted expiration values cannot be rebound under the same identity in
+`SqliteStore`, and expiry checks reject a record at or after its deadline. Nothing keeps
+the full negative out: there is no irreversible expired state or monotone-clock
+requirement, public values can be cloned with a later expiry, and a backward clock
+reading revives an otherwise available expired record. There is no non-revival test.
+
+### N8 — Standing does not reduce to a role
+
+The natural drift point is authority for ratification and recovery. It is kept out by
+`StandingScope` in `crates/gwr-core/src/domain/standing.rs`, which binds actor, act,
+repository, exact attempt digest, expiry, and one-use state; by the atomic consumption
+projection in `crates/gwr-local/src/store/mod.rs`; and by the ratification/recovery tests
+for wrong scope, expiry, and replay. The public-field clone/extend gap noted under N7
+weakens value encapsulation but does not turn the persisted service path into RBAC.
+
+### N9 — The hazard lives in the reliance relation, not in a producer-side noun
+
+The natural drift point is receipt and refusal design. It is kept out by the narrow
+receipt structs in `crates/gwr-core/src/receipt.rs`, which have no hazard, confidence,
+severity, or consumer-advice fields, and by claim calibration in
+`ObservationToReviewQueueV1`. No carrier/stranding ontology or `StrandedDemand` type
+exists.
+
+## 3 — Verdict
+
+`cargo test --workspace` passed: 92 tests passed and none failed. That is not by itself a
+conformance verdict.
+
+**The release freeze is blocked by row 25.** It is tagged `doctrine-unproved` but is
+classified `unenforced`, below the required minimum of `tested-only`: the suite checks
+that an expired record refuses at a later clock reading, but neither code nor test
+prevents revival after clock rollback or public clone-and-extension.
+
+No `proved` row is classified `tested-only` or `unenforced`; therefore no proved row
+independently triggers the gate's classification rule. Rows 1, 2, 6–9, 14, 21, 27, and
+29 are nevertheless materially looser than specified for the gaps stated in the table.
+Row 30 meets only the minimum doctrine threshold (`tested-only`) and does not implement
+the protocol obligation it names. The freeze must not proceed until a fresh audit can
+classify row 25 at least `tested-only` (and any implementation change is audited on what
+it actually enforces).

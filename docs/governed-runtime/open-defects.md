@@ -38,13 +38,36 @@ harden (validate the transition inside the store) or narrow the claims and the v
 
 Affects conformance rows 1, 2, 5, 6, 14, 16, 27, 29 ("checked but looser") and 11.
 
-### Clone-and-extend on core domain values — authority-leak shape
+### Invariant 25 / clone-and-extend — expiry revival — **NOW THE FREEZE BLOCKER**
 
-`StandingGrant` and `ReservationClaim` have public fields, so a caller using a bridge
-directly can clone an expired value, extend `expires_at`, and present it as valid; only
-the persisted store path prevents that revival (conformance row 25). Operator ruling: same
-authority-leak shape as the store issue; **likely requires constructor/privacy hardening
-rather than more bridge checks.**
+Re-audit of the patched tree (2026-07-24) classified row 25 `unenforced`, below the
+`tested-only` minimum its `doctrine-unproved` tag requires, and it is now the sole freeze
+blocker. Two revival paths:
+
+1. **Clock rollback.** Expiry is judged by comparing the presented `now` against
+   `expires_at`; no irreversible expired state is ever recorded. A backward clock reading
+   makes a previously-refused record valid again. (Invariant 26 makes clock readings
+   authoritative — an `implementation-choice` — so this is the cost of that choice.)
+2. **Clone-and-extend.** `StandingGrant` and `ReservationClaim` have public fields; a
+   caller using a bridge directly can clone an expired value, raise `expires_at`, and
+   present it as valid. Only the persisted store path prevents that.
+
+Existing tests assert that an expired record *refuses*, never that it does not *revive* —
+which is precisely the distinction N7 names. Operator ruling: same authority-leak shape as
+the store issue; **likely requires constructor/privacy hardening rather than more bridge
+checks.** Minimum to unblock the freeze: a test asserting non-revival. Proper fix: private
+fields with validated constructors, and/or a durable expired marker.
+
+### Invariant 8 residual — journal digest and expected result unverified
+
+The re-audit accepts row 8 as `checked` but notes a remaining looseness: neither the
+fact's `journal_digest` nor its `expected_result_commit` is checked against a persisted
+broker journal, and `Store::record_recovery_fact` accepts caller-constructed facts. A
+correctly contextualized but self-authored expected result can therefore still drive a
+`CommittedViaRecovery` when the ref happens to hold that commit. Narrower than the closed
+defect (all six context fields must now match the real attempt), but the same family:
+evidence partly self-authored. Not currently blocking; fix would verify the fact's journal
+digest against the stored journal for that dispatch.
 
 ### N3 / invariant 30 — missing-bridge refusal is a protocol obligation
 
