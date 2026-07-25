@@ -2,6 +2,8 @@
 
 pub mod dispatch;
 pub mod dossier;
+pub mod journal;
+pub mod list;
 pub mod preparation;
 pub mod ratification;
 pub mod reconcile;

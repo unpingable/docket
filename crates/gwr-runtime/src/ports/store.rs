@@ -103,6 +103,10 @@ pub trait Store {
     fn admit_attempt(&mut self, attempt: &PreparedAttempt) -> Result<(), StoreError>;
     fn get_attempt(&mut self, id: AttemptId) -> Result<ProjectedAttempt, StoreError>;
     fn find_attempt_dispatch(&mut self, id: AttemptId) -> Result<Option<DispatchId>, StoreError>;
+    /// The attempt a persisted dispatch identity belongs to, if any. The
+    /// schema guarantees at most one (`dispatch.id` is the primary key and
+    /// `dispatch.attempt` is unique), so this cannot be multiply bound.
+    fn find_dispatch_attempt(&mut self, id: DispatchId) -> Result<Option<AttemptId>, StoreError>;
     /// The dispatch envelope persisted for an attempt, so a runtime that died
     /// mid-dispatch can present it to the broker again for inspection.
     fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError>;

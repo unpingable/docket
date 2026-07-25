@@ -757,6 +757,17 @@ impl Store for SqliteStore {
             .map_err(backend)
     }
 
+    fn find_dispatch_attempt(&mut self, id: DispatchId) -> Result<Option<AttemptId>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT attempt FROM dispatch WHERE id=?1",
+                params![id16(id.as_bytes())],
+                |r| parse_id16::<AttemptId>(&r.get::<_, String>(0)?).map_err(sql_corrupt),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError> {
         self.conn
             .query_row(

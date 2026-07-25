@@ -24,6 +24,8 @@ use gwr_runtime::ports::labor_provider::BoundedAssignment;
 use gwr_runtime::ports::store::Store;
 use gwr_runtime::services::dispatch::{dispatch, DispatchOutcome};
 use gwr_runtime::services::dossier;
+use gwr_runtime::services::journal;
+use gwr_runtime::services::list;
 use gwr_runtime::services::preparation::{run_preparation, PreparationResult};
 use gwr_runtime::services::ratification::ratify;
 use gwr_runtime::services::reconcile::reconcile;
@@ -139,6 +141,39 @@ impl State {
                     .with_file_name("gwr-git-broker")
             });
         SubprocessGitBroker::new(bin, self.dir.join("journals"), self.dir.join("artifacts"))
+    }
+}
+
+/// Resolve the attempt a read command addresses, by exactly one of
+/// `--attempt` or `--dispatch`. A dispatch identity resolves through the
+/// recorded dispatch binding; an unknown, malformed, or ambiguous identifier
+/// is a typed refusal, never a silent selection. (The schema makes a dispatch
+/// identity bind at most one attempt: `dispatch.id` is the primary key and
+/// `dispatch.attempt` is unique.)
+fn resolve_attempt(st: &mut State, args: &[String]) -> Result<AttemptId, String> {
+    match (flag(args, "--attempt"), flag(args, "--dispatch")) {
+        (Some(_), Some(_)) => Err("give exactly one of --attempt or --dispatch, not both".into()),
+        (None, None) => Err("missing --attempt or --dispatch".into()),
+        (Some(a), None) => Ok(AttemptId::from_bytes(parse16(&a)?)),
+        (None, Some(d)) => {
+            let dispatch_id = DispatchId::from_bytes(parse16(&d)?);
+            st.store
+                .find_dispatch_attempt(dispatch_id)
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or_else(|| format!("unknown dispatch identity {d}"))
+        }
+    }
+}
+
+/// A missing associated record is an ordinary absence on read paths; every
+/// other store error is surfaced.
+fn optional_read<T>(
+    r: Result<T, gwr_runtime::ports::store::StoreError>,
+) -> Result<Option<T>, String> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(gwr_runtime::ports::store::StoreError::NotFound) => Ok(None),
+        Err(e) => Err(format!("{e:?}")),
     }
 }
 
@@ -560,36 +595,19 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         ["docket", "list"] | ["list"] => {
             let mut st = State::open(args)?;
-            let json = has(args, "--json");
-            let attempts = st.store.list_attempts().map_err(|e| format!("{e:?}"))?;
-            if json {
-                let mut rows = Vec::new();
-                for id in attempts {
-                    let p = st.store.get_attempt(id).map_err(|e| format!("{e:?}"))?;
-                    rows.push(format!(
-                        "{{\"attempt\":\"{}\",\"state\":\"{}\",\"version\":{}}}",
-                        hex16s(id.as_bytes()),
-                        state_tag(&p.state),
-                        p.version
-                    ));
-                }
-                println!("[{}]", rows.join(","));
+            // One canonical list model sources both renderings; the human
+            // table truncates long values, the JSON carries them complete.
+            let rows = list::assemble_list(&mut st.store).map_err(|e| format!("{e:?}"))?;
+            if has(args, "--json") {
+                println!("{}", list::render_list_json(&rows));
             } else {
-                for id in attempts {
-                    let p = st.store.get_attempt(id).map_err(|e| format!("{e:?}"))?;
-                    println!(
-                        "attempt {} state {} version {}",
-                        hex16s(id.as_bytes()),
-                        state_tag(&p.state),
-                        p.version
-                    );
-                }
+                print!("{}", list::render_list_text(&rows));
             }
             Ok(())
         }
         ["docket", "show"] | ["show"] => {
             let mut st = State::open(args)?;
-            let attempt = AttemptId::from_bytes(parse16(&need(args, "--attempt")?)?);
+            let attempt = resolve_attempt(&mut st, args)?;
             // One canonical read model sources both surfaces; the human and
             // JSON renderings are pure functions of the same assembled value.
             let d = dossier::assemble(&mut st.store, attempt).map_err(|e| format!("{e:?}"))?;
@@ -600,11 +618,50 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["docket", "journal"] | ["journal"] => {
+            let mut st = State::open(args)?;
+            let attempt = resolve_attempt(&mut st, args)?;
+            // Resolve through the recorded dispatch binding, derive the
+            // expected digest from the persisted outcome records, and load
+            // only the journal the store records for that dispatch. The pure
+            // inspection verifies before a byte of content is rendered.
+            let dispatch_id = st
+                .store
+                .find_attempt_dispatch(attempt)
+                .map_err(|e| format!("{e:?}"))?;
+            let commitment = optional_read(st.store.get_commitment(attempt))?;
+            let refusal = st
+                .store
+                .get_dispatch_refusal(attempt)
+                .map_err(|e| format!("{e:?}"))?;
+            let indeterminate = optional_read(st.store.get_indeterminate(attempt))?;
+            let expectation = journal::expectation(
+                dispatch_id.is_some(),
+                commitment.as_ref(),
+                refusal.as_ref(),
+                indeterminate.as_ref(),
+            );
+            let bytes = dispatch_id.and_then(|d| {
+                std::fs::read(
+                    st.dir
+                        .join("journals")
+                        .join(format!("{}.journal", hex16s(d.as_bytes()))),
+                )
+                .ok()
+            });
+            let view = journal::inspect(attempt, dispatch_id, expectation, bytes.as_deref());
+            if has(args, "--json") {
+                println!("{}", journal::render_journal_json(&view));
+            } else {
+                print!("{}", journal::render_journal_text(&view));
+            }
+            Ok(())
+        }
         _ => Err(format!(
             "unknown command {cmd:?}; commands: request create, prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
              rely review-queue, reconcile, recover fact, recover resolve, docket list, \
-             docket show"
+             docket show, docket journal"
         )),
     }
 }
