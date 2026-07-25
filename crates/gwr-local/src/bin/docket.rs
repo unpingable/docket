@@ -300,6 +300,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 .filter_map(|(i, _)| args.get(i + 1).cloned())
                 .collect();
             let observe_cmd = need(args, "--observe")?;
+            // An observation plan is fixed at admission and can never be edited,
+            // so an empty one would mint an attempt that is committable but
+            // permanently unobservable. Refuse at the input boundary.
+            if observe_cmd.split_whitespace().next().is_none() {
+                return Err("--observe names no command".into());
+            }
             let attempt = PreparedAttempt::admit(
                 AttemptId::from_bytes(st.ids.fresh16()),
                 request,

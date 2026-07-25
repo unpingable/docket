@@ -39,6 +39,41 @@ pub struct RecoveryFact {
     pub recorded_at: ClockReading,
 }
 
+/// The custody premise `ProvenNotCommitted` rests on, named so that it cannot be
+/// dropped silently.
+///
+/// Recovery reads the target ref and infers from `observed_ref == basis` that the
+/// effect did not land. That inference is valid only if nothing but the governed
+/// broker could have moved the ref between dispatch and this reading. Otherwise
+/// two histories are observationally identical:
+///
+/// - **H₁** — the effect never landed;
+/// - **H₂** — the effect landed, and the ref was later returned to the basis.
+///
+/// Endpoint equality is not occurrence history (packet negative N6, in its
+/// runtime form). The runtime cannot separate H₁ from H₂ after the fact: under
+/// Git's default `core.logAllRefUpdates`, `refs/gwr/*` carries no reflog, so no
+/// durable evidence of an intervening update survives anywhere.
+///
+/// This type verifies nothing — no in-process check can establish who else can
+/// write a ref. It records that the caller asserts custody, and makes that
+/// assertion a *required argument of the verdict* rather than unstated
+/// background. `ProvenNotCommitted` proves non-occurrence only relative to it;
+/// without it the honest reading of the same evidence is the weaker "the effect
+/// is not presently reflected in the governed ref".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExclusiveRefCustody(());
+
+impl ExclusiveRefCustody {
+    /// Assert that the governed broker is the only writer of this target ref
+    /// from dispatch through the recovery observation. Asserted by the
+    /// deployment, never verified by the runtime; see the type documentation and
+    /// `docs/governed-runtime/trust-model.md`.
+    pub fn asserted_by_deployment() -> Self {
+        Self(())
+    }
+}
+
 /// Everything the runtime itself established about an indeterminate dispatch.
 ///
 /// A recovery fact carries a copy of every one of these. Those copies are the
@@ -70,6 +105,9 @@ pub struct AuthoritativeBinding<'a> {
     pub observed_ref: &'a CommitHash,
     pub expected_result: Option<&'a CommitHash>,
     pub observed_ref_owner: Option<AttemptId>,
+    /// The premise under which a ref reading can speak about non-occurrence.
+    /// Required, not defaulted: see [`ExclusiveRefCustody`].
+    pub custody: ExclusiveRefCustody,
 }
 
 impl AuthoritativeBinding<'_> {
@@ -77,7 +115,14 @@ impl AuthoritativeBinding<'_> {
     /// is not consulted: it has already been required to agree with all of this
     /// by `validate_fact_binding`, and it is evidence of an observation, not a
     /// source of the verdict.
+    ///
+    /// **Both verdicts are relative to [`ExclusiveRefCustody`].** The ref reading
+    /// is the whole evidentiary basis for `ProvenNotCommitted`, and a ref that
+    /// another writer can move carries no information about non-occurrence. The
+    /// premise is carried in `self.custody` so it appears at every call site.
     pub fn establishes(&self) -> Option<RecoveryVerdict> {
+        // Named so the premise is visibly load-bearing here rather than implied.
+        let ExclusiveRefCustody(()) = self.custody;
         // A commit the ledger attributes to a different attempt cannot settle
         // this one, in either direction. Structural, not a careful comparison.
         if let Some(owner) = self.observed_ref_owner {

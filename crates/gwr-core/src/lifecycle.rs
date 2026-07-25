@@ -47,9 +47,20 @@ pub struct RecoveryResolutionRef {
 }
 
 /// The two ways out of indeterminacy — and the only two.
+///
+/// Both are established by reading the governed target ref, so both are valid
+/// only under `recovery::ExclusiveRefCustody`: the premise that the governed
+/// broker is the sole writer of that ref from dispatch through the recovery
+/// observation. Without it, a ref reading cannot distinguish "the effect never
+/// landed" from "the effect landed and the ref was moved back", and
+/// `ProvenNotCommitted` proves only that the effect is not presently reflected
+/// in the ref. The premise is not verified by this runtime; it is asserted by
+/// the deployment and stated in `docs/governed-runtime/trust-model.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecoveryVerdict {
     CommittedViaRecovery,
+    /// Terminal. Reads as non-occurrence **relative to the custody premise
+    /// above**, not as an unconditional proof that no commit ever happened.
     ProvenNotCommitted,
 }
 

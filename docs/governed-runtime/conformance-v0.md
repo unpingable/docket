@@ -1,5 +1,12 @@
 # Governed Runtime v0 Conformance Audit
 
+> **Superseded in part.** The table in section 1 and the verdict in section 3 record the
+> *first* audit, against the tree before the repair campaign. They are retained because
+> the repair record and the freeze argument both refer back to them. For the
+> classification that governs the freeze, see
+> [`conformance-v0-second-pass.md`](conformance-v0-second-pass.md) — a blind re-audit of
+> the patched tree, which supersedes section 3 and reclassifies rows 6, 8, 25, and 27.
+
 ## 1 — Enforcement table
 
 The classifications below describe the code that exists, including its public seams, not

@@ -33,8 +33,18 @@ fn hex16(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Strictly canonical lowercase hex. `u8::from_str_radix` also accepts uppercase,
+/// which made two distinct token strings carry the same MAC bytes: one grant, two
+/// valid tokens. Encoding is part of what is authenticated, so a non-canonical
+/// spelling is an integrity failure, not a formatting preference.
 fn unhex(hex: &str, out: &mut [u8]) -> Result<(), StandingRefusal> {
     if hex.len() != out.len() * 2 {
+        return Err(StandingRefusal::IntegrityFailure);
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(StandingRefusal::IntegrityFailure);
     }
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
@@ -113,7 +123,6 @@ impl StandingTokenCodec {
         let (payload, tag) = token
             .rsplit_once('|')
             .ok_or(StandingRefusal::IntegrityFailure)?;
-        let expected = self.mac(payload);
         // Constant-time comparison via the hmac crate's verify.
         let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac accepts any key length");
         mac.update(payload.as_bytes());
@@ -121,7 +130,6 @@ impl StandingTokenCodec {
         unhex(tag, &mut tag_bytes)?;
         mac.verify_slice(&tag_bytes)
             .map_err(|_| StandingRefusal::IntegrityFailure)?;
-        debug_assert_eq!(expected, tag);
 
         let (prefix, rest) = Self::take_field(payload)?;
         if prefix != TOKEN_PREFIX {
@@ -162,10 +170,16 @@ impl StandingTokenCodec {
             },
             ClockReading(expires_at),
         );
-        // Every accepted parse must re-encode to exactly the bytes that were
-        // signed. This is what makes "the scope this token names" and "the
-        // scope whose bytes carry the MAC" the same object by construction.
-        if Self::payload(&grant) != payload {
+        // Every accepted token must re-encode to exactly the bytes presented —
+        // payload *and* tag. This is what makes "the scope this token names" and
+        // "the scope whose bytes carry the MAC" the same object by construction,
+        // and it makes the accepted token text canonical: one grant, one token.
+        //
+        // This check runs in every build profile. A `debug_assert!` stood here
+        // once and was the only thing that noticed a non-canonical tag — by
+        // panicking in debug on operator-supplied input while release accepted
+        // it. A correctness mechanism that disagrees between profiles is not one.
+        if self.issue(&grant) != token {
             return Err(StandingRefusal::IntegrityFailure);
         }
         Ok(grant)

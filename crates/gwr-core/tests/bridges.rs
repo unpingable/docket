@@ -269,6 +269,7 @@ fn auth_for<'a>(
         observed_ref,
         expected_result,
         observed_ref_owner: None,
+        custody: gwr_core::recovery::ExclusiveRefCustody::asserted_by_deployment(),
     }
 }
 

@@ -80,6 +80,7 @@ fn auth<'a>(att: &'a PreparedAttempt, w: &'a World) -> AuthoritativeBinding<'a> 
         observed_ref: &w.observed_ref,
         expected_result: w.expected_result.as_ref(),
         observed_ref_owner: w.observed_ref_owner,
+        custody: gwr_core::recovery::ExclusiveRefCustody::asserted_by_deployment(),
     }
 }
 

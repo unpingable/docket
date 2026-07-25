@@ -16,6 +16,11 @@ use std::process::Command;
 pub enum ObserveError {
     Store(StoreError),
     Io(String),
+    /// The attempt's observation plan names no command. Operator input, not an
+    /// impossible internal state: it is refused before anything is run and
+    /// before any record is written, so the commitment stands untouched and the
+    /// attempt is not consumed by a malformed invocation.
+    EmptyObservationPlan,
 }
 
 impl From<StoreError> for ObserveError {
@@ -34,6 +39,16 @@ pub fn observe(
 ) -> Result<ObservationRecord, ObserveError> {
     let projected = store.get_attempt(attempt_id)?;
     let commitment = store.get_commitment(attempt_id)?;
+
+    // Refuse before indexing, before the worktree exists, and before any record
+    // is written. Observation happens after commitment, so a malformed plan must
+    // not strand a committed attempt: nothing here mutates the commitment, the
+    // projection, or the observation ledger.
+    let argv = projected.attempt.observation_plan.argv.clone();
+    if argv.is_empty() {
+        return Err(ObserveError::EmptyObservationPlan);
+    }
+
     let repo = projected.attempt.repository.as_str().to_string();
     let result_commit = commitment.result_commit.clone();
 
@@ -62,7 +77,6 @@ pub fn observe(
         )));
     }
 
-    let argv = projected.attempt.observation_plan.argv.clone();
     let output = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(&worktree)

@@ -186,7 +186,85 @@ open. Until it is closed, the honest claim is: *the adapter hands the provider n
 authority, and no longer places it adjacent to authority material, but does not confine
 it.*
 
+## Second blind review, 2026-07-25 — findings and dispositions
+
+A second blind pass re-ran the full invariant table and every recorded witness against the
+patched tree, and reviewed the six changed seams starting from the claimed invariants
+rather than the diff. Classification results: [`conformance-v0-second-pass.md`](conformance-v0-second-pass.md).
+
+All eight repair-campaign fixes were confirmed by witness, including V1 end-to-end through
+the real CLI (the in-repo regression for V1 is unit-level only and would not catch a
+regression in the `diff-index` invocation itself). Concurrency held at every durable
+boundary: four racing ratifications spent one grant, four racing dispatches produced one
+commitment and one journal.
+
+### Closed before the freeze
+
+**N-1 — `ProvenNotCommitted` proved less than its name said.** Recovery derives the
+verdict from a reading of the governed target ref. From "the ref holds the basis" the
+runtime concluded non-occurrence — but an external rollback produces two observationally
+identical states with different occurrence histories (the effect never landed; the effect
+landed and was reverted). Endpoint equivalence laundering history. No retained evidence
+separates them: `refs/gwr/*` carries no reflog under Git's default `core.logAllRefUpdates`,
+verified empirically.
+
+Fixed by making exclusivity an explicit premise of the verdict rather than unstated
+background. `gwr_core::recovery::ExclusiveRefCustody` is a required field of
+`AuthoritativeBinding`, so no code path reaches a verdict without naming it, and the
+premise now appears in the invariant table, the verdict documentation, the recovery API
+contract, [`trust-model.md`](trust-model.md), and this record. Reflog corroboration was
+considered and rejected as a *repair*: it improves evidence but does not prove
+non-occurrence, since retention, expiry, deletion, configuration, alternate mutation
+paths, and repository replacement all remain assumptions. Real ref mediation is a later
+deployment boundary, alongside provider confinement. Boundary specimen:
+`crates/gwr-local/tests/ref_custody_boundary.rs`, which asserts the *unsound* behaviour
+under violated custody — a statement of the boundary, not a check that the runtime
+defends it.
+
+**N-2 — standing-token MAC tags were non-canonical.** `u8::from_str_radix(_, 16)` accepts
+uppercase, so an uppercase tag passed the constant-time verify and then hit a
+`debug_assert_eq!` on the hex string: a panic in debug on operator-supplied input at the
+authority seam (`docket ratify`, exit 101), and silent acceptance in release, where one
+grant had two valid token texts. Fixed by requiring strictly canonical lowercase hex and
+checking that every accepted token re-encodes to exactly the bytes presented — payload
+*and* tag — in every build profile. The `debug_assert` is gone; a correctness mechanism
+that disagrees between profiles is not one. Regression:
+`crates/gwr-local/tests/token_canonicality.rs`, and the suite now runs under `--release`
+as well as debug.
+
+**N-3 — an empty observation plan stranded a committed attempt.** `observe()` indexed
+`argv[0]` unguarded; `--observe ""` admitted an attempt that committed normally and then
+panicked at observation (exit 101). Observation happens after commitment, so the property
+that matters is not merely "no panic": a malformed invocation must not consume or strand a
+committed attempt. Fixed at both ends — `ObserveError::EmptyObservationPlan` is returned
+before anything is run and before any record is written, and the CLI refuses an empty
+`--observe` at admission, since the plan is fixed at admission and can never be edited.
+Regression: `crates/gwr-local/tests/empty_observation_plan.rs`, which asserts the
+commitment, projection, version, and observation ledger are all untouched by the refusal.
+
+### Open — recorded as post-v0.1.0 work, not blockers
+
+These are looseness inside stated scope, not witnessed false claims. The distinction is
+the one this campaign established and is worth keeping.
+
+- **N-4** — `ObservationFailed` is returned before the claim check, so presenting an
+  inadmissible claim against a failed observation implies it would have been admissible
+  had the command passed.
+- **N-5** — persisted reliance refusals retain only attempt, kind, detail, and time; the
+  observation, consumer, and claim are dropped (row 21's value-level looseness).
+- **N-6** — `StandingGrant::from_persisted` and `ReservationClaim::from_persisted` are
+  public value-level constructors. No service path reaches them; every service loads
+  grants from the store by identity. Encapsulation debt, not a live authority leak.
+- **N-7** — `split_list` silently drops trailing bytes after the last well-formed element,
+  so decode is not injective over hand-written column values. The digest is recomputed
+  from the decoded value so no semantic drift is possible, but the stored
+  `prepared_digest` column is still never compared on read.
+- **N-8** — the broker envelope remains unauthenticated and under-parsed. Not charged as a
+  defect: anything able to run the broker could run `git update-ref` directly, so it is
+  not a privilege boundary. See [`trust-model.md`](trust-model.md) §1.
+
 ## Freeze gate
 
-Task 13 remains blocked until Task 12 is re-run against the patched tree and shows no
-`proved`-tagged invariant classified `tested-only` or `unenforced`.
+**Satisfied 2026-07-25.** The re-audit classifies no `proved`-tagged invariant as
+`tested-only` or `unenforced`, and row 25 — the sole remaining blocker — is now
+`tested-only`, the minimum its tag requires. N-1, N-2, and N-3 were closed before tagging.

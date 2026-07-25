@@ -8,6 +8,15 @@
 //! weighed — it produces no resolution and the attempt remains indeterminate.
 //! Does not transport: fault, blame, correctness, retry wisdom, or any
 //! reclassification of `DispatchRefused`.
+//!
+//! **Premise carried, not proved.** Both verdicts are derived from a reading of
+//! the governed target ref, so both are conditional on
+//! `recovery::ExclusiveRefCustody` — the deployment's assertion that the
+//! governed broker is the sole writer of that ref from dispatch through the
+//! recovery observation. The premise is a required field of the
+//! `AuthoritativeBinding` this bridge consumes, so no caller can reach a verdict
+//! without naming it. This bridge does not verify it and cannot: what else may
+//! write a Git ref is a property of the deployment, not of this process.
 
 use crate::domain::standing::{StandingAct, StandingGrant};
 use crate::ids::{ActorId, RecoveryResolutionId, StandingUseId};

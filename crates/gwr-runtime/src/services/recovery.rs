@@ -8,6 +8,16 @@
 //! agree with all of it; agreement makes it a usable observation, not an
 //! authority. Applying it additionally requires separately held recovery
 //! standing, and either half alone is refused.
+//!
+//! **What the ref reading can and cannot establish.** The current ref value is
+//! the entire evidentiary basis for `ProvenNotCommitted`. From "the ref holds
+//! the basis" this service concludes non-occurrence, which is sound only while
+//! the governed broker is the sole writer of that ref — the premise named by
+//! `ExclusiveRefCustody` and asserted here on the deployment's behalf. If any
+//! other writer can reach the ref, the same reading is equally consistent with
+//! an effect that landed and was reverted, and no durable evidence separates the
+//! two: `refs/gwr/*` carries no reflog under Git's default settings. See
+//! `docs/governed-runtime/trust-model.md`.
 
 use crate::ports::adapters::{Clock, IdSource};
 use crate::ports::recovery_evidence::{expected_result_from_journal, RecoveryEvidenceSource};
@@ -19,7 +29,7 @@ use gwr_core::ids::{
     ActorId, AttemptId, RecoveryFactId, RecoveryResolutionId, StandingGrantId, StandingUseId,
 };
 use gwr_core::lifecycle::AttemptState;
-use gwr_core::recovery::{AuthoritativeBinding, RecoveryResolution};
+use gwr_core::recovery::{AuthoritativeBinding, ExclusiveRefCustody, RecoveryResolution};
 use gwr_core::refusal::{RecoveryRefusal, TransitionRefusal};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +104,11 @@ pub fn resolve(
         observed_ref: &observed_ref,
         expected_result: expected_result.as_ref(),
         observed_ref_owner,
+        // The deployment asserts that the governed broker is the only writer of
+        // this target ref. The runtime cannot check that, and does not claim to:
+        // without it, `ProvenNotCommitted` reports only that the effect is not
+        // presently reflected in the ref, not that it never landed.
+        custody: ExclusiveRefCustody::asserted_by_deployment(),
     };
 
     let fact = store.get_recovery_fact(fact_id)?;
