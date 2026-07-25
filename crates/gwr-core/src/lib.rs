@@ -7,7 +7,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge;
 pub mod digest;
+pub mod domain;
 pub mod effect_spec;
 pub mod ids;
 pub mod lifecycle;
