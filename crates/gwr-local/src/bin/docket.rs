@@ -508,12 +508,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("token integrity: {e:?}"))?;
             let clock = SystemClock;
             let mut ids = HashChainIds::new();
+            let mut evidence =
+                gwr_local::recover::GitRecoveryEvidence::new(st.dir.join("journals"));
             let resolution = gwr_runtime::services::recovery::resolve(
                 &mut st.store,
                 attempt,
                 fact,
                 verified.id,
                 actor_id(&need(args, "--actor")?),
+                &mut evidence,
                 &clock,
                 &mut ids,
             )

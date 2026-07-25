@@ -18,7 +18,7 @@ use gwr_core::receipt::{DispatchEnvelope, RatificationReceipt, ReviewQueueAdmiss
 use gwr_core::reconciliation::{Reconciliation, ResidualObligation};
 use gwr_core::recovery::{RecoveryFact, RecoveryResolution};
 use gwr_core::refusal::RelianceRefusal;
-use gwr_core::work_request::{ClockReading, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, WorkRequest};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -148,6 +148,16 @@ pub trait Store {
         attempt: AttemptId,
     ) -> Result<Vec<ObservationRecord>, StoreError>;
     fn get_commitment(&mut self, attempt: AttemptId) -> Result<Commitment, StoreError>;
+    /// The indeterminate outcome recorded for an attempt, if any. Carries the
+    /// broker journal digest established at the moment of indeterminacy.
+    fn get_indeterminate(&mut self, attempt: AttemptId) -> Result<IndeterminateRecord, StoreError>;
+    /// The attempt whose committed effect produced this result commit, if the
+    /// runtime already recorded one. A commit already attributed to another
+    /// attempt cannot settle this one.
+    fn find_commitment_owner(
+        &mut self,
+        result_commit: &CommitHash,
+    ) -> Result<Option<AttemptId>, StoreError>;
     fn record_reliance_admission(&mut self, adm: &ReviewQueueAdmission) -> Result<(), StoreError>;
     fn record_reliance_refusal(
         &mut self,

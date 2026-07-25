@@ -39,13 +39,25 @@ pub struct RecoveryFact {
     pub recorded_at: ClockReading,
 }
 
-/// The authoritative binding a fact is checked against: the admitted attempt's
-/// own fields and the attempt's one dispatch identity, never the fact's.
+/// Everything the runtime itself established about an indeterminate dispatch.
 ///
-/// A recovery fact carries a copy of every binding field. Those copies are the
-/// fact's testimony, not the yardstick: comparing the fact against itself would
-/// reduce validation to "does this document agree with itself?" and would let a
-/// fact manufacture a verdict about an attempt it never touched.
+/// A recovery fact carries a copy of every one of these. Those copies are the
+/// fact's *testimony*; this struct is the *record*. The verdict is derived from
+/// this struct alone — a fact contributes no value to it — because a document
+/// that supplies both the proposition and its comparison baseline reduces
+/// validation to "does this agree with itself?"
+///
+/// Sources, none of them the fact:
+/// - identity, repository, ref, basis: the admitted attempt and its persisted
+///   dispatch;
+/// - `journal_digest`: recorded when the dispatch became indeterminate;
+/// - `expected_result`: parsed from the broker journal *after* that journal is
+///   confirmed to hash to `journal_digest`;
+/// - `observed_ref`: read from the repository by the runtime at resolution;
+/// - `observed_ref_owner`: the commitment ledger's attribution of that commit.
+///
+/// Journal-digest binding answers "was this altered since we recorded it?", not
+/// "was this true?" — which is why commit attribution is checked separately.
 #[derive(Clone, Copy, Debug)]
 pub struct AuthoritativeBinding<'a> {
     pub attempt: AttemptId,
@@ -54,23 +66,33 @@ pub struct AuthoritativeBinding<'a> {
     pub repository: &'a RepositoryIdentity,
     pub target_ref: &'a RefName,
     pub basis: &'a CommitHash,
+    pub journal_digest: &'a Sha256Digest,
+    pub observed_ref: &'a CommitHash,
+    pub expected_result: Option<&'a CommitHash>,
+    pub observed_ref_owner: Option<AttemptId>,
 }
 
-impl RecoveryFact {
-    /// What this fact establishes about the attempt named by `authoritative` —
-    /// and only that attempt. The comparison baseline is the attempt's own
-    /// basis, never the fact's copy of it. Conflicting or insufficient evidence
-    /// establishes nothing and leaves the attempt indeterminate.
-    pub fn establishes(&self, authoritative: &AuthoritativeBinding<'_>) -> Option<RecoveryVerdict> {
-        // The ref still holds the attempt's real basis: the effect did not land.
-        if &self.observed_ref == authoritative.basis {
+impl AuthoritativeBinding<'_> {
+    /// What the runtime's own records establish about this dispatch. The fact
+    /// is not consulted: it has already been required to agree with all of this
+    /// by `validate_fact_binding`, and it is evidence of an observation, not a
+    /// source of the verdict.
+    pub fn establishes(&self) -> Option<RecoveryVerdict> {
+        // A commit the ledger attributes to a different attempt cannot settle
+        // this one, in either direction. Structural, not a careful comparison.
+        if let Some(owner) = self.observed_ref_owner {
+            if owner != self.attempt {
+                return None;
+            }
+        }
+        // The ref still holds this attempt's real basis: the effect did not land.
+        if self.observed_ref == self.basis {
             return Some(RecoveryVerdict::ProvenNotCommitted);
         }
-        // The ref holds exactly the commit the broker journal established this
-        // dispatch would produce: the effect landed. A result equal to the basis
-        // is not a commitment, and is rejected above.
-        match &self.expected_result_commit {
-            Some(expected) if &self.observed_ref == expected && expected != authoritative.basis => {
+        // The ref holds exactly the commit this dispatch's own journal recorded
+        // creating. A "result" equal to the basis is not a commitment.
+        match self.expected_result {
+            Some(expected) if self.observed_ref == expected && expected != self.basis => {
                 Some(RecoveryVerdict::CommittedViaRecovery)
             }
             _ => None,
@@ -109,6 +131,19 @@ pub fn validate_fact_binding(
     }
     if &fact.basis != authoritative.basis {
         return Err(RecoveryRefusal::BasisMismatch);
+    }
+    // The fact's observations must agree with what the runtime established. A
+    // fact that disagrees is not a usable observation of this dispatch — and
+    // since the verdict comes from the record rather than the fact, a fact that
+    // agrees adds no authority either.
+    if &fact.journal_digest != authoritative.journal_digest {
+        return Err(RecoveryRefusal::JournalDigestMismatch);
+    }
+    if &fact.observed_ref != authoritative.observed_ref {
+        return Err(RecoveryRefusal::ObservedRefMismatch);
+    }
+    if fact.expected_result_commit.as_ref() != authoritative.expected_result {
+        return Err(RecoveryRefusal::ExpectedResultMismatch);
     }
     Ok(())
 }

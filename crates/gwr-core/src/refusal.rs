@@ -108,6 +108,17 @@ pub enum RecoveryRefusal {
     TargetRefMismatch,
     /// The fact names a different basis than the attempt was specified against.
     BasisMismatch,
+    /// The fact's journal digest is not the one recorded when this dispatch
+    /// became indeterminate: the journal it describes is not the journal the
+    /// runtime saw.
+    JournalDigestMismatch,
+    /// The fact's observed ref disagrees with what the runtime read.
+    ObservedRefMismatch,
+    /// The fact's expected result disagrees with the digest-verified journal.
+    ExpectedResultMismatch,
+    /// The observed commit is already attributed to a different attempt, so it
+    /// cannot settle this one.
+    CommitAttributedElsewhere,
     StandingInsufficient,
     StandingExpired,
     StandingAlreadyUsed,

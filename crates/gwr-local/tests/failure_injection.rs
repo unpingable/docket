@@ -184,6 +184,11 @@ fn ratify_and_reserve(fx: &mut Fx) {
     .unwrap();
 }
 
+/// The runtime's own reader of the world for recovery.
+fn evidence(fx: &Fx) -> gwr_local::recover::GitRecoveryEvidence {
+    gwr_local::recover::GitRecoveryEvidence::new(fx.repo.join(".gwr-journals"))
+}
+
 /// Drive to Indeterminate via a real broker crash after the named phase.
 fn drive_indeterminate(fx: &mut Fx, crash_after: &str) {
     ratify_and_reserve(fx);
@@ -521,12 +526,14 @@ fn lost_ack_after_ref_update_requires_recovery() {
     // Separate recovery standing resolves it — and only to a recovery verdict.
     let grant = grant_for(&fx, 6, StandingAct::ResolveRecovery);
     fx.store.create_standing_grant(&grant).unwrap();
+    let mut ev = evidence(&fx);
     let resolution = resolve(
         &mut fx.store,
         fx.att.attempt_id,
         fact.id,
         grant.id,
         ACTOR,
+        &mut ev,
         &clock,
         &mut fx.ids,
     )
@@ -650,12 +657,14 @@ fn recovery_fact_for_other_attempt_is_rejected() {
     fx.store.create_standing_grant(&grant).unwrap();
     let clock = FixedClock(ClockReading(100));
     let before = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    let mut ev = evidence(&fx);
     let err = resolve(
         &mut fx.store,
         fx.att.attempt_id,
         foreign.id,
         grant.id,
         ACTOR,
+        &mut ev,
         &clock,
         &mut fx.ids,
     )
@@ -693,12 +702,14 @@ fn recovery_requires_separate_standing() {
     let grant = grant_for(&fx, 61, StandingAct::Ratify);
     fx.store.create_standing_grant(&grant).unwrap();
     let before = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    let mut ev = evidence(&fx);
     let err = resolve(
         &mut fx.store,
         fx.att.attempt_id,
         fact.id,
         grant.id,
         ACTOR,
+        &mut ev,
         &clock,
         &mut fx.ids,
     )
@@ -852,4 +863,150 @@ fn unsupported_bridge_version_is_rejected() {
     fx.store
         .record_reliance_refusal(fx.att.attempt_id, &refusal, ClockReading(40))
         .unwrap();
+}
+
+/// V2 end-to-end: the blind review's witness. Attempt A crashed before the ref
+/// moved; attempt B later committed legitimately. Editing A's broker journal to
+/// claim B's commit as A's expected result must not mint a commitment for A.
+#[test]
+fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
+    let mut fx = fixture("tampered-journal");
+    drive_indeterminate(&mut fx, "commit_created");
+    // The ref never moved for A.
+    assert_eq!(sh(&fx.repo, &["git", "rev-parse", TARGET_REF]), fx.basis);
+
+    // Someone else's commit now sits on the ref, recorded as another attempt's
+    // commitment — the position after B commits legitimately.
+    let other_commit = sh(
+        &fx.repo,
+        &[
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            &sh(&fx.repo, &["git", "rev-parse", "HEAD^{tree}"]),
+            "-m",
+            "attempt B's effect",
+        ],
+    );
+    sh(&fx.repo, &["git", "update-ref", TARGET_REF, &other_commit]);
+    let attempt_b = AttemptId::from_bytes([22; 16]);
+    let b_commitment = gwr_core::outcome::Commitment {
+        attempt: attempt_b,
+        dispatch: DispatchId::from_bytes([23; 16]),
+        target_ref: RefName::new(TARGET_REF),
+        previous_value: CommitHash::new(&fx.basis),
+        result_commit: CommitHash::new(&other_commit),
+        journal_digest: Sha256Digest::of_bytes(b"b journal"),
+        committed_at: ClockReading(50),
+    };
+
+    // Tamper: rewrite A's journal so it claims B's commit as A's result.
+    let dispatch_hex: String = fx
+        .store
+        .find_attempt_dispatch(fx.att.attempt_id)
+        .unwrap()
+        .unwrap()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let journal_path = fx
+        .repo
+        .join(".gwr-journals")
+        .join(format!("{dispatch_hex}.journal"));
+    let original = std::fs::read_to_string(&journal_path).unwrap();
+    let tampered: String = original
+        .lines()
+        .map(|l| {
+            if l.starts_with("commit_created ") {
+                format!("commit_created {other_commit}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&journal_path, format!("{tampered}\n")).unwrap();
+
+    let clock = FixedClock(ClockReading(100));
+    // Producing a fact from the tampered journal is allowed — facts are
+    // observations, and recording one changes nothing.
+    let fact = gwr_local::recover::produce_fact(
+        &mut fx.store,
+        fx.att.attempt_id,
+        &fx.repo.join(".gwr-journals"),
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap();
+
+    let grant = grant_for(&fx, 6, StandingAct::ResolveRecovery);
+    fx.store.create_standing_grant(&grant).unwrap();
+    let before = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    let mut ev = evidence(&fx);
+    let err = resolve(
+        &mut fx.store,
+        fx.att.attempt_id,
+        fact.id,
+        grant.id,
+        ACTOR,
+        &mut ev,
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap_err();
+    // The runtime holds the digest recorded at indeterminacy and compares it.
+    assert_eq!(
+        err,
+        ResolveError::Bridge(rec_bridge::Refusal::Recovery(
+            RecoveryRefusal::JournalDigestMismatch
+        ))
+    );
+    let after = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    assert_eq!(before.state, after.state);
+    assert!(matches!(after.state, AttemptState::Indeterminate { .. }));
+    assert_eq!(
+        fx.store.get_standing_grant(grant.id).unwrap().state,
+        GrantState::Available
+    );
+
+    // Even with an untampered journal, another attempt's commit cannot settle
+    // this one: record B's commitment and restore the journal.
+    std::fs::write(&journal_path, &original).unwrap();
+    let dispatching_b = AttemptState::Prepared;
+    let _ = dispatching_b;
+    fx.store
+        .record_commitment_for_test(&b_commitment)
+        .expect("record B's commitment");
+    let fact2 = gwr_local::recover::produce_fact(
+        &mut fx.store,
+        fx.att.attempt_id,
+        &fx.repo.join(".gwr-journals"),
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap();
+    let mut ev = evidence(&fx);
+    let err = resolve(
+        &mut fx.store,
+        fx.att.attempt_id,
+        fact2.id,
+        grant.id,
+        ACTOR,
+        &mut ev,
+        &clock,
+        &mut fx.ids,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        ResolveError::Bridge(rec_bridge::Refusal::Recovery(
+            RecoveryRefusal::CommitAttributedElsewhere
+        ))
+    );
+    let after = fx.store.get_attempt(fx.att.attempt_id).unwrap();
+    assert!(matches!(after.state, AttemptState::Indeterminate { .. }));
 }

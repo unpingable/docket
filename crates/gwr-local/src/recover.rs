@@ -14,6 +14,53 @@ use gwr_runtime::ports::store::{Store, StoreError};
 use std::path::Path;
 use std::process::Command;
 
+/// Reads the world for the recovery path: the current ref value from the
+/// governed repository, and the broker journal for a dispatch. These are the
+/// runtime's own readings — never a recovery fact's report of them.
+pub struct GitRecoveryEvidence {
+    pub journal_dir: std::path::PathBuf,
+}
+
+impl GitRecoveryEvidence {
+    pub fn new(journal_dir: std::path::PathBuf) -> Self {
+        Self { journal_dir }
+    }
+}
+
+impl gwr_runtime::ports::recovery_evidence::RecoveryEvidenceSource for GitRecoveryEvidence {
+    fn read_target_ref(
+        &mut self,
+        repository: &gwr_core::work_request::RepositoryIdentity,
+        target_ref: &gwr_core::work_request::RefName,
+    ) -> Result<CommitHash, String> {
+        let out = Command::new("git")
+            .args([
+                "-C",
+                repository.as_str(),
+                "rev-parse",
+                "--verify",
+                target_ref.as_str(),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("cannot read {}", target_ref.as_str()));
+        }
+        Ok(CommitHash::new(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
+    }
+
+    fn read_journal(&mut self, dispatch: gwr_core::ids::DispatchId) -> Result<Vec<u8>, String> {
+        let hex: String = dispatch
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Ok(std::fs::read(self.journal_dir.join(format!("{hex}.journal"))).unwrap_or_default())
+    }
+}
+
 #[derive(Debug)]
 pub enum RecoverError {
     Store(StoreError),

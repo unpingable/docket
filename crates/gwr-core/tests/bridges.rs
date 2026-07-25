@@ -253,6 +253,28 @@ fn a_passing_test_cannot_support_obligation_closure() {
     assert_eq!(obs, before);
 }
 
+/// Authoritative binding for an attempt, with the runtime's readings supplied
+/// explicitly by the test.
+fn auth_for<'a>(
+    att: &'a PreparedAttempt,
+    observed_ref: &'a CommitHash,
+    expected_result: Option<&'a CommitHash>,
+    journal_digest: &'a Sha256Digest,
+) -> gwr_core::recovery::AuthoritativeBinding<'a> {
+    gwr_core::recovery::AuthoritativeBinding {
+        attempt: att.attempt_id,
+        dispatch: DispatchId::from_bytes([8; 16]),
+        prepared_attempt_digest: &att.prepared_attempt_digest,
+        repository: &att.repository,
+        target_ref: &att.effect.target_ref,
+        basis: &att.effect.expected_basis,
+        journal_digest,
+        observed_ref,
+        expected_result,
+        observed_ref_owner: None,
+    }
+}
+
 fn fact_for(att: &PreparedAttempt, dispatch: [u8; 16]) -> RecoveryFact {
     RecoveryFact {
         id: RecoveryFactId::from_bytes([11; 16]),
@@ -281,8 +303,12 @@ fn recovery_evidence_for_attempt_a_cannot_resolve_attempt_b() {
         fact: &fact_a,
         grant: &grant,
         actor: ActorId::from_bytes([4; 16]),
-        attempt: &att_b,
-        dispatch: DispatchId::from_bytes([8; 16]),
+        authoritative: auth_for(
+            &att_b,
+            &fact_a.observed_ref,
+            fact_a.expected_result_commit.as_ref(),
+            &fact_a.journal_digest,
+        ),
         now: ClockReading(100),
         new_resolution: RecoveryResolutionId::from_bytes([12; 16]),
         new_use: StandingUseId::from_bytes([13; 16]),
@@ -306,8 +332,12 @@ fn valid_recovery_evidence_with_insufficient_standing_produces_a_refusal() {
         fact: &fact,
         grant: &grant,
         actor: ActorId::from_bytes([4; 16]),
-        attempt: &att,
-        dispatch: DispatchId::from_bytes([8; 16]),
+        authoritative: auth_for(
+            &att,
+            &fact.observed_ref,
+            fact.expected_result_commit.as_ref(),
+            &fact.journal_digest,
+        ),
         now: ClockReading(100),
         new_resolution: RecoveryResolutionId::from_bytes([12; 16]),
         new_use: StandingUseId::from_bytes([13; 16]),

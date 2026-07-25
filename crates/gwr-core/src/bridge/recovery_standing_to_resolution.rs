@@ -10,9 +10,8 @@
 //! reclassification of `DispatchRefused`.
 
 use crate::domain::standing::{StandingAct, StandingGrant};
-use crate::ids::{ActorId, DispatchId, RecoveryResolutionId, StandingUseId};
+use crate::ids::{ActorId, RecoveryResolutionId, StandingUseId};
 use crate::lifecycle::{RecoveryResolutionRef, RecoveryVerdict};
-use crate::prepared_attempt::PreparedAttempt;
 use crate::recovery::{
     validate_fact_binding, AuthoritativeBinding, RecoveryFact, RecoveryResolution,
 };
@@ -27,12 +26,9 @@ pub struct Input<'a> {
     pub fact: &'a RecoveryFact,
     pub grant: &'a StandingGrant,
     pub actor: ActorId,
-    /// The admitted attempt itself — the authoritative source of every binding
-    /// field. Passing the attempt rather than loose copies makes it structurally
-    /// impossible to check a fact against anything but the real attempt.
-    pub attempt: &'a PreparedAttempt,
-    /// The attempt's one dispatch identity, from the persisted lifecycle state.
-    pub dispatch: DispatchId,
+    /// Everything the runtime established about this dispatch. The verdict is
+    /// derived from this and nothing else; the fact must merely agree with it.
+    pub authoritative: AuthoritativeBinding<'a>,
     pub now: ClockReading,
     pub new_resolution: RecoveryResolutionId,
     pub new_use: StandingUseId,
@@ -59,16 +55,19 @@ pub fn cross(input: Input<'_>) -> Result<Output, Refusal> {
             presented: input.version,
         });
     }
-    let authoritative = AuthoritativeBinding {
-        attempt: input.attempt.attempt_id,
-        dispatch: input.dispatch,
-        prepared_attempt_digest: &input.attempt.prepared_attempt_digest,
-        repository: &input.attempt.repository,
-        target_ref: &input.attempt.effect.target_ref,
-        basis: &input.attempt.effect.expected_basis,
-    };
+    let authoritative = input.authoritative;
+    // A commit the ledger attributes to another attempt is structurally
+    // incapable of settling this one; say so with its own refusal rather than
+    // letting it fall through as merely inconclusive.
+    if let Some(owner) = authoritative.observed_ref_owner {
+        if owner != authoritative.attempt {
+            return Err(Refusal::Recovery(
+                RecoveryRefusal::CommitAttributedElsewhere,
+            ));
+        }
+    }
     validate_fact_binding(input.fact, &authoritative).map_err(Refusal::Recovery)?;
-    let Some(verdict) = input.fact.establishes(&authoritative) else {
+    let Some(verdict) = authoritative.establishes() else {
         return Err(Refusal::Recovery(RecoveryRefusal::ConflictingEvidence));
     };
     let (consumed_grant, standing_use) = input
@@ -93,7 +92,7 @@ pub fn cross(input: Input<'_>) -> Result<Output, Refusal> {
     let resolution = RecoveryResolution {
         id: input.new_resolution,
         attempt: authoritative.attempt,
-        dispatch: input.dispatch,
+        dispatch: authoritative.dispatch,
         fact: input.fact.id,
         verdict,
         recovery_standing_use: standing_use.id,

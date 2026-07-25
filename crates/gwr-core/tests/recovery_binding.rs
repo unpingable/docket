@@ -1,10 +1,17 @@
-//! Regression suite for the invariant-8 defect found by the Task 12 conformance
-//! audit (2026-07-24): `validate_fact_binding` checked only attempt, dispatch,
-//! and prepared-attempt digest, and `establishes()` compared the observed ref
-//! against the fact's *own* copy of the basis. A recovery fact could therefore
-//! supply both the proposition and the comparison baseline — self-certifying
-//! evidence — and manufacture a false `ProvenNotCommitted` for an attempt it
-//! never touched.
+//! Regression suite for the recovery-evidence defects.
+//!
+//! Round one (Task 12 audit): `validate_fact_binding` checked only attempt,
+//! dispatch, and prepared-attempt digest, and the verdict was read off the
+//! fact's own copy of the basis.
+//!
+//! Round two (V2, blind adversarial review): the verdict was still derived from
+//! the fact's `observed_ref` and `expected_result_commit`. A fact with every
+//! *checked* binding copied faithfully and invented result fields minted
+//! `CommittedViaRecovery` for an effect that never landed — including by
+//! claiming another attempt's commit.
+//!
+//! The verdict now comes from `AuthoritativeBinding` — the runtime's own
+//! records — and the fact must merely agree with it.
 
 use gwr_core::digest::Sha256Digest;
 use gwr_core::effect_spec::GitRefEffect;
@@ -19,7 +26,8 @@ use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdenti
 const REAL_REPO: &str = "/governed/repo";
 const REAL_REF: &str = "refs/gwr/target";
 const REAL_BASIS: &str = "basis-aaa";
-const RESULT: &str = "result-ccc";
+const OUR_RESULT: &str = "result-ccc";
+const OTHER_ATTEMPT_COMMIT: &str = "result-bbb-owned-by-attempt-b";
 
 fn attempt() -> PreparedAttempt {
     PreparedAttempt::admit(
@@ -43,7 +51,24 @@ fn attempt() -> PreparedAttempt {
     )
 }
 
-fn authoritative(att: &PreparedAttempt) -> AuthoritativeBinding<'_> {
+/// The runtime's record: its own ref reading, its own digest-verified journal.
+struct World {
+    journal_digest: Sha256Digest,
+    observed_ref: CommitHash,
+    expected_result: Option<CommitHash>,
+    observed_ref_owner: Option<AttemptId>,
+}
+
+fn world(observed: &str, expected: Option<&str>, owner: Option<AttemptId>) -> World {
+    World {
+        journal_digest: Sha256Digest::of_bytes(b"the real journal"),
+        observed_ref: CommitHash::new(observed),
+        expected_result: expected.map(CommitHash::new),
+        observed_ref_owner: owner,
+    }
+}
+
+fn auth<'a>(att: &'a PreparedAttempt, w: &'a World) -> AuthoritativeBinding<'a> {
     AuthoritativeBinding {
         attempt: att.attempt_id,
         dispatch: DispatchId::from_bytes([8; 16]),
@@ -51,45 +76,16 @@ fn authoritative(att: &PreparedAttempt) -> AuthoritativeBinding<'_> {
         repository: &att.repository,
         target_ref: &att.effect.target_ref,
         basis: &att.effect.expected_basis,
+        journal_digest: &w.journal_digest,
+        observed_ref: &w.observed_ref,
+        expected_result: w.expected_result.as_ref(),
+        observed_ref_owner: w.observed_ref_owner,
     }
 }
 
-/// The witness from the audit, unchanged in construction: the three formerly
-/// checked fields are correct, every contextual binding points somewhere else.
-/// Previously ACCEPTED, and it drove `ProvenNotCommitted`.
-#[test]
-fn contradictory_context_is_refused() {
-    let att = attempt();
-    let auth = authoritative(&att);
-    let contradictory = RecoveryFact {
-        id: RecoveryFactId::from_bytes([1; 16]),
-        attempt: att.attempt_id,
-        dispatch: DispatchId::from_bytes([8; 16]),
-        prepared_attempt_digest: att.prepared_attempt_digest,
-        repository: RepositoryIdentity::new("/some/entirely/other/repo"),
-        target_ref: RefName::new("refs/heads/unrelated"),
-        basis: CommitHash::new("a-basis-the-attempt-never-had"),
-        observed_ref: CommitHash::new("a-basis-the-attempt-never-had"),
-        expected_result_commit: None,
-        journal_digest: Sha256Digest::of_bytes(b"unrelated journal"),
-        source: FactSource::OperatorSupplied("hand-written".into()),
-        recorded_at: ClockReading(1),
-    };
-    assert_eq!(
-        validate_fact_binding(&contradictory, &auth),
-        Err(RecoveryRefusal::RepositoryMismatch)
-    );
-    // And even if binding were waived, the verdict no longer follows from the
-    // fact's own basis: the observed ref is not the attempt's real basis.
-    assert_eq!(contradictory.establishes(&auth), None);
-}
-
-/// Each contextual field is load-bearing on its own.
-#[test]
-fn each_contextual_binding_is_checked_independently() {
-    let att = attempt();
-    let auth = authoritative(&att);
-    let good = RecoveryFact {
+/// A fact that faithfully reports the runtime's record.
+fn truthful_fact(att: &PreparedAttempt, w: &World) -> RecoveryFact {
+    RecoveryFact {
         id: RecoveryFactId::from_bytes([1; 16]),
         attempt: att.attempt_id,
         dispatch: DispatchId::from_bytes([8; 16]),
@@ -97,121 +93,214 @@ fn each_contextual_binding_is_checked_independently() {
         repository: RepositoryIdentity::new(REAL_REPO),
         target_ref: RefName::new(REAL_REF),
         basis: CommitHash::new(REAL_BASIS),
-        observed_ref: CommitHash::new(REAL_BASIS),
-        expected_result_commit: Some(CommitHash::new(RESULT)),
-        journal_digest: Sha256Digest::of_bytes(b"journal"),
+        observed_ref: w.observed_ref.clone(),
+        expected_result_commit: w.expected_result.clone(),
+        journal_digest: w.journal_digest,
         source: FactSource::RefInspection,
         recorded_at: ClockReading(90),
-    };
+    }
+}
 
-    let mut wrong_repo = good.clone();
-    wrong_repo.repository = RepositoryIdentity::new("/elsewhere");
+// ---------------------------------------------------------------- round one
+
+/// The Task 12 witness, unchanged in construction: correct attempt, dispatch,
+/// and digest; foreign repository, ref, and basis.
+#[test]
+fn contradictory_context_is_refused() {
+    let att = attempt();
+    let w = world(REAL_BASIS, None, None);
+    let a = auth(&att, &w);
+    let mut contradictory = truthful_fact(&att, &w);
+    contradictory.repository = RepositoryIdentity::new("/some/entirely/other/repo");
+    contradictory.target_ref = RefName::new("refs/heads/unrelated");
+    contradictory.basis = CommitHash::new("a-basis-the-attempt-never-had");
     assert_eq!(
-        validate_fact_binding(&wrong_repo, &auth),
+        validate_fact_binding(&contradictory, &a),
         Err(RecoveryRefusal::RepositoryMismatch)
     );
+}
 
-    let mut wrong_ref = good.clone();
-    wrong_ref.target_ref = RefName::new("refs/heads/main");
-    assert_eq!(
-        validate_fact_binding(&wrong_ref, &auth),
-        Err(RecoveryRefusal::TargetRefMismatch)
+#[test]
+fn each_contextual_binding_is_checked_independently() {
+    let att = attempt();
+    let w = world(REAL_BASIS, Some(OUR_RESULT), None);
+    let a = auth(&att, &w);
+    let good = truthful_fact(&att, &w);
+    assert_eq!(validate_fact_binding(&good, &a), Ok(()));
+
+    /// One mutation of a binding field and the refusal it must produce.
+    type Case = (
+        &'static str,
+        Box<dyn Fn(&mut RecoveryFact)>,
+        RecoveryRefusal,
     );
 
-    let mut wrong_basis = good.clone();
-    wrong_basis.basis = CommitHash::new("basis-zzz");
-    assert_eq!(
-        validate_fact_binding(&wrong_basis, &auth),
-        Err(RecoveryRefusal::BasisMismatch)
-    );
+    let cases: Vec<Case> = vec![
+        (
+            "repository",
+            Box::new(|f: &mut RecoveryFact| f.repository = RepositoryIdentity::new("/elsewhere")),
+            RecoveryRefusal::RepositoryMismatch,
+        ),
+        (
+            "target_ref",
+            Box::new(|f: &mut RecoveryFact| f.target_ref = RefName::new("refs/heads/main")),
+            RecoveryRefusal::TargetRefMismatch,
+        ),
+        (
+            "basis",
+            Box::new(|f: &mut RecoveryFact| f.basis = CommitHash::new("basis-zzz")),
+            RecoveryRefusal::BasisMismatch,
+        ),
+        (
+            "prepared_attempt_digest",
+            Box::new(|f: &mut RecoveryFact| {
+                f.prepared_attempt_digest = Sha256Digest::of_bytes(b"another attempt")
+            }),
+            RecoveryRefusal::BindingIncomplete,
+        ),
+        (
+            "journal_digest",
+            Box::new(|f: &mut RecoveryFact| {
+                f.journal_digest = Sha256Digest::of_bytes(b"a different journal")
+            }),
+            RecoveryRefusal::JournalDigestMismatch,
+        ),
+        (
+            "observed_ref",
+            Box::new(|f: &mut RecoveryFact| f.observed_ref = CommitHash::new("invented")),
+            RecoveryRefusal::ObservedRefMismatch,
+        ),
+        (
+            "expected_result_commit",
+            Box::new(|f: &mut RecoveryFact| {
+                f.expected_result_commit = Some(CommitHash::new("invented"))
+            }),
+            RecoveryRefusal::ExpectedResultMismatch,
+        ),
+    ];
+    for (field, mutate, expected) in cases {
+        let mut f = good.clone();
+        mutate(&mut f);
+        assert_eq!(
+            validate_fact_binding(&f, &a),
+            Err(expected),
+            "mutating {field} must be refused"
+        );
+    }
 
     let mut wrong_attempt = good.clone();
     wrong_attempt.attempt = AttemptId::from_bytes([77; 16]);
     assert!(matches!(
-        validate_fact_binding(&wrong_attempt, &auth),
+        validate_fact_binding(&wrong_attempt, &a),
         Err(RecoveryRefusal::AttemptMismatch { .. })
     ));
-
     let mut wrong_dispatch = good.clone();
     wrong_dispatch.dispatch = DispatchId::from_bytes([77; 16]);
     assert!(matches!(
-        validate_fact_binding(&wrong_dispatch, &auth),
+        validate_fact_binding(&wrong_dispatch, &a),
         Err(RecoveryRefusal::DispatchMismatch { .. })
     ));
-
-    let mut wrong_digest = good.clone();
-    wrong_digest.prepared_attempt_digest = Sha256Digest::of_bytes(b"another attempt");
-    assert_eq!(
-        validate_fact_binding(&wrong_digest, &auth),
-        Err(RecoveryRefusal::BindingIncomplete)
-    );
 }
 
-/// A correctly bound fact still resolves — in both directions.
+// ---------------------------------------------------------------- round two
+
+/// V2's port-level witness: every checked binding copied faithfully, result
+/// fields invented. The fact can no longer contribute a verdict at all, and its
+/// invented readings now disagree with the record and are refused.
+#[test]
+fn self_authored_result_fields_cannot_mint_a_commitment() {
+    let att = attempt();
+    // The runtime read the ref and found it still at the basis: nothing landed.
+    let w = world(REAL_BASIS, None, None);
+    let a = auth(&att, &w);
+
+    let mut fabricated = truthful_fact(&att, &w);
+    fabricated.observed_ref = CommitHash::new(OUR_RESULT);
+    fabricated.expected_result_commit = Some(CommitHash::new(OUR_RESULT));
+    fabricated.journal_digest = Sha256Digest::of_bytes(b"a journal I wrote myself");
+    fabricated.source = FactSource::BrokerJournal;
+
+    // Refused as evidence...
+    assert_eq!(
+        validate_fact_binding(&fabricated, &a),
+        Err(RecoveryRefusal::JournalDigestMismatch)
+    );
+    // ...and even waiving that, the record — not the fact — decides, and the
+    // record says the ref never moved.
+    assert_eq!(a.establishes(), Some(RecoveryVerdict::ProvenNotCommitted));
+}
+
+/// A commit belonging to another attempt is structurally incapable of settling
+/// this one, in either direction.
+#[test]
+fn another_attempts_commit_cannot_settle_this_attempt() {
+    let att = attempt();
+    let attempt_b = AttemptId::from_bytes([22; 16]);
+    // The ref holds B's commit; the ledger attributes it to B.
+    let w = world(
+        OTHER_ATTEMPT_COMMIT,
+        Some(OTHER_ATTEMPT_COMMIT),
+        Some(attempt_b),
+    );
+    let a = auth(&att, &w);
+    // Even with the journal claiming that commit as our expected result — the
+    // tampered-journal scenario — the verdict is withheld.
+    assert_eq!(a.establishes(), None);
+}
+
+/// Our own commit still settles our own attempt.
+#[test]
+fn our_own_commit_settles_our_own_attempt() {
+    let att = attempt();
+    let w = world(OUR_RESULT, Some(OUR_RESULT), Some(att.attempt_id));
+    let a = auth(&att, &w);
+    assert_eq!(a.establishes(), Some(RecoveryVerdict::CommittedViaRecovery));
+    assert_eq!(validate_fact_binding(&truthful_fact(&att, &w), &a), Ok(()));
+}
+
 #[test]
 fn correctly_bound_facts_still_establish_their_verdicts() {
     let att = attempt();
-    let auth = authoritative(&att);
-    let base = RecoveryFact {
-        id: RecoveryFactId::from_bytes([1; 16]),
-        attempt: att.attempt_id,
-        dispatch: DispatchId::from_bytes([8; 16]),
-        prepared_attempt_digest: att.prepared_attempt_digest,
-        repository: RepositoryIdentity::new(REAL_REPO),
-        target_ref: RefName::new(REAL_REF),
-        basis: CommitHash::new(REAL_BASIS),
-        observed_ref: CommitHash::new(REAL_BASIS),
-        expected_result_commit: Some(CommitHash::new(RESULT)),
-        journal_digest: Sha256Digest::of_bytes(b"journal"),
-        source: FactSource::RefInspection,
-        recorded_at: ClockReading(90),
-    };
 
-    // Ref still at the attempt's real basis: the effect did not land.
-    assert_eq!(validate_fact_binding(&base, &auth), Ok(()));
+    // Ref at the attempt's real basis: the effect did not land.
+    let not_committed = world(REAL_BASIS, Some(OUR_RESULT), None);
+    let a = auth(&att, &not_committed);
     assert_eq!(
-        base.establishes(&auth),
-        Some(RecoveryVerdict::ProvenNotCommitted)
+        validate_fact_binding(&truthful_fact(&att, &not_committed), &a),
+        Ok(())
     );
+    assert_eq!(a.establishes(), Some(RecoveryVerdict::ProvenNotCommitted));
 
-    // Ref at exactly the commit the journal said this dispatch would produce.
-    let mut committed = base.clone();
-    committed.observed_ref = CommitHash::new(RESULT);
-    assert_eq!(validate_fact_binding(&committed, &auth), Ok(()));
+    // Ref at exactly what this dispatch's journal recorded creating.
+    let committed = world(OUR_RESULT, Some(OUR_RESULT), None);
+    let a = auth(&att, &committed);
     assert_eq!(
-        committed.establishes(&auth),
-        Some(RecoveryVerdict::CommittedViaRecovery)
+        validate_fact_binding(&truthful_fact(&att, &committed), &a),
+        Ok(())
     );
+    assert_eq!(a.establishes(), Some(RecoveryVerdict::CommittedViaRecovery));
 
-    // Ref somewhere else entirely: conflicting evidence resolves nothing and
-    // the attempt stays indeterminate.
-    let mut third_party = base.clone();
-    third_party.observed_ref = CommitHash::new("someone-elses-commit");
-    assert_eq!(validate_fact_binding(&third_party, &auth), Ok(()));
-    assert_eq!(third_party.establishes(&auth), None);
+    // Ref somewhere else entirely, unattributed: conflicting, resolves nothing.
+    let third_party = world("someone-elses-commit", Some(OUR_RESULT), None);
+    let a = auth(&att, &third_party);
+    assert_eq!(a.establishes(), None);
+}
+
+/// A journal with no `commit_created` line yields no expected result, so a
+/// moved ref cannot be read as our commitment.
+#[test]
+fn absent_expected_result_cannot_establish_commitment() {
+    let att = attempt();
+    let w = world("some-other-commit", None, None);
+    let a = auth(&att, &w);
+    assert_eq!(a.establishes(), None);
 }
 
 /// A "result" equal to the basis is not a commitment: the ref never moved.
 #[test]
 fn expected_result_equal_to_basis_is_not_a_commitment() {
     let att = attempt();
-    let auth = authoritative(&att);
-    let degenerate = RecoveryFact {
-        id: RecoveryFactId::from_bytes([1; 16]),
-        attempt: att.attempt_id,
-        dispatch: DispatchId::from_bytes([8; 16]),
-        prepared_attempt_digest: att.prepared_attempt_digest,
-        repository: RepositoryIdentity::new(REAL_REPO),
-        target_ref: RefName::new(REAL_REF),
-        basis: CommitHash::new(REAL_BASIS),
-        observed_ref: CommitHash::new(REAL_BASIS),
-        expected_result_commit: Some(CommitHash::new(REAL_BASIS)),
-        journal_digest: Sha256Digest::of_bytes(b"journal"),
-        source: FactSource::OperatorSupplied("claims basis is the result".into()),
-        recorded_at: ClockReading(90),
-    };
-    assert_eq!(
-        degenerate.establishes(&auth),
-        Some(RecoveryVerdict::ProvenNotCommitted)
-    );
+    let w = world(REAL_BASIS, Some(REAL_BASIS), None);
+    let a = auth(&att, &w);
+    assert_eq!(a.establishes(), Some(RecoveryVerdict::ProvenNotCommitted));
 }

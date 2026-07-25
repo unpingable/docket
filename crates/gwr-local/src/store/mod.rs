@@ -51,6 +51,32 @@ impl SqliteStore {
         self.conn.transaction().map_err(backend)
     }
 
+    /// Insert a commitment row directly. Test support only: it exists so a
+    /// suite can stage another attempt's committed effect without driving that
+    /// attempt's whole lifecycle. It writes no projection.
+    pub fn record_commitment_for_test(
+        &mut self,
+        c: &gwr_core::outcome::Commitment,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO commitment
+                 (attempt, dispatch, target_ref, previous_value, result_commit, journal_digest, at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    id16(c.attempt.as_bytes()),
+                    id16(c.dispatch.as_bytes()),
+                    c.target_ref.as_str(),
+                    c.previous_value.as_str(),
+                    c.result_commit.as_str(),
+                    c.journal_digest.to_hex(),
+                    c.committed_at.0 as i64
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     /// Column names across every table, for boundary tests.
     pub fn all_column_names(&mut self) -> Result<Vec<String>, StoreError> {
         let mut names = Vec::new();
@@ -1200,6 +1226,42 @@ impl Store for SqliteStore {
             .optional()
             .map_err(backend)?
             .ok_or(StoreError::NotFound)
+    }
+
+    fn get_indeterminate(&mut self, attempt: AttemptId) -> Result<IndeterminateRecord, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT dispatch, last_journal_digest, at FROM indeterminate_outcome
+                 WHERE attempt=?1",
+                params![id16(attempt.as_bytes())],
+                |r| {
+                    Ok(IndeterminateRecord {
+                        attempt,
+                        dispatch: parse_id16(&r.get::<_, String>(0)?),
+                        last_journal_digest: r
+                            .get::<_, Option<String>>(1)?
+                            .map(|d| parse_digest(&d)),
+                        recorded_at: ClockReading(r.get::<_, i64>(2)? as u64),
+                    })
+                },
+            )
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)
+    }
+
+    fn find_commitment_owner(
+        &mut self,
+        result_commit: &gwr_core::work_request::CommitHash,
+    ) -> Result<Option<AttemptId>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT attempt FROM commitment WHERE result_commit=?1",
+                params![result_commit.as_str()],
+                |r| Ok(parse_id16::<AttemptId>(&r.get::<_, String>(0)?)),
+            )
+            .optional()
+            .map_err(backend)
     }
 
     fn record_reliance_admission(&mut self, adm: &ReviewQueueAdmission) -> Result<(), StoreError> {
