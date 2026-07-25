@@ -6,6 +6,7 @@
 pub mod adapters;
 pub mod broker;
 pub mod capabilities;
+pub mod observe;
 pub mod providers;
 pub mod store;
 
