@@ -43,16 +43,22 @@ not to missing files.
 
 ## Verification
 
-```text
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+Four gates, all required:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test --workspace --release
 ```
 
-Pass/fail is decided by exit codes.
+Pass/fail is decided by exit codes, never by reading the tail of the output.
 
 The release run is not redundant: a defect was shipped once whose behaviour differed
-between build profiles. Both suites must be green.
+between build profiles — a `debug_assert!` panicked in debug on operator-supplied input
+while release silently accepted it. Both suites must be green.
+
+At the freeze this was 125 tests, identical in both profiles.
 
 ## Contributing and security
 
