@@ -6,6 +6,34 @@ The trusted runtime establishes mechanical facts only; domain modules own semant
 judgments; labor providers produce candidate artifacts and untrusted provenance. The
 normative specification lives in `docs/governed-runtime/`.
 
+## Status
+
+Frozen as [`gwr-greenfield-v0.1`](CHANGELOG.md) — a greenfield comparison baseline, built
+without adapting any prior implementation. It is a working runtime with a full audit
+record, not a production-hardened product.
+
+**Read the trust model before relying on anything here.**
+[`docs/governed-runtime/trust-model.md`](docs/governed-runtime/trust-model.md) states what
+is enforced and what is assumed. Three assumptions are load-bearing and are premises rather
+than guarantees: exclusive broker custody of the governed target ref, same-UID trust of the
+labor provider and broker binary, and monotone clock readings. Several claims a reader
+might expect to be enforced are deliberately written down there as premises instead.
+
+## Where to start
+
+| | |
+|---|---|
+| What it is and what it claims | [`greenfield-result.md`](docs/governed-runtime/greenfield-result.md) |
+| The thirty invariants and their provenance | [`invariants-v0.md`](docs/governed-runtime/invariants-v0.md) |
+| What is enforced vs. assumed | [`trust-model.md`](docs/governed-runtime/trust-model.md) |
+| Current conformance classification | [`conformance-v0-second-pass.md`](docs/governed-runtime/conformance-v0-second-pass.md) |
+| What it does not do | [`greenfield-known-gaps.md`](docs/governed-runtime/greenfield-known-gaps.md) · [`non-goals.md`](docs/governed-runtime/non-goals.md) |
+| Test coverage | [`greenfield-test-matrix.md`](docs/governed-runtime/greenfield-test-matrix.md) |
+
+Documents cite an external "normative packet" as their requirements source. That packet is
+held privately and is not part of this repository; the citations are to an external source,
+not to missing files.
+
 ## Workspace
 
 - `crates/gwr-core` — pure deterministic types and transition rules. No I/O.
@@ -22,3 +50,16 @@ cargo test --workspace
 ```
 
 Pass/fail is decided by exit codes.
+
+The release run is not redundant: a defect was shipped once whose behaviour differed
+between build profiles. Both suites must be green.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Vulnerability
+reports should not be filed as public issues.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Attribution and authorship: [PROVENANCE.md](PROVENANCE.md).
