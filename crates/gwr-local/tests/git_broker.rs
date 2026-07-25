@@ -244,8 +244,12 @@ fn basis_moved_refuses_dispatch() {
 
 #[test]
 fn forbidden_path_refuses() {
-    let patch = b"diff --git a/Cargo.toml b/Cargo.toml\nindex 000..111 100644\n--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -1 +1 @@\n-x\n+y\n"
-        .to_vec();
+    // A clean addition at an unadmitted path: it applies to the temporary index
+    // without error, so the refusal must come from path authorization over what
+    // the patch actually did — not from the patch failing to apply.
+    let patch =
+        b"diff --git a/evil/added.rs b/evil/added.rs\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/evil/added.rs\n@@ -0,0 +1 @@\n+pwned\n"
+            .to_vec();
     let mut f = fixture("forbidden", Some(patch));
     let clock = FixedClock(ClockReading(20));
     let outcome = dispatch(
@@ -373,4 +377,36 @@ fn death_after_ref_update_before_ack_requires_recovery() {
         projected.state,
         AttemptState::Indeterminate { .. }
     ));
+}
+
+/// V1 end-to-end: the blind review's witness. A rename patch whose destination
+/// was never admitted must not reach the ref.
+#[test]
+fn rename_to_unadmitted_path_is_refused_end_to_end() {
+    let patch = b"diff --git a/src/lib.rs b/evil/pwned.rs\nsimilarity index 100%\nrename from src/lib.rs\nrename to evil/pwned.rs\n".to_vec();
+    let mut f = fixture("rename-escape", Some(patch));
+    let clock = FixedClock(ClockReading(20));
+    let outcome = dispatch(
+        &mut f.store,
+        f.att.attempt_id,
+        &mut f.broker,
+        &clock,
+        &mut f.ids,
+    )
+    .unwrap();
+    let DispatchOutcome::Refused(record) = outcome else {
+        panic!("rename escaped the allowlist: {outcome:?}");
+    };
+    assert_eq!(record.ground, DispatchRefusalGround::ForbiddenPath);
+    // The ref never moved, and the unadmitted path does not exist anywhere.
+    assert_eq!(ref_value(&f.repo), f.basis);
+    let tree = sh(
+        &f.repo,
+        &["git", "ls-tree", "-r", "--name-only", TARGET_REF],
+    );
+    assert!(!tree.contains("evil/pwned.rs"), "tree: {tree}");
+    assert!(
+        tree.contains("src/lib.rs"),
+        "admitted file was deleted: {tree}"
+    );
 }

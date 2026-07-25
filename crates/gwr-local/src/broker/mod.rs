@@ -152,21 +152,98 @@ fn git_env(
     cmd.output().map_err(|e| e.to_string())
 }
 
-/// Paths a unified diff touches, from its `diff --git` headers.
-pub fn patch_paths(patch: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some((a, _b)) = rest.split_once(" b/") {
-                paths.push(a.to_string());
-            }
-        } else if let Some(rest) = line.strip_prefix("+++ b/") {
-            if !paths.contains(&rest.to_string()) {
-                paths.push(rest.to_string());
-            }
+/// One path transition the applied patch actually produces, as reported by
+/// `git diff-index --raw -z`. Renames and copies carry both endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTransition {
+    /// Git status letter: M, A, D, R, C, T.
+    pub status: char,
+    /// The path as it existed at the basis, for M/D/R/C/T.
+    pub source: String,
+    /// The path as it exists after the patch, for M/A/R/C/T. Equals `source`
+    /// for in-place modification; `None` for a pure deletion.
+    pub destination: Option<String>,
+}
+
+/// Parse `git diff-index --cached --raw -z <basis>` output.
+///
+/// Each record is `:<mode> <mode> <sha> <sha> <status>\0<path>\0[<path2>\0]`,
+/// where rename and copy statuses carry a second path. NUL separation makes
+/// this unambiguous for every path git can represent, including ones with
+/// spaces, quotes, or newlines — which is precisely what parsing the porcelain
+/// `diff --git` header could not do.
+pub fn parse_raw_transitions(raw: &[u8]) -> Result<Vec<PathTransition>, String> {
+    let mut out = Vec::new();
+    let mut fields = raw.split(|b| *b == 0).peekable();
+    while let Some(meta) = fields.next() {
+        if meta.is_empty() {
+            continue;
         }
+        let meta = std::str::from_utf8(meta).map_err(|_| "non-utf8 raw metadata")?;
+        if !meta.starts_with(':') {
+            return Err(format!("unexpected raw record: {meta}"));
+        }
+        let status_field = meta
+            .split_whitespace()
+            .next_back()
+            .ok_or("raw record has no status")?;
+        let status = status_field
+            .chars()
+            .next()
+            .ok_or("raw record has empty status")?;
+        let take = |fields: &mut std::iter::Peekable<std::slice::Split<'_, u8, _>>| {
+            fields
+                .next()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .ok_or_else(|| "raw record is missing a path".to_string())
+        };
+        let first = take(&mut fields)?;
+        let transition = match status {
+            'R' | 'C' => {
+                let second = take(&mut fields)?;
+                PathTransition {
+                    status,
+                    source: first,
+                    destination: Some(second),
+                }
+            }
+            'D' => PathTransition {
+                status,
+                source: first,
+                destination: None,
+            },
+            _ => PathTransition {
+                status,
+                source: first.clone(),
+                destination: Some(first),
+            },
+        };
+        out.push(transition);
     }
-    paths
+    Ok(out)
+}
+
+/// Authorize the transitions a patch actually produces against the admitted
+/// allowlist.
+///
+/// Both endpoints must be admitted. A rename out of an allowed path into a
+/// disallowed one is refused, and so is the reverse: the effect specification
+/// admits exactly the paths it names, and a path transition is a change to both
+/// of them. `A` (addition) has no source to authorize; `D` (deletion) has no
+/// destination.
+pub fn transitions_authorized(transitions: &[PathTransition], allowed: &[String]) -> bool {
+    if transitions.is_empty() {
+        return false;
+    }
+    transitions.iter().all(|t| {
+        let source_ok = t.status == 'A' || allowed.contains(&t.source);
+        let destination_ok = t
+            .destination
+            .as_ref()
+            .map(|d| allowed.contains(d))
+            .unwrap_or(true);
+        source_ok && destination_ok
+    })
 }
 
 /// Execute one envelope against the repository. `crash_after` names a journal
@@ -195,14 +272,6 @@ pub fn execute_envelope(
         phase(journal, "refused envelope_mismatch")?;
         return Ok(BrokerRun::Refused {
             ground: DispatchRefusalGround::EnvelopeMismatch,
-        });
-    }
-    let patch_text = String::from_utf8_lossy(patch);
-    let touched = patch_paths(&patch_text);
-    if touched.is_empty() || touched.iter().any(|p| !env.allowed_paths.contains(p)) {
-        phase(journal, "refused forbidden_path")?;
-        return Ok(BrokerRun::Refused {
-            ground: DispatchRefusalGround::ForbiddenPath,
         });
     }
     phase(journal, "verified")?;
@@ -267,6 +336,39 @@ pub fn execute_envelope(
         });
     }
     phase(journal, "patch_applied")?;
+
+    // Authorize what the patch ACTUALLY did, from git's machine-readable
+    // transcript of the temporary index against the basis — not from parsing
+    // the patch text. Porcelain headers were mistaken for a protocol here once:
+    // rename and copy diffs carry no `+++ b/` line, so a destination path could
+    // slip past a check that read only the `a/` side.
+    //
+    // Nothing has left the temporary index yet: refusing here means no tree is
+    // written, no commit is created, and the ref is untouched.
+    let raw = git_env(
+        &env.repository,
+        &[
+            "diff-index",
+            "--cached",
+            "--raw",
+            "-z",
+            "--find-renames",
+            "--find-copies",
+            &env.expected_basis,
+        ],
+        &envs,
+    )?;
+    if !raw.status.success() {
+        return Err("diff-index failed".into());
+    }
+    let transitions = parse_raw_transitions(&raw.stdout)?;
+    if !transitions_authorized(&transitions, &env.allowed_paths) {
+        phase(journal, "refused forbidden_path")?;
+        return Ok(BrokerRun::Refused {
+            ground: DispatchRefusalGround::ForbiddenPath,
+        });
+    }
+    phase(journal, "paths_authorized")?;
 
     let tree = git_env(&env.repository, &["write-tree"], &envs)?;
     if !tree.status.success() {
