@@ -43,6 +43,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | What effects are admissible | [`effect-classes.md`](docs/governed-runtime/effect-classes.md) |
 | What each outcome means and what to do next | [`operator-runbook.md`](docs/governed-runtime/operator-runbook.md) |
 | First upstream-authorized governed change | [`vertical-01.md`](docs/vertical-01.md) |
+| How upstream authorization becomes local standing | [`upstream-authorization.md`](docs/governed-runtime/upstream-authorization.md) |
 
 Documents cite an external "normative packet" as their requirements source. That packet is
 held privately and is not part of this repository; the citations are to an external source,

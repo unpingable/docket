@@ -2,6 +2,40 @@
 
 Notable changes to the governed work runtime.
 
+## Unreleased — upstream authorization intake — 2026-07-25
+
+The first three-office vertical: an upstream office authorizes exact proposed work,
+Docket verifies that authorization against its own prepared attempt and mints local
+standing, and the resulting dossier projects downstream as bounded testimony
+([`docs/vertical-01.md`](docs/vertical-01.md)).
+
+### Added
+
+- **`gwr:authz-request:v1`** — canonical authorization-request projection
+  (`docket authz request`). Testimony about a prepared proposal; emitting one mints
+  nothing.
+- **`ag.docket-issuance:v1` intake** — `docket authz accept` verifies an authenticated
+  issuance against a configured trusted issuer (Ed25519 over the exact body bytes,
+  under the *trusted* key) and against Docket's own stored attempt, then mints Docket's
+  own local, attempt-bound, single-use standing. One issuance justifies at most one
+  grant; substituted bytes under an accepted identity refuse. Docket does not re-run
+  the upstream policy question.
+- **Authorization provenance** — grants record `source` (`local` | `upstream`);
+  pre-migration grants read as *unrecorded*. The manual path remains supported and
+  visibly distinct.
+- **Upstream premises and residuals** — carried in upstream vocabulary, kept separate
+  from settlement premises and from Docket obligations, never discharged; residual
+  status distinguishes *none recorded* from *unrepresented*.
+- [`docs/governed-runtime/upstream-authorization.md`](docs/governed-runtime/upstream-authorization.md).
+
+### Changed
+
+- **Dossier is now `gwr:attempt-dossier:v2`**, adding the `authorization` block. v1 was
+  a closed schema whose consumers refuse unknown fields, so this required a version
+  rather than an extension.
+
+171 tests, all four gates exit 0 in debug and release.
+
 ## Unreleased — read-surface completion — 2026-07-25
 
 Completes the read-only operator surface over the canonical evidence model (`e923bf0`),
