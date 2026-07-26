@@ -1,5 +1,11 @@
 # Greenfield result — `gwr-greenfield-v0.1`
 
+> **Scope banner (2026-07-26):** this document describes the frozen baseline
+> `gwr-greenfield-v0.1`, not current `main`. Post-freeze work (pilot, read
+> surface, effect-class boundary, upstream authorization, dossier v2, two
+> multi-office verticals) is recorded in `CHANGELOG.md`. The freeze statement
+> below remains true of the freeze.
+
 The frozen comparison baseline, recorded before any prior implementation becomes visible.
 
 ## Freeze statement

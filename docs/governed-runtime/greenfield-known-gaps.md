@@ -55,3 +55,7 @@ negatives. Nothing in this freeze reaches for one.
 - Comparison with prior implementations. Locked to Task 14, which requires a separate
   operator instruction naming exact paths. **No such comparison informed this result**;
   that isolation is the entire basis of the Task 14 deliverable.
+  *(Supersession note, 2026-07-26: Task 14 was subsequently performed on
+  2026-07-25 under an operator instruction naming `transition-kernel`; the
+  result is [`old-rust-comparison.md`](old-rust-comparison.md). The isolation
+  claim above remains true of the frozen result itself.)*

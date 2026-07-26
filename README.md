@@ -15,11 +15,34 @@ are properties of that class and its stated premises, not universal Docket guara
 
 ## Status
 
+Docket is the **governed-execution office** of a four-office constellation:
+Nightshift proposes bounded intent, **AG ng** authorizes the exact prepared
+attempt (one-use authority burn), Docket prepares exact bytes, executes via
+its broker, and settles with evidence, and **NQ** evaluates the exported
+dossier against registered claims and consumer reliance. Docket owns both
+authorization wire contracts (`gwr:authz-request:v1`, `ag.docket-issuance:v1`)
+and their conformance vectors; it does not own authorization policy, claim
+admissibility, or orchestration posture — and its own reliance bridge refuses
+`safe-to-merge` as permanently inadmissible.
+
 The audited baseline is frozen as [`gwr-greenfield-v0.1`](CHANGELOG.md) — a greenfield
 comparison result, built without adapting any prior implementation. It is a working
 runtime with a full audit record, not a production-hardened product. Work after the tag
-(the first pilot, the canonical read surface, the explicit effect-class boundary) is on
+(the first pilot, the canonical read surface, the explicit effect-class boundary, the
+upstream-authorization intake, and two completed multi-office verticals) is on
 `main` and recorded in the changelog; the tag has not moved.
+
+Maturity: **operationally reusable vertical** — the three-office run
+([`vertical-01.md`](docs/vertical-01.md), 2026-07-25) and the four-office
+pilot (2026-07-26, target: the Nightshift repository; declared in Nightshift's
+`docs/FOUR_OFFICE_PILOT_01.md`, itself the pilot's broker-authored governed
+effect) both ran on this runtime without code changes. Not operator-ready or
+production-hardened; the trust-model premises below still hold the load.
+
+The compared prior Rust implementation, `transition-kernel`, is a **research
+cousin, not a predecessor**: the Task 14 comparison
+([`old-rust-comparison.md`](docs/governed-runtime/old-rust-comparison.md))
+concluded "complementary organs, not rivals" and imported nothing.
 
 **Read the trust model before relying on anything here.**
 [`docs/governed-runtime/trust-model.md`](docs/governed-runtime/trust-model.md) states what

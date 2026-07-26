@@ -191,6 +191,12 @@ was reverted." Already recorded in the trust model; the pilot confirms it in pra
 
 **Usable reference implementation; not yet operator-ready.**
 
+*(Supersession note, 2026-07-26: this verdict is the pilot-01 snapshot. Its
+P-1 finding was closed by the canonical dossier — see
+[`pilot-01-followup.md`](pilot-01-followup.md) — and the runtime has since
+completed a three-office vertical ([`vertical-01.md`](vertical-01.md)) and
+the four-office pilot of 2026-07-26. "Not yet operator-ready" still stands.)*
+
 The governance machinery did its job. Authority was bound to exact content and consumed
 once. A crash that landed an effect and lost its acknowledgement was recovered to the
 correct terminal state under separately-held standing, with the ref moving exactly once. A

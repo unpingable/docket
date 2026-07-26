@@ -97,3 +97,11 @@ identities, standing and dispatch identities, the settled commit, the downstream
 digest, and the claim results — are recorded in campaign custody alongside the commands
 that produced them. This is a bootstrap vertical: it is not a claim of production
 provider confinement, and it is not a notarized custody chain.
+
+*(Supersession note, 2026-07-26: this three-office vertical was followed by
+the first **four-office** pilot — Nightshift proposal → Docket preparation →
+AG ng authorization → Docket execution → NQ evaluation → Nightshift read-only
+disposition — executed against the Nightshift repository with no code changes
+in any office. The public declaration is Nightshift's
+`docs/FOUR_OFFICE_PILOT_01.md`, itself that pilot's broker-authored governed
+effect; detailed receipts remain in campaign custody.)*

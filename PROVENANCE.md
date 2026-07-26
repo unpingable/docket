@@ -1,7 +1,8 @@
 # Provenance
 
-This repository contains the greenfield governed work runtime frozen as
-`gwr-greenfield-v0.1`.
+This repository contains the greenfield governed work runtime whose audited
+baseline is frozen as `gwr-greenfield-v0.1`; `main` carries recorded
+post-freeze work (see `CHANGELOG.md`) and the tag has not moved.
 
 This project is human-directed and AI-assisted. Final design authority, acceptance
 criteria, and editorial control rest with the human author. AI contributions were

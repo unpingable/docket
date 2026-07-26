@@ -14,7 +14,8 @@ re-proposed.
 - generic effect execution;
 - arbitrary shell effects;
 - generalized accounting;
-- complete AG, NQ/NG, LA, or MC implementations;
+- complete implementations of the other offices — authority (AG ng),
+  testimony/claims (NQ), or the historical LA/MC organs;
 - semantic correctness;
 - merge safety;
 - obligation discharge;
@@ -32,7 +33,9 @@ re-proposed.
 - dashboards;
 - merge, release, deployment, or promotion automation;
 - compatibility with prior code;
-- comparison with prior implementations (gated separately at Task 14; not performed here).
+- comparison with prior implementations (gated separately at Task 14; not
+  performed as part of the freeze — *performed later, 2026-07-25:*
+  [`old-rust-comparison.md`](old-rust-comparison.md)).
 
 ## Also excluded, by proved negative
 
