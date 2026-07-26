@@ -1,0 +1,9 @@
+{
+  "issuers": [
+    {
+      "issuer_principal": "issuer",
+      "key_id": "vertical-issuer-1",
+      "public_key": "R49f-_EIfCeBYwyzlH8VoZtk5wr52mEiP3pVCMlMmSE"
+    }
+  ]
+}

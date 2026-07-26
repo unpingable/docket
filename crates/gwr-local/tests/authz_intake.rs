@@ -776,3 +776,124 @@ fn substituted_bytes_under_the_same_issuance_identity_refuse() {
         other => panic!("expected substitution refusal, got {other:?}"),
     }
 }
+
+// --- cross-repository conformance vectors ---
+//
+// These exercise the *shipped* vectors in `conformance/authz/`, which were
+// produced by the upstream office's independent implementation. The consumer
+// verifies the producer's artifacts; neither side shares code with the other.
+
+fn vector(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../conformance/authz")
+        .join(name);
+    std::fs::read(path).unwrap()
+}
+
+fn vector_trust() -> IssuerTrustConfig {
+    IssuerTrustConfig::parse(&vector("trust.json")).unwrap()
+}
+
+// The positive vector authenticates under the shipped trust configuration:
+// schema, trusted issuer, and signature over the exact body bytes all hold.
+#[test]
+fn shipped_issuance_vector_authenticates() {
+    let att = attempt();
+    // Binding is checked against *this* store's attempt, which is not the
+    // historical one the vector names — so the refusal must be a binding
+    // mismatch, never an authentication failure.
+    match verify_issuance(
+        &vector("issuance.json"),
+        &att,
+        att.attempt_id,
+        &vector_trust(),
+        ClockReading(0),
+    ) {
+        Err(IntakeRefusal::BindingMismatch { field, .. }) => assert_eq!(field, "attempt"),
+        other => panic!("expected binding mismatch after successful authentication, got {other:?}"),
+    }
+}
+
+// Every tampered derivative fails authentication: the signature covers each
+// protected field, including premises and residual status.
+#[test]
+fn tampered_issuance_vectors_fail_authentication() {
+    let att = attempt();
+    let t = vector_trust();
+    for name in [
+        "issuance-changed-prepared-digest.json",
+        "issuance-changed-ag-digest.json",
+        "issuance-changed-raw-digest.json",
+        "issuance-changed-scope.json",
+        "issuance-changed-actor.json",
+        "issuance-changed-premise.json",
+        "issuance-changed-residual.json",
+        "issuance-expired.json",
+        "issuance-not-admitted.json",
+        "issuance-bad-authentication.json",
+    ] {
+        match verify_issuance(&vector(name), &att, att.attempt_id, &t, ClockReading(0)) {
+            Err(IntakeRefusal::AuthenticationFailed) => {}
+            other => panic!("{name}: expected authentication failure, got {other:?}"),
+        }
+    }
+}
+
+// Structural vectors refuse before authentication is even relevant.
+#[test]
+fn structural_issuance_vectors_refuse_typed() {
+    let att = attempt();
+    let t = vector_trust();
+    assert!(matches!(
+        verify_issuance(
+            &vector("issuance-unknown-issuer.json"),
+            &att,
+            att.attempt_id,
+            &t,
+            ClockReading(0)
+        ),
+        Err(IntakeRefusal::UntrustedIssuer { .. })
+    ));
+    assert!(matches!(
+        verify_issuance(
+            &vector("issuance-unsupported-schema.json"),
+            &att,
+            att.attempt_id,
+            &t,
+            ClockReading(0)
+        ),
+        Err(IntakeRefusal::UnsupportedSchema { .. })
+    ));
+    assert!(matches!(
+        verify_issuance(
+            &vector("refusal-object.json"),
+            &att,
+            att.attempt_id,
+            &t,
+            ClockReading(0)
+        ),
+        Err(IntakeRefusal::Malformed { .. })
+    ));
+}
+
+// The shipped request vector round-trips through the digest the consumer
+// computes, and a changed request no longer matches the issuance's echo.
+#[test]
+fn shipped_request_vector_digests_match_the_issuance() {
+    let att = attempt();
+    let t = vector_trust();
+    // Read the issuance's raw digest by authenticating it far enough to decode.
+    let bytes = vector("issuance.json");
+    let err = verify_issuance(&bytes, &att, att.attempt_id, &t, ClockReading(0)).unwrap_err();
+    assert!(matches!(err, IntakeRefusal::BindingMismatch { .. }));
+    // The consumer's own digest of the shipped request equals what the
+    // issuance names; the altered request does not.
+    let request = vector("request.json");
+    let changed = vector("request-changed.json");
+    let issuance_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let body_b64 = issuance_json["body_b64"].as_str().unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&decode_b64(body_b64)).unwrap();
+    let named = body["request_source"]["raw_sha256"].as_str().unwrap();
+    assert_eq!(request_digest(&request), named);
+    assert_ne!(request_digest(&changed), named);
+}

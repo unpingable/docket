@@ -1,0 +1,28 @@
+{
+ "authz_request_format": "gwr:authz-request:v1",
+ "attempt": "5e6ee3da609a4a8bc0838ff57a8301cf",
+ "attempt_version": 0,
+ "effect_class": "git-ref-update:v1",
+ "prepared_attempt_digest": "e59307a224c3ff0365026fd446f5d52487cbfb1adc33c2398a65fa8177f82e77",
+ "repository": "/home/jbeck/git/docket/runtime",
+ "target_ref": "refs/gwr/target",
+ "basis": "32407f7e1f271db6035199d83730ec937c519af5",
+ "allowed_paths": [
+  "docs/vertical-01.md",
+  "README.md"
+ ],
+ "settlement_premises": [
+  "inspectable_endpoint",
+  "atomic_compare_and_swap",
+  "attributable_result_state",
+  "exclusive_ref_custody"
+ ],
+ "requested_actor": "operator",
+ "goal": "a different goal",
+ "work_request": "7f09565f7d626636bb39bdb62e5a7887",
+ "preparation_run": "a5389ac1952ce466ed60d680a7dcab7e",
+ "candidate": "d8bf18ce4442619f04ad30b712318219",
+ "candidate_digest": "0f2f402609c33f5c405a7896df872ac3ffc6f69ecdd406abfbf96a53ff222834",
+ "request_created_at_ms": 1785028222181,
+ "admitted_at_ms": 1785028222253
+}
