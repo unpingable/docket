@@ -30,7 +30,7 @@ use gwr_core::ids::*;
 use gwr_core::lifecycle::{AttemptState, RecoveryVerdict};
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::store::SqliteStore;
@@ -117,7 +117,7 @@ fn fixture(name: &str) -> Fx {
         AttemptId::from_bytes([9; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new(repo.to_string_lossy()),
+        RepositoryLocator::new(repo.to_string_lossy()),
         CommitHash::new(&basis),
         patch_digest,
         GitRefEffect {

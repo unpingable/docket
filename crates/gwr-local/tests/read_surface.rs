@@ -14,7 +14,7 @@ use gwr_core::lifecycle::RecoveryVerdict;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::preparation::CandidateArtifact;
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::capabilities::StandingTokenCodec;
@@ -119,7 +119,8 @@ fn fixture(name: &str) -> Fx {
     let mut store = SqliteStore::open(&root.join("state.sqlite")).unwrap();
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new(repo.to_string_lossy()),
+        repository_id: None,
+        repository: RepositoryLocator::new(repo.to_string_lossy()),
         target_ref: RefName::new(TARGET_REF),
         goal: GOAL.into(),
         created_at: ClockReading(1),

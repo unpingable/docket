@@ -16,18 +16,24 @@ docket show --attempt <id>          # human rendering
 docket show --attempt <id> --json   # versioned JSON rendering
 ```
 
-There is no second assembly path, so the surfaces cannot drift. The JSON carries
-`"dossier_format": "gwr:attempt-dossier:v1"`; any change to its key set or value
-encodings is a version bump, not an edit.
+There is no second assembly path, so the surfaces cannot drift. The JSON carries a
+versioned `dossier_format`; any change to its key set or value encodings is a version
+bump, not an edit. The current formats are v2 for a legacy work request without an
+explicit repository binding and v3 for an identified work request. v1 is the earlier
+closed format; v2 added upstream-authorization provenance. See
+[`repository-identity-and-ref-continuity.md`](repository-identity-and-ref-continuity.md)
+for the v2/v3 identity boundary and explicit migration.
 
 ## What it exposes
 
 Only records the runtime already owns — the dossier manufactures no facts:
 
-- **Identity and preparation** — goal, work request, repository, target ref, basis,
-  effect class and its declared settlement premises, admitted paths, candidate and
-  preparation-run identities, candidate/patch/prepared-attempt digests, observation
-  plan, creation/admission timestamps.
+- **Identity and preparation** — goal, work request, Docket-owned `RepositoryId` and
+  path locator in v3 (legacy path spelling only in v2), target ref, basis, exact
+  ref-continuity subject when a matching result commitment exists, effect class and its
+  declared settlement premises, admitted paths, candidate and preparation-run
+  identities, candidate/patch/prepared-attempt digests, observation plan, and
+  creation/admission timestamps.
 - **Authority and reservation** — ratification receipt (actor, standing use, time), the
   ratifying grant's scope and exact digest binding, expiry and consumption status, the
   reservation and its consumption, the one dispatch identity, and — separately — the
@@ -95,6 +101,9 @@ refusals.
 
 ## Stability
 
-The JSON forms (`gwr:attempt-dossier:v1`, `gwr:attempt-list:v1`, `gwr:journal-view:v1`)
-are intended to be stable enough for later ingestion by external tooling (a cockpit, a
-witness system). No such integration exists yet, and none is implied by the formats.
+The JSON forms (`gwr:attempt-dossier:v2`, `gwr:attempt-dossier:v3`,
+`gwr:attempt-list:v1`, `gwr:journal-view:v1`) are intended to be stable enough for later
+ingestion by external tooling. The v3 dossier and
+`gwr:ref-continuity-operation:v0` are now supported inputs to the continuity-aware
+vertical; that support does not turn the other read formats into generic integration
+APIs.

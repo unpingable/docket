@@ -10,7 +10,7 @@ use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::ids::{ActorId, StandingGrantId};
 use gwr_core::refusal::StandingRefusal;
-use gwr_core::work_request::{ClockReading, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, RepositoryLocator};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -165,7 +165,7 @@ impl StandingTokenCodec {
             StandingScope {
                 actor: ActorId::from_bytes(actor),
                 act,
-                repository: RepositoryIdentity::new(repository),
+                repository: RepositoryLocator::new(repository),
                 attempt_digest: Sha256Digest::from_bytes(digest),
             },
             ClockReading(expires_at),

@@ -217,12 +217,36 @@ fn provider_workspace_is_not_inside_the_state_directory() {
     .unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+    let registration = Command::new(env!("CARGO_BIN_EXE_docket"))
+        .args([
+            "repository",
+            "register",
+            "--state",
+            state.to_string_lossy().as_ref(),
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        registration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registration.stderr)
+    );
+    let registration_stdout = String::from_utf8_lossy(&registration.stdout);
+    let repository_id = registration_stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("repository_id: "))
+        .unwrap();
+
     let out = Command::new(env!("CARGO_BIN_EXE_docket"))
         .args([
             "request",
             "create",
             "--state",
             state.to_string_lossy().as_ref(),
+            "--repository-id",
+            repository_id,
             "--repo",
             repo.to_string_lossy().as_ref(),
             "--target-ref",

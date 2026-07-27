@@ -18,7 +18,7 @@ use gwr_core::ids::*;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::preparation::CandidateArtifact;
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::authz_intake::{
     confirm_request_bytes, request_digest, verify_issuance, IntakeRefusal, IssuerTrustConfig,
 };
@@ -90,7 +90,7 @@ fn attempt() -> PreparedAttempt {
         AttemptId::from_bytes(ATTEMPT_BYTES),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new(REPO),
+        RepositoryLocator::new(REPO),
         CommitHash::new(BASIS),
         Sha256Digest::of_bytes(b"patch"),
         GitRefEffect {
@@ -182,6 +182,7 @@ fn store_with_attempt(att: &PreparedAttempt) -> SqliteStore {
     let mut store = SqliteStore::open_in_memory().unwrap();
     let wr = WorkRequest {
         id: att.work_request,
+        repository_id: None,
         repository: att.repository.clone(),
         target_ref: att.effect.target_ref.clone(),
         goal: "fixture".into(),

@@ -15,7 +15,7 @@ use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::ids::{ActorId, StandingGrantId};
 use gwr_core::refusal::StandingRefusal;
-use gwr_core::work_request::{ClockReading, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, RepositoryLocator};
 use gwr_local::capabilities::StandingTokenCodec;
 
 fn codec() -> StandingTokenCodec {
@@ -28,7 +28,7 @@ fn grant(repo: &str) -> StandingGrant {
         StandingScope {
             actor: ActorId::from_bytes([2; 16]),
             act: StandingAct::Ratify,
-            repository: RepositoryIdentity::new(repo),
+            repository: RepositoryLocator::new(repo),
             attempt_digest: Sha256Digest::of_bytes(b"attempt"),
         },
         ClockReading(5_000),

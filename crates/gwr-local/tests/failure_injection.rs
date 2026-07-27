@@ -18,7 +18,7 @@ use gwr_core::recovery::{FactSource, RecoveryFact};
 use gwr_core::refusal::{
     DispatchRefusalGround, ObservationRefusal, RecoveryRefusal, RelianceRefusal,
 };
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FixedClock, FsArtifactStore, FsProvenanceSink, HashChainIds};
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::providers::fake::{GoalEchoProvider, Script, ScriptedProvider};
@@ -105,7 +105,7 @@ fn fixture(name: &str) -> Fx {
         AttemptId::from_bytes([9; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new(repo.to_string_lossy()),
+        RepositoryLocator::new(repo.to_string_lossy()),
         CommitHash::new(&basis),
         patch_digest,
         GitRefEffect {
@@ -211,6 +211,7 @@ fn provider_death_does_not_mint_effect_failure() {
     let mut fx = fixture("prov-death");
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
+        repository_id: None,
         repository: fx.att.repository.clone(),
         target_ref: RefName::new(TARGET_REF),
         goal: "fix".into(),
@@ -260,6 +261,7 @@ fn late_candidate_cannot_be_admitted() {
     let mut fx = fixture("late-cand");
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
+        repository_id: None,
         repository: fx.att.repository.clone(),
         target_ref: RefName::new(TARGET_REF),
         goal: "fix".into(),

@@ -21,5 +21,7 @@ pub mod prepared_attempt;
 pub mod receipt;
 pub mod reconciliation;
 pub mod recovery;
+pub mod ref_continuity;
 pub mod refusal;
+pub mod repository;
 pub mod work_request;

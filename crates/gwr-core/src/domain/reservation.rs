@@ -7,7 +7,7 @@
 
 use crate::ids::{AttemptId, ReservationId, ReservationUseId};
 use crate::refusal::ReservationRefusal;
-use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ClaimState {
@@ -20,7 +20,7 @@ pub enum ClaimState {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ReservationClaim {
     id: ReservationId,
-    repository: RepositoryIdentity,
+    repository: RepositoryLocator,
     target_ref: RefName,
     basis: CommitHash,
     attempt: AttemptId,
@@ -32,7 +32,7 @@ impl ReservationClaim {
     #[allow(clippy::too_many_arguments)]
     pub fn claim(
         id: ReservationId,
-        repository: RepositoryIdentity,
+        repository: RepositoryLocator,
         target_ref: RefName,
         basis: CommitHash,
         attempt: AttemptId,
@@ -53,7 +53,7 @@ impl ReservationClaim {
     #[allow(clippy::too_many_arguments)]
     pub fn from_persisted(
         id: ReservationId,
-        repository: RepositoryIdentity,
+        repository: RepositoryLocator,
         target_ref: RefName,
         basis: CommitHash,
         attempt: AttemptId,
@@ -75,7 +75,7 @@ impl ReservationClaim {
         self.id
     }
 
-    pub fn repository(&self) -> &RepositoryIdentity {
+    pub fn repository(&self) -> &RepositoryLocator {
         &self.repository
     }
 
@@ -113,7 +113,7 @@ impl ReservationClaim {
     /// repository and target ref, both alive at `now`.
     pub fn conflicts_with(
         &self,
-        repository: &RepositoryIdentity,
+        repository: &RepositoryLocator,
         target_ref: &RefName,
         now: ClockReading,
     ) -> bool {

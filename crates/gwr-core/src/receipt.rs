@@ -9,7 +9,7 @@ use crate::digest::Sha256Digest;
 use crate::ids::{
     ActorId, AttemptId, DispatchId, ObservationId, RatificationId, ReservationUseId, StandingUseId,
 };
-use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 
 /// This actor, holding this standing, ratified this exact prepared attempt.
 /// Not approval, not correctness — a commitment to an exact digest.
@@ -31,7 +31,7 @@ pub struct DispatchEnvelope {
     pub attempt: AttemptId,
     pub prepared_attempt_digest: Sha256Digest,
     pub reservation_use: ReservationUseId,
-    pub repository: RepositoryIdentity,
+    pub repository: RepositoryLocator,
     pub target_ref: RefName,
     pub expected_basis: CommitHash,
     pub patch_digest: Sha256Digest,

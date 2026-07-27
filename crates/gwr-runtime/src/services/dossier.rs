@@ -25,6 +25,7 @@ use gwr_core::prepared_attempt::PreparedAttempt;
 use gwr_core::receipt::{RatificationReceipt, ReviewQueueAdmission};
 use gwr_core::reconciliation::{Reconciliation, ResidualObligation};
 use gwr_core::recovery::{RecoveryFact, RecoveryResolution};
+use gwr_core::ref_continuity::RefContinuitySubject;
 use gwr_core::work_request::{ClockReading, WorkRequest};
 
 /// The dossier format identifier, carried in every JSON rendering. Any change
@@ -33,6 +34,12 @@ use gwr_core::work_request::{ClockReading, WorkRequest};
 /// closed schema whose consumers deny unknown fields, so carrying upstream
 /// authorization facts honestly requires a version, not an extension.
 pub const DOSSIER_FORMAT: &str = "gwr:attempt-dossier:v2";
+/// v3 adds Docket's opaque repository identity, labels the retained path as an
+/// operational locator, and carries the exact ref-continuity subject when a
+/// result commit exists. A legacy dossier stays v2 until an operator explicitly
+/// registers an identity and binds the selected work request; no path is
+/// silently promoted into identity.
+pub const DOSSIER_FORMAT_V3: &str = "gwr:attempt-dossier:v3";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DossierError {
@@ -234,6 +241,12 @@ pub struct AttemptDossier {
     /// source testimony. Upstream premises are never merged into settlement
     /// premises; upstream residuals are never discharged here.
     pub authorization: AuthorizationSection,
+    /// Docket-owned logical identity resolved only through the explicit
+    /// repository registry. `None` is honest legacy state, never path-derived.
+    pub repository_id: Option<RepositoryId>,
+    /// Present only when repository identity, exact target ref, and a full
+    /// result commit can be bound under the v0 subject contract.
+    pub ref_continuity_subject: Option<RefContinuitySubject>,
 }
 
 /// The authorization provenance of an attempt's standing.
@@ -300,6 +313,17 @@ pub fn assemble(
     let work_request = store.get_work_request(projected.attempt.work_request)?;
     let candidate = store.get_candidate(projected.attempt.candidate)?;
     let timeline = store.timeline(attempt_id)?;
+    let repository_id = work_request.repository_id;
+    if let Some(repository_id) = repository_id {
+        let registration = store.get_repository(repository_id)?;
+        if !registration.has_path(&projected.attempt.repository) {
+            return Err(DossierError::Store(StoreError::Corrupt(format!(
+                "work request repository {repository_id} does not retain attempt path {} \
+                 as an explicit locator",
+                projected.attempt.repository.as_str()
+            ))));
+        }
+    }
 
     // Authority. Each block is present exactly when its ledger record is.
     let ratification = store.get_ratification(attempt_id)?;
@@ -417,6 +441,19 @@ pub fn assemble(
     let residual_obligations = store.get_residual_obligations(attempt_id)?;
     let reconciliation = store.get_reconciliation(attempt_id)?;
     let settlement = settlement(&projected.state);
+    let ref_continuity_subject = match (repository_id, commitment.as_ref()) {
+        (Some(repository_id), Some(commitment))
+            if commitment.target_ref == projected.attempt.effect.target_ref =>
+        {
+            RefContinuitySubject::bind(
+                repository_id,
+                &projected.attempt.effect.target_ref,
+                &commitment.result_commit,
+            )
+            .ok()
+        }
+        _ => None,
+    };
 
     // Authorization provenance: the ratifying grant's recorded source, and the
     // upstream issuance when one justified it. A grant written before source
@@ -470,6 +507,8 @@ pub fn assemble(
             source: authorization_source,
             issuance,
         },
+        repository_id,
+        ref_continuity_subject,
     })
 }
 
@@ -596,8 +635,22 @@ fn grant_json(g: &Option<GrantSummary>) -> String {
 /// The versioned JSON rendering of the dossier.
 pub fn render_json(d: &AttemptDossier) -> String {
     let a = &d.attempt;
+    let repository_identity = match d.repository_id {
+        Some(repository_id) => format!(
+            "\"repository_id\":{},\"repository_locator\":{{\"kind\":\"path\",\"value\":{}}},\
+             \"ref_continuity_subject\":{},",
+            js(&repository_id.to_string()),
+            js(a.repository.as_str()),
+            js_opt(
+                d.ref_continuity_subject
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+            ),
+        ),
+        None => format!("\"repository\":{},", js(a.repository.as_str())),
+    };
     let identity = format!(
-        "{{\"work_request\":{},\"goal\":{},\"repository\":{},\"target_ref\":{},\"basis\":{},\
+        "{{\"work_request\":{},\"goal\":{},{}\"target_ref\":{},\"basis\":{},\
          \"effect_class\":{},\"settlement_premises\":{},\"allowed_paths\":{},\
          \"candidate\":{},\"candidate_digest\":{},\
          \"patch_digest\":{},\"preparation_run\":{},\"candidate_ingested_at_ms\":{},\
@@ -605,7 +658,7 @@ pub fn render_json(d: &AttemptDossier) -> String {
          \"request_created_at_ms\":{},\"admitted_at_ms\":{}}}",
         js(&hx(d.work_request.id.as_bytes())),
         js(&d.work_request.goal),
-        js(a.repository.as_str()),
+        repository_identity,
         js(a.effect.target_ref.as_str()),
         js(a.basis.as_str()),
         js(gwr_core::effect_spec::GitRefEffect::KIND),
@@ -977,7 +1030,11 @@ pub fn render_json(d: &AttemptDossier) -> String {
         "{{\"dossier_format\":{},\"attempt\":{},\"state\":{},\"version\":{},\"settlement\":{},\
          \"identity\":{},\"authorization\":{},\"authority\":{},\"timeline\":{},\
          \"execution\":{},\"observation\":{},\"qualification\":{}}}",
-        js(DOSSIER_FORMAT),
+        js(if d.repository_id.is_some() {
+            DOSSIER_FORMAT_V3
+        } else {
+            DOSSIER_FORMAT
+        }),
         js(&hx(d.attempt.attempt_id.as_bytes())),
         js(state_tag(&d.state)),
         d.version,
@@ -1006,7 +1063,31 @@ pub fn render_text(d: &AttemptDossier) -> String {
     let _ = writeln!(w, "\nidentity");
     let _ = writeln!(w, "  goal {}", d.work_request.goal);
     let _ = writeln!(w, "  work_request {}", hx(d.work_request.id.as_bytes()));
-    let _ = writeln!(w, "  repository {}", a.repository.as_str());
+    match d.repository_id {
+        Some(repository_id) => {
+            let _ = writeln!(w, "  repository_id {repository_id}");
+            let _ = writeln!(
+                w,
+                "  repository_locator path {} (operational alias; not identity)",
+                a.repository.as_str()
+            );
+            let _ = writeln!(
+                w,
+                "  ref_continuity_subject {}",
+                d.ref_continuity_subject
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unavailable (no exact committed result binding)")
+            );
+        }
+        None => {
+            let _ = writeln!(
+                w,
+                "  repository {} (legacy operational locator; no RepositoryId registered)",
+                a.repository.as_str()
+            );
+        }
+    }
     let _ = writeln!(w, "  target_ref {}", a.effect.target_ref.as_str());
     let _ = writeln!(w, "  basis {}", a.basis.as_str());
     let _ = writeln!(

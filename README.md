@@ -63,6 +63,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | Test coverage | [`greenfield-test-matrix.md`](docs/governed-runtime/greenfield-test-matrix.md) |
 | First governed execution (pilot) | [`pilot-01.md`](docs/pilot-01.md) · [`pilot-01-followup.md`](docs/pilot-01-followup.md) |
 | The supported evidence/read surface | [`attempt-dossier.md`](docs/governed-runtime/attempt-dossier.md) |
+| Repository identity and ref-continuity handoff | [`repository-identity-and-ref-continuity.md`](docs/governed-runtime/repository-identity-and-ref-continuity.md) |
 | What effects are admissible | [`effect-classes.md`](docs/governed-runtime/effect-classes.md) |
 | What each outcome means and what to do next | [`operator-runbook.md`](docs/governed-runtime/operator-runbook.md) |
 | First upstream-authorized governed change | [`vertical-01.md`](docs/vertical-01.md) |

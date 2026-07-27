@@ -15,7 +15,8 @@ use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::outcome::{Commitment, IndeterminateRecord};
 use gwr_core::preparation::{CandidateArtifact, PreparationEnd, PreparationRun, PreparationStatus};
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegistration};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::store::SqliteStore;
 use gwr_runtime::ports::store::{Store, StoreError};
 
@@ -24,7 +25,7 @@ fn attempt(byte: u8) -> PreparedAttempt {
         AttemptId::from_bytes([byte; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new("/tmp/fixture"),
+        RepositoryLocator::new("/tmp/fixture"),
         CommitHash::new("basis-aaa"),
         Sha256Digest::of_bytes(b"candidate"),
         GitRefEffect {
@@ -129,6 +130,44 @@ fn temp_db(name: &str) -> std::path::PathBuf {
     let db = dir.join("state.sqlite");
     let _ = std::fs::remove_file(&db);
     db
+}
+
+#[test]
+fn pre_registry_database_migrates_with_repository_identity_unbound() {
+    let db = temp_db("repository-migration");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE work_request (
+                id TEXT PRIMARY KEY,
+                repository TEXT NOT NULL,
+                target_ref TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO work_request
+                (id, repository, target_ref, goal, created_at)
+             VALUES
+                ('01010101010101010101010101010101',
+                 '/old/checkout',
+                 'refs/gwr/target',
+                 'legacy request',
+                 1);",
+        )
+        .unwrap();
+    }
+
+    let mut store = SqliteStore::open(&db).unwrap();
+    let legacy = store
+        .get_work_request(WorkRequestId::from_bytes([1; 16]))
+        .unwrap();
+    assert_eq!(legacy.repository_id, None);
+    assert_eq!(legacy.repository.as_str(), "/old/checkout");
+    assert!(store
+        .all_column_names()
+        .unwrap()
+        .contains(&"work_request.repository_id".to_string()));
+    std::fs::remove_file(&db).unwrap();
 }
 
 #[test]
@@ -263,7 +302,8 @@ fn immutable_ids_cannot_be_rebound_to_different_content() {
     );
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new("/tmp/fixture"),
+        repository_id: None,
+        repository: RepositoryLocator::new("/tmp/fixture"),
         target_ref: RefName::new("refs/gwr/target"),
         goal: "make the test pass".into(),
         created_at: ClockReading(1),
@@ -278,6 +318,125 @@ fn immutable_ids_cannot_be_rebound_to_different_content() {
 }
 
 #[test]
+fn repository_identity_survives_path_relocation_and_aliases_cannot_be_rebound() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let repository_id = RepositoryId::from_bytes([0xa5; 16]);
+    let old_path = RepositoryLocator::new("/srv/checkouts/project-a");
+    let new_path = RepositoryLocator::new("/work/recloned/project-a");
+    store
+        .register_repository(&RepositoryRegistration {
+            id: repository_id,
+            registered_at: ClockReading(10),
+            aliases: vec![RepositoryAlias {
+                kind: RepositoryAliasKind::Path,
+                locator: old_path.clone(),
+                registered_at: ClockReading(10),
+                current: true,
+            }],
+        })
+        .unwrap();
+
+    store
+        .add_repository_alias(
+            repository_id,
+            &RepositoryAlias {
+                kind: RepositoryAliasKind::Path,
+                locator: new_path.clone(),
+                registered_at: ClockReading(20),
+                current: true,
+            },
+        )
+        .unwrap();
+
+    let registration = store.get_repository(repository_id).unwrap();
+    assert_eq!(registration.id, repository_id);
+    assert_eq!(registration.current_path(), Some(&new_path));
+    assert!(registration.has_path(&old_path));
+    assert!(registration.has_path(&new_path));
+    assert_eq!(
+        store
+            .find_repository_by_path(&old_path)
+            .unwrap()
+            .unwrap()
+            .id,
+        repository_id,
+        "the historical locator still resolves through the explicit registry"
+    );
+    assert_eq!(
+        store
+            .find_repository_by_path(&new_path)
+            .unwrap()
+            .unwrap()
+            .id,
+        repository_id
+    );
+
+    let other_id = RepositoryId::from_bytes([0xb6; 16]);
+    store
+        .register_repository(&RepositoryRegistration {
+            id: other_id,
+            registered_at: ClockReading(30),
+            aliases: vec![RepositoryAlias {
+                kind: RepositoryAliasKind::Path,
+                locator: RepositoryLocator::new("/work/other"),
+                registered_at: ClockReading(30),
+                current: true,
+            }],
+        })
+        .unwrap();
+
+    let legacy_request = WorkRequest {
+        id: WorkRequestId::from_bytes([0xc7; 16]),
+        repository_id: None,
+        repository: new_path.clone(),
+        target_ref: RefName::new("refs/gwr/target"),
+        goal: "legacy request".into(),
+        created_at: ClockReading(32),
+    };
+    store.create_work_request(&legacy_request).unwrap();
+    assert_eq!(
+        store
+            .get_work_request(legacy_request.id)
+            .unwrap()
+            .repository_id,
+        None,
+        "alias registration alone never promotes an existing work request"
+    );
+    store
+        .bind_work_request_repository(legacy_request.id, repository_id)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_work_request(legacy_request.id)
+            .unwrap()
+            .repository_id,
+        Some(repository_id)
+    );
+    assert_eq!(
+        store
+            .add_repository_alias(
+                other_id,
+                &RepositoryAlias {
+                    kind: RepositoryAliasKind::Path,
+                    locator: old_path,
+                    registered_at: ClockReading(31),
+                    current: false,
+                },
+            )
+            .unwrap_err(),
+        StoreError::ImmutableRebind,
+        "a locator already registered to one opaque identity cannot be laundered into another"
+    );
+    assert_eq!(
+        store
+            .bind_work_request_repository(legacy_request.id, other_id)
+            .unwrap_err(),
+        StoreError::ImmutableRebind,
+        "an explicit legacy binding is immutable"
+    );
+}
+
+#[test]
 fn identical_duplicate_commands_are_idempotent() {
     let mut store = SqliteStore::open_in_memory().unwrap();
     let att = attempt(9);
@@ -285,7 +444,8 @@ fn identical_duplicate_commands_are_idempotent() {
     store.admit_attempt(&att).unwrap();
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new("/tmp/fixture"),
+        repository_id: None,
+        repository: RepositoryLocator::new("/tmp/fixture"),
         target_ref: RefName::new("refs/gwr/target"),
         goal: "make the test pass".into(),
         created_at: ClockReading(1),

@@ -12,7 +12,7 @@ use gwr_core::preparation::PreparationEnd;
 use gwr_core::reconciliation::ObligationKind;
 use gwr_core::recovery::FactSource;
 use gwr_core::refusal::{DispatchRefusalGround, RelianceRefusal};
-use gwr_core::work_request::{CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{CommitHash, RefName, RepositoryLocator};
 use gwr_runtime::ports::store::StoreError;
 
 /// List encoding: length-prefixed, so `decode(encode(x)) == x` for every list
@@ -89,6 +89,7 @@ impl_from16!(
     WorkRequestId,
     PreparationRunId,
     CandidateArtifactId,
+    RepositoryId,
     AttemptId,
     RatificationId,
     StandingGrantId,
@@ -147,8 +148,8 @@ pub fn parse_digest(hex: &str) -> Result<Sha256Digest, CorruptColumn> {
     Ok(Sha256Digest::from_bytes(bytes))
 }
 
-pub fn repo(s: &str) -> RepositoryIdentity {
-    RepositoryIdentity::new(s)
+pub fn repo(s: &str) -> RepositoryLocator {
+    RepositoryLocator::new(s)
 }
 
 pub fn refname(s: &str) -> RefName {

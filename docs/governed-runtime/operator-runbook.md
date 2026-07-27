@@ -18,6 +18,36 @@ Recurring rules:
   `proven_not_committed` are valid relative to asserted `ExclusiveRefCustody`
   ([trust model §2](trust-model.md)); the dossier's qualification block states this per
   attempt.
+- **A checkout path is not repository identity.** Register a Docket-owned
+  `RepositoryId` before creating new work, and pass both that ID and its current path
+  locator. The complete contract and migration procedure are in
+  [repository identity and ref continuity](repository-identity-and-ref-continuity.md).
+
+## Repository setup and continuity handoff
+
+For a new repository, run `docket repository register --repo <absolute-path>` in the
+intended state directory. Keep the printed `repo-…` value and supply it to
+`docket request create --repository-id <repo-id> --repo <absolute-path> …`. Docket
+refuses an unregistered ID, a non-current path, a relative path, or a path/remote/Git
+object presented as identity.
+
+Opening an existing state store does not infer identities from paths. Register the old
+path explicitly, then use
+`docket repository migrate-attempt --repository-id <repo-id> --attempt <attempt-id>`.
+The migration refuses unless that attempt's path is already a retained alias for the
+named ID, and it cannot rebind a work request that already has another ID.
+
+After relocating or recloning, run
+`docket repository relocate --repository-id <repo-id> --repo <new-absolute-path>`.
+`repository show --json` should then show the new path as current and the prior path as a
+retained non-current alias. The logical ID does not change.
+
+For an identified attempt with a normal result commitment,
+`docket continuity subject --attempt <attempt-id> --json` emits
+`gwr:ref-continuity-operation:v0`. Hand that complete operation to Continuity; do not
+reconstruct its `gwr:ref-continuity:v0:<repo>#<ref>@<commit>` subject from the path or
+from a familiar-looking endpoint. The command refuses legacy-unbound and uncommitted
+attempts. It does not itself inspect Git or claim that continuity currently holds.
 
 ## 1. `committed` (normal settlement)
 

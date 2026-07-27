@@ -56,6 +56,13 @@ define_id!(
     "cand"
 );
 define_id!(
+    /// One Docket-owned logical repository. This identity is minted or
+    /// explicitly registered; it is never derived from a path, remote URL,
+    /// checkout, commit, or tree.
+    RepositoryId,
+    "repo"
+);
+define_id!(
     /// An exact attempt: minted only at candidate admission, when repository,
     /// basis, artifact digest, effect specification, and observation plan are all
     /// fixed. Never reused; a retry is a different attempt.

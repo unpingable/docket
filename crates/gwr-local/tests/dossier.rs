@@ -17,7 +17,8 @@ use gwr_core::lifecycle::{AttemptState, RecoveryVerdict};
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::preparation::CandidateArtifact;
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegistration};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::capabilities::StandingTokenCodec;
@@ -113,7 +114,8 @@ fn fixture(name: &str) -> Fx {
     // admitted attempt.
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new(repo.to_string_lossy()),
+        repository_id: None,
+        repository: RepositoryLocator::new(repo.to_string_lossy()),
         target_ref: RefName::new(TARGET_REF),
         goal: GOAL.into(),
         created_at: ClockReading(1),
@@ -359,6 +361,80 @@ fn normal_committed_attempt_is_fully_legible() {
         assert!(surface.contains("src/lib.rs"), "admitted path missing");
     }
     assert!(json.contains("\"settlement\":\"normal\""));
+}
+
+#[test]
+fn legacy_dossier_is_not_path_migrated_and_explicit_registration_binds_v3_subject() {
+    let mut fx = fixture("repository-migration");
+    drive_committed(&mut fx);
+
+    // Merely opening the migrated database did not infer an identity from the
+    // path already stored in the attempt. Its legacy dossier remains exactly
+    // the closed v2 shape.
+    let legacy = assemble(&mut fx.store, fx.att.attempt_id).unwrap();
+    assert_eq!(legacy.repository_id, None);
+    assert_eq!(legacy.ref_continuity_subject, None);
+    let legacy_bytes = render_json(&legacy).into_bytes();
+    assert!(std::str::from_utf8(&legacy_bytes)
+        .unwrap()
+        .contains("\"dossier_format\":\"gwr:attempt-dossier:v2\""));
+
+    // Migration is an explicit Docket registration: mint/register the opaque
+    // ID and retain the old stored path as a locator.
+    let repository_id = RepositoryId::from_bytes([0x5c; 16]);
+    fx.store
+        .register_repository(&RepositoryRegistration {
+            id: repository_id,
+            registered_at: ClockReading(60),
+            aliases: vec![RepositoryAlias {
+                kind: RepositoryAliasKind::Path,
+                locator: fx.att.repository.clone(),
+                registered_at: ClockReading(60),
+                current: true,
+            }],
+        })
+        .unwrap();
+
+    let registered_only = assemble(&mut fx.store, fx.att.attempt_id).unwrap();
+    assert_eq!(
+        registered_only.repository_id, None,
+        "registering a path alias must not silently migrate a historical dossier"
+    );
+    assert!(render_json(&registered_only).contains("\"dossier_format\":\"gwr:attempt-dossier:v2\""));
+
+    fx.store
+        .bind_work_request_repository(fx.att.work_request, repository_id)
+        .unwrap();
+    let promoted = assemble(&mut fx.store, fx.att.attempt_id).unwrap();
+    assert_eq!(promoted.repository_id, Some(repository_id));
+    let commitment = promoted.execution.commitment.as_ref().unwrap();
+    let expected = format!(
+        "gwr:ref-continuity:v0:{repository_id}#{TARGET_REF}@{}",
+        commitment.result_commit.as_str()
+    );
+    assert_eq!(
+        promoted.ref_continuity_subject.as_ref().unwrap().as_str(),
+        expected
+    );
+    assert!(
+        !expected.contains(fx.att.repository.as_str()),
+        "the operational path must not enter the logical subject"
+    );
+
+    let v3 = render_json(&promoted);
+    assert!(v3.contains("\"dossier_format\":\"gwr:attempt-dossier:v3\""));
+    assert!(v3.contains(&format!("\"repository_id\":\"{repository_id}\"")));
+    assert!(v3.contains(&format!("\"ref_continuity_subject\":\"{expected}\"")));
+    assert!(v3.contains("\"repository_locator\":{\"kind\":\"path\""));
+    assert!(
+        !v3.contains("\"repository\":"),
+        "v3 must label the stored path as a locator"
+    );
+
+    // Rendering the already-issued legacy read model after registration is
+    // byte-identical: promotion creates a new v3 projection and rewrites no
+    // historical artifact.
+    assert_eq!(render_json(&legacy).as_bytes(), legacy_bytes);
 }
 
 // 2 — a `CommittedViaRecovery` attempt: recovery evidence, the separate

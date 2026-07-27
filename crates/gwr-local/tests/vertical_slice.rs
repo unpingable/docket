@@ -132,12 +132,25 @@ fn complete_happy_path_through_the_cli() {
     let patch_file = repo.join("candidate.patch");
     std::fs::write(&patch_file, &patch).unwrap();
 
+    let out = docket(
+        &state,
+        &[
+            "repository",
+            "register",
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+        ],
+    );
+    let repository_id = value_of(&out, "repository_id").to_string();
+
     // request create
     let out = docket(
         &state,
         &[
             "request",
             "create",
+            "--repository-id",
+            &repository_id,
             "--repo",
             repo.to_string_lossy().as_ref(),
             "--target-ref",
@@ -283,12 +296,124 @@ fn complete_happy_path_through_the_cli() {
         assert!(human.contains(fact), "human output missing {fact}");
         assert!(json.contains(fact), "json output missing {fact}");
     }
-    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v2\""));
+    assert!(json.contains("\"dossier_format\":\"gwr:attempt-dossier:v3\""));
     assert!(human.contains("human_review_before_merge"), "{human}");
     assert!(
         json.contains("\"kind\":\"human_review_before_merge\""),
         "{json}"
     );
+
+    // The machine-facing operation carries the exact Docket-owned subject and
+    // independently named components. It neither probes Git nor derives the
+    // identity from the checkout.
+    let before = docket(
+        &state,
+        &["continuity", "subject", "--attempt", &attempt, "--json"],
+    );
+    let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+    let expected_subject =
+        format!("gwr:ref-continuity:v0:{repository_id}#{TARGET_REF}@{result_commit}");
+    assert_eq!(
+        before["schema"], "gwr:ref-continuity-operation:v0",
+        "{before}"
+    );
+    assert_eq!(before["subject"], expected_subject);
+    assert_eq!(before["repository_id"], repository_id);
+    assert_eq!(before["target_ref"], TARGET_REF);
+    assert_eq!(before["result_commit"], result_commit);
+    assert!(
+        !before["subject"]
+            .as_str()
+            .unwrap()
+            .contains(repo.to_string_lossy().as_ref()),
+        "the path locator entered the logical subject"
+    );
+
+    // Relocate the complete working tree and its Docket state, explicitly
+    // register the new path, then prove the logical subject is unchanged. The
+    // old path remains a historical alias for the already-recorded attempt.
+    let relocated = repo.with_file_name(format!(
+        "{}-relocated",
+        repo.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&relocated);
+    std::fs::rename(&repo, &relocated).unwrap();
+    let relocated_state = relocated.join(".gwr-state");
+    docket(
+        &relocated_state,
+        &[
+            "repository",
+            "relocate",
+            "--repository-id",
+            &repository_id,
+            "--repo",
+            relocated.to_string_lossy().as_ref(),
+        ],
+    );
+    let after = docket(
+        &relocated_state,
+        &["continuity", "subject", "--attempt", &attempt, "--json"],
+    );
+    let after: serde_json::Value = serde_json::from_str(&after).unwrap();
+    assert_eq!(after["subject"], before["subject"]);
+    assert_eq!(after["repository_id"], before["repository_id"]);
+    let registration = docket(
+        &relocated_state,
+        &[
+            "repository",
+            "show",
+            "--repository-id",
+            &repository_id,
+            "--json",
+        ],
+    );
+    let registration: serde_json::Value = serde_json::from_str(&registration).unwrap();
+    assert_eq!(registration["aliases"].as_array().unwrap().len(), 2);
+    assert!(registration["aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| { a["locator"] == repo.to_string_lossy().as_ref() && a["current"] == false }));
+    assert!(registration["aliases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| { a["locator"] == relocated.to_string_lossy().as_ref() && a["current"] == true }));
+
+    let _ = std::fs::remove_dir_all(&relocated);
+}
+
+#[test]
+fn repository_identity_parser_rejects_paths_remotes_and_git_hashes() {
+    let (repo, _, _) = fixture_repo("identity-refusal");
+    let state = repo.join(".gwr-state");
+    let bad_identities = [
+        repo.to_string_lossy().to_string(),
+        "https://example.invalid/owner/repository.git".to_string(),
+        "0123456789abcdef0123456789abcdef01234567".to_string(),
+    ];
+
+    for bad in bad_identities {
+        let out = Command::new(env!("CARGO_BIN_EXE_docket"))
+            .args([
+                "repository",
+                "register",
+                "--repository-id",
+                &bad,
+                "--repo",
+                repo.to_string_lossy().as_ref(),
+                "--state",
+                state.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad:?} was accepted as identity");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("paths, remotes, and Git object hashes"),
+            "unexpected refusal for {bad:?}: {stderr}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&repo);
 }
@@ -299,6 +424,8 @@ fn complete_happy_path_through_the_cli() {
 struct Committed {
     store: SqliteStore,
     attempt: AttemptId,
+    attempt_text: String,
+    repository_id: String,
     result_commit: String,
     repo: PathBuf,
 }
@@ -308,11 +435,23 @@ fn committed_fixture(name: &str) -> Committed {
     let state = repo.join(".gwr-state");
     let patch_file = repo.join("candidate.patch");
     std::fs::write(&patch_file, &patch).unwrap();
+    let registration = docket(
+        &state,
+        &[
+            "repository",
+            "register",
+            "--repo",
+            repo.to_string_lossy().as_ref(),
+        ],
+    );
+    let repository_id = value_of(&registration, "repository_id").to_string();
     let out = docket(
         &state,
         &[
             "request",
             "create",
+            "--repository-id",
+            &repository_id,
             "--repo",
             repo.to_string_lossy().as_ref(),
             "--target-ref",
@@ -395,6 +534,8 @@ fn committed_fixture(name: &str) -> Committed {
     Committed {
         store,
         attempt: AttemptId::from_bytes(bytes),
+        attempt_text: attempt,
+        repository_id,
         result_commit,
         repo,
     }
@@ -485,5 +626,60 @@ fn wrong_commit_observation_is_rejected() {
         RelyError::Refused(RelianceRefusal::Observation(
             ObservationRefusal::ScopeMismatch
         ))
+    );
+}
+
+#[test]
+fn legacy_attempt_subject_refuses_until_selected_explicit_migration() {
+    let mut f = committed_fixture("legacy-migration");
+    f.store
+        .execute_raw_for_test("UPDATE work_request SET repository_id=NULL")
+        .unwrap();
+    let state = f.repo.join(".gwr-state");
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_docket"))
+        .args([
+            "continuity",
+            "subject",
+            "--attempt",
+            &f.attempt_text,
+            "--json",
+            "--state",
+            state.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("refusing path-derived identity"));
+
+    docket(
+        &state,
+        &[
+            "repository",
+            "migrate-attempt",
+            "--attempt",
+            &f.attempt_text,
+            "--repository-id",
+            &f.repository_id,
+        ],
+    );
+    let operation = docket(
+        &state,
+        &[
+            "continuity",
+            "subject",
+            "--attempt",
+            &f.attempt_text,
+            "--json",
+        ],
+    );
+    let operation: serde_json::Value = serde_json::from_str(&operation).unwrap();
+    assert_eq!(operation["repository_id"], f.repository_id);
+    assert_eq!(
+        operation["subject"],
+        format!(
+            "gwr:ref-continuity:v0:{}#{TARGET_REF}@{}",
+            f.repository_id, f.result_commit
+        )
     );
 }

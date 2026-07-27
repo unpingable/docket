@@ -11,7 +11,7 @@ use crate::digest::Sha256Digest;
 use crate::ids::{AttemptId, DispatchId, RecoveryFactId, RecoveryResolutionId, StandingUseId};
 use crate::lifecycle::RecoveryVerdict;
 use crate::refusal::RecoveryRefusal;
-use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use crate::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 
 /// Where a recovery fact came from. Recorded exactly; never graded for truth.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -48,7 +48,7 @@ pub struct RecoveryFact {
     pub attempt: AttemptId,
     pub dispatch: DispatchId,
     pub prepared_attempt_digest: Sha256Digest,
-    pub repository: RepositoryIdentity,
+    pub repository: RepositoryLocator,
     pub target_ref: RefName,
     pub basis: CommitHash,
     /// The value the target ref was observed to hold.
@@ -119,7 +119,7 @@ pub struct AuthoritativeBinding<'a> {
     pub attempt: AttemptId,
     pub dispatch: DispatchId,
     pub prepared_attempt_digest: &'a Sha256Digest,
-    pub repository: &'a RepositoryIdentity,
+    pub repository: &'a RepositoryLocator,
     pub target_ref: &'a RefName,
     pub basis: &'a CommitHash,
     pub journal_digest: &'a Sha256Digest,

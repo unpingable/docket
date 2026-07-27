@@ -6,13 +6,13 @@
 //! reading is refused rather than believed.
 
 use gwr_core::ids::DispatchId;
-use gwr_core::work_request::{CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{CommitHash, RefName, RepositoryLocator};
 
 pub trait RecoveryEvidenceSource {
     /// The value the governed target ref holds right now.
     fn read_target_ref(
         &mut self,
-        repository: &RepositoryIdentity,
+        repository: &RepositoryLocator,
         target_ref: &RefName,
     ) -> Result<CommitHash, String>;
 

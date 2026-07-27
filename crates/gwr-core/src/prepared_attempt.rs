@@ -9,14 +9,14 @@ use crate::digest::{Sha256Digest, Transcript};
 use crate::effect_spec::GitRefEffect;
 use crate::ids::{AttemptId, CandidateArtifactId, WorkRequestId};
 use crate::observation_plan::ObservationPlan;
-use crate::work_request::{ClockReading, CommitHash, RepositoryIdentity};
+use crate::work_request::{ClockReading, CommitHash, RepositoryLocator};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PreparedAttempt {
     pub attempt_id: AttemptId,
     pub work_request: WorkRequestId,
     pub candidate: CandidateArtifactId,
-    pub repository: RepositoryIdentity,
+    pub repository: RepositoryLocator,
     pub basis: CommitHash,
     pub artifact_digest: Sha256Digest,
     pub effect: GitRefEffect,
@@ -36,7 +36,7 @@ impl PreparedAttempt {
         attempt_id: AttemptId,
         work_request: WorkRequestId,
         candidate: CandidateArtifactId,
-        repository: RepositoryIdentity,
+        repository: RepositoryLocator,
         basis: CommitHash,
         artifact_digest: Sha256Digest,
         effect: GitRefEffect,
@@ -76,7 +76,7 @@ mod tests {
             AttemptId::from_bytes(attempt),
             WorkRequestId::from_bytes([9; 16]),
             CandidateArtifactId::from_bytes([8; 16]),
-            RepositoryIdentity::new("/tmp/fixture"),
+            RepositoryLocator::new("/tmp/fixture"),
             CommitHash::new(basis),
             Sha256Digest::of_bytes(b"candidate-bytes"),
             GitRefEffect {

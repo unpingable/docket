@@ -14,7 +14,7 @@ use gwr_core::lifecycle::AttemptState;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::outcome::Commitment;
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::observe::{observe, ObserveError};
 use gwr_local::store::SqliteStore;
@@ -26,7 +26,7 @@ fn attempt_with(argv: Vec<String>) -> PreparedAttempt {
         AttemptId::from_bytes([9; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new("/nonexistent-repo"),
+        RepositoryLocator::new("/nonexistent-repo"),
         CommitHash::new("basis"),
         d,
         GitRefEffect {

@@ -18,7 +18,8 @@ use gwr_core::receipt::{DispatchEnvelope, RatificationReceipt, ReviewQueueAdmiss
 use gwr_core::reconciliation::{Reconciliation, ResidualObligation};
 use gwr_core::recovery::{RecoveryFact, RecoveryResolution};
 use gwr_core::refusal::RelianceRefusal;
-use gwr_core::work_request::{ClockReading, CommitHash, WorkRequest};
+use gwr_core::repository::{RepositoryAlias, RepositoryRegistration};
+use gwr_core::work_request::{ClockReading, CommitHash, RepositoryLocator, WorkRequest};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -85,6 +86,33 @@ pub struct RelianceRefusalRecord {
 }
 
 pub trait Store {
+    // Docket-owned logical repository registry. Paths/remotes are aliases;
+    // lookup by a path succeeds only after an explicit registration.
+    fn register_repository(
+        &mut self,
+        registration: &RepositoryRegistration,
+    ) -> Result<(), StoreError>;
+    fn add_repository_alias(
+        &mut self,
+        repository: RepositoryId,
+        alias: &RepositoryAlias,
+    ) -> Result<(), StoreError>;
+    fn get_repository(
+        &mut self,
+        repository: RepositoryId,
+    ) -> Result<RepositoryRegistration, StoreError>;
+    fn find_repository_by_path(
+        &mut self,
+        path: &RepositoryLocator,
+    ) -> Result<Option<RepositoryRegistration>, StoreError>;
+    /// Explicitly bind one legacy work request to an already registered
+    /// logical repository. Implementations must refuse rebinding.
+    fn bind_work_request_repository(
+        &mut self,
+        work_request: WorkRequestId,
+        repository: RepositoryId,
+    ) -> Result<(), StoreError>;
+
     // Work requests, preparation, candidates.
     fn create_work_request(&mut self, wr: &WorkRequest) -> Result<(), StoreError>;
     fn get_work_request(&mut self, id: WorkRequestId) -> Result<WorkRequest, StoreError>;

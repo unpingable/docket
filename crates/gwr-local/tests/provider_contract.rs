@@ -4,7 +4,7 @@
 use gwr_core::digest::Sha256Digest;
 use gwr_core::ids::*;
 use gwr_core::preparation::{PreparationEnd, PreparationRun, PreparationStatus};
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FixedClock, FsArtifactStore, FsProvenanceSink, HashChainIds};
 use gwr_local::providers::fake::{GoalEchoProvider, Script, ScriptedProvider};
 use gwr_local::store::SqliteStore;
@@ -39,7 +39,8 @@ impl Fixture {
     fn run(&mut self, byte: u8, deadline: u64) -> (PreparationRun, BoundedAssignment) {
         let wr = WorkRequest {
             id: WorkRequestId::from_bytes([1; 16]),
-            repository: RepositoryIdentity::new("/tmp/fixture"),
+            repository_id: None,
+            repository: RepositoryLocator::new("/tmp/fixture"),
             target_ref: RefName::new("refs/gwr/target"),
             goal: "make canonicalizes_whitespace pass".into(),
             created_at: ClockReading(1),

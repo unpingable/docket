@@ -20,7 +20,8 @@ use gwr_core::receipt::{DispatchEnvelope, RatificationReceipt, ReviewQueueAdmiss
 use gwr_core::reconciliation::{Reconciliation, ResidualObligation};
 use gwr_core::recovery::{RecoveryFact, RecoveryResolution};
 use gwr_core::refusal::RelianceRefusal;
-use gwr_core::work_request::{ClockReading, WorkRequest};
+use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegistration};
+use gwr_core::work_request::{ClockReading, RepositoryLocator, WorkRequest};
 use gwr_runtime::ports::store::{
     ProjectedAttempt, RelianceRefusalRecord, RelianceSubject, Store, StoreError, TimelineEntry,
 };
@@ -30,6 +31,7 @@ use std::path::Path;
 const MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_reliance_subject.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_authz_issuance.sql");
+const MIGRATION_0004: &str = include_str!("../../migrations/0004_repository_registry.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -94,6 +96,25 @@ impl SqliteStore {
         if has_source == 0 {
             conn.execute_batch(MIGRATION_0003).map_err(backend)?;
         }
+        // 0004 introduces Docket's explicit logical repository registry.
+        // It intentionally does not backfill from stored paths: a path is a
+        // locator, never identity. Existing stores remain readable for
+        // operations that do not require logical identity. The nullable
+        // work-request binding remains NULL until a new request supplies an ID
+        // or an operator explicitly migrates one selected attempt.
+        let has_repository_id: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_request')
+                 WHERE name='repository_id'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if has_repository_id == 0 {
+            conn.execute("ALTER TABLE work_request ADD COLUMN repository_id TEXT", [])
+                .map_err(backend)?;
+        }
+        conn.execute_batch(MIGRATION_0004).map_err(backend)?;
         Ok(())
     }
 
@@ -454,14 +475,300 @@ fn consume_standing(
 }
 
 impl Store for SqliteStore {
-    fn create_work_request(&mut self, wr: &WorkRequest) -> Result<(), StoreError> {
+    fn register_repository(
+        &mut self,
+        registration: &RepositoryRegistration,
+    ) -> Result<(), StoreError> {
+        if registration.aliases.is_empty() {
+            return Err(StoreError::Backend(
+                "repository registration requires at least one explicit alias".into(),
+            ));
+        }
+        let tx = self.tx()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO repository (id, registered_at) VALUES (?1, ?2)",
+            params![
+                id16(registration.id.as_bytes()),
+                registration.registered_at.0 as i64
+            ],
+        )
+        .map_err(backend)?;
+
+        for alias in &registration.aliases {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT repository_id FROM repository_locator
+                     WHERE kind=?1 AND locator=?2",
+                    params![alias.kind.tag(), alias.locator.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            if existing
+                .as_deref()
+                .is_some_and(|id| id != id16(registration.id.as_bytes()))
+            {
+                return Err(StoreError::ImmutableRebind);
+            }
+            if alias.current {
+                if alias.kind != RepositoryAliasKind::Path {
+                    return Err(StoreError::Backend(
+                        "only a path alias may be current".into(),
+                    ));
+                }
+                tx.execute(
+                    "UPDATE repository_locator SET current=0
+                     WHERE repository_id=?1 AND kind='path' AND current=1",
+                    params![id16(registration.id.as_bytes())],
+                )
+                .map_err(backend)?;
+            }
+            tx.execute(
+                "INSERT INTO repository_locator
+                 (repository_id, kind, locator, registered_at, current)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(repository_id, kind, locator) DO UPDATE SET
+                   current=MAX(repository_locator.current, excluded.current)",
+                params![
+                    id16(registration.id.as_bytes()),
+                    alias.kind.tag(),
+                    alias.locator.as_str(),
+                    alias.registered_at.0 as i64,
+                    i64::from(alias.current)
+                ],
+            )
+            .map_err(backend)?;
+        }
+        tx.commit().map_err(backend)
+    }
+
+    fn add_repository_alias(
+        &mut self,
+        repository: RepositoryId,
+        alias: &RepositoryAlias,
+    ) -> Result<(), StoreError> {
+        // Refuse aliases for an unregistered logical identity.
+        let present: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM repository WHERE id=?1",
+                params![id16(repository.as_bytes())],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if present == 0 {
+            return Err(StoreError::NotFound);
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT repository_id FROM repository_locator
+                 WHERE kind=?1 AND locator=?2",
+                params![alias.kind.tag(), alias.locator.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if existing
+            .as_deref()
+            .is_some_and(|id| id != id16(repository.as_bytes()))
+        {
+            return Err(StoreError::ImmutableRebind);
+        }
+        if alias.current && alias.kind != RepositoryAliasKind::Path {
+            return Err(StoreError::Backend(
+                "only a path alias may be current".into(),
+            ));
+        }
+
+        let tx = self.tx()?;
+        if alias.current {
+            tx.execute(
+                "UPDATE repository_locator SET current=0
+                 WHERE repository_id=?1 AND kind='path' AND current=1",
+                params![id16(repository.as_bytes())],
+            )
+            .map_err(backend)?;
+        }
+        tx.execute(
+            "INSERT INTO repository_locator
+             (repository_id, kind, locator, registered_at, current)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repository_id, kind, locator) DO UPDATE SET
+               current=excluded.current",
+            params![
+                id16(repository.as_bytes()),
+                alias.kind.tag(),
+                alias.locator.as_str(),
+                alias.registered_at.0 as i64,
+                i64::from(alias.current)
+            ],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    fn get_repository(
+        &mut self,
+        repository: RepositoryId,
+    ) -> Result<RepositoryRegistration, StoreError> {
+        let registered_at: i64 = self
+            .conn
+            .query_row(
+                "SELECT registered_at FROM repository WHERE id=?1",
+                params![id16(repository.as_bytes())],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .ok_or(StoreError::NotFound)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT kind, locator, registered_at, current
+                 FROM repository_locator WHERE repository_id=?1
+                 ORDER BY registered_at, kind, locator",
+            )
+            .map_err(backend)?;
+        let aliases = stmt
+            .query_map(params![id16(repository.as_bytes())], |r| {
+                let kind: String = r.get(0)?;
+                let kind = RepositoryAliasKind::from_tag(&kind).ok_or_else(|| {
+                    sql_corrupt(CorruptColumn(format!(
+                        "unknown repository alias kind {kind:?}"
+                    )))
+                })?;
+                Ok(RepositoryAlias {
+                    kind,
+                    locator: RepositoryLocator::new(r.get::<_, String>(1)?),
+                    registered_at: ClockReading(r.get::<_, i64>(2)? as u64),
+                    current: r.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(RepositoryRegistration {
+            id: repository,
+            registered_at: ClockReading(registered_at as u64),
+            aliases,
+        })
+    }
+
+    fn find_repository_by_path(
+        &mut self,
+        path: &RepositoryLocator,
+    ) -> Result<Option<RepositoryRegistration>, StoreError> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT repository_id FROM repository_locator
+                 WHERE kind='path' AND locator=?1",
+                params![path.as_str()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        id.map(|raw| {
+            let parsed =
+                parse_id16::<RepositoryId>(&raw).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            self.get_repository(parsed)
+        })
+        .transpose()
+    }
+
+    fn bind_work_request_repository(
+        &mut self,
+        work_request: WorkRequestId,
+        repository: RepositoryId,
+    ) -> Result<(), StoreError> {
+        let registered: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM repository WHERE id=?1",
+                params![id16(repository.as_bytes())],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if registered == 0 {
+            return Err(StoreError::NotFound);
+        }
+        let request_path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT repository FROM work_request WHERE id=?1",
+                params![id16(work_request.as_bytes())],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        let request_path = request_path.ok_or(StoreError::NotFound)?;
+        let retained_alias: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM repository_locator
+                 WHERE repository_id=?1 AND kind='path' AND locator=?2",
+                params![id16(repository.as_bytes()), request_path],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if retained_alias == 0 {
+            return Err(StoreError::ImmutableRebind);
+        }
         let changed = self
             .conn
             .execute(
-                "INSERT OR IGNORE INTO work_request (id, repository, target_ref, goal, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "UPDATE work_request SET repository_id=?1
+                 WHERE id=?2 AND repository_id IS NULL",
+                params![id16(repository.as_bytes()), id16(work_request.as_bytes())],
+            )
+            .map_err(backend)?;
+        if changed == 1 {
+            return Ok(());
+        }
+        let existing: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT repository_id FROM work_request WHERE id=?1",
+                params![id16(work_request.as_bytes())],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        match existing {
+            None => Err(StoreError::NotFound),
+            Some(Some(id)) if id == id16(repository.as_bytes()) => Ok(()),
+            Some(Some(_)) => Err(StoreError::ImmutableRebind),
+            Some(None) => Err(StoreError::Backend(
+                "repository binding update made no progress".into(),
+            )),
+        }
+    }
+
+    fn create_work_request(&mut self, wr: &WorkRequest) -> Result<(), StoreError> {
+        if let Some(repository_id) = wr.repository_id {
+            let registered_current_path: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM repository_locator
+                     WHERE repository_id=?1 AND kind='path' AND locator=?2 AND current=1",
+                    params![id16(repository_id.as_bytes()), wr.repository.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(backend)?;
+            if registered_current_path == 0 {
+                return Err(StoreError::NotFound);
+            }
+        }
+        let changed = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO work_request
+                 (id, repository_id, repository, target_ref, goal, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     id16(wr.id.as_bytes()),
+                    wr.repository_id.map(|id| id16(id.as_bytes())),
                     wr.repository.as_str(),
                     wr.target_ref.as_str(),
                     wr.goal,
@@ -481,15 +788,20 @@ impl Store for SqliteStore {
     fn get_work_request(&mut self, id: WorkRequestId) -> Result<WorkRequest, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, repository, target_ref, goal, created_at FROM work_request WHERE id=?1",
+                "SELECT id, repository_id, repository, target_ref, goal, created_at
+                 FROM work_request WHERE id=?1",
                 params![id16(id.as_bytes())],
                 |r| {
+                    let repository_id: Option<String> = r.get(1)?;
                     Ok(WorkRequest {
                         id: parse_id16(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
-                        repository: repo(&r.get::<_, String>(1)?),
-                        target_ref: refname(&r.get::<_, String>(2)?),
-                        goal: r.get(3)?,
-                        created_at: ClockReading(r.get::<_, i64>(4)? as u64),
+                        repository_id: repository_id
+                            .map(|raw| parse_id16(&raw).map_err(sql_corrupt))
+                            .transpose()?,
+                        repository: repo(&r.get::<_, String>(2)?),
+                        target_ref: refname(&r.get::<_, String>(3)?),
+                        goal: r.get(4)?,
+                        created_at: ClockReading(r.get::<_, i64>(5)? as u64),
                     })
                 },
             )

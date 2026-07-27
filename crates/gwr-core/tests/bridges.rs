@@ -17,14 +17,14 @@ use gwr_core::recovery::{FactSource, RecoveryFact};
 use gwr_core::refusal::{
     ObservationRefusal, RecoveryRefusal, RelianceRefusal, ReservationRefusal, StandingRefusal,
 };
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 
 fn attempt(id_byte: u8) -> PreparedAttempt {
     PreparedAttempt::admit(
         AttemptId::from_bytes([id_byte; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new("/tmp/fixture"),
+        RepositoryLocator::new("/tmp/fixture"),
         CommitHash::new("basis-aaa"),
         Sha256Digest::of_bytes(b"candidate"),
         GitRefEffect {

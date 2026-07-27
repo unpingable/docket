@@ -16,7 +16,7 @@ use gwr_core::lifecycle::AttemptState;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::preparation::{CandidateArtifact, PreparationRun, PreparationStatus};
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FixedClock, FsArtifactStore, FsProvenanceSink, HashChainIds};
 use gwr_local::store::SqliteStore;
 use gwr_runtime::ports::labor_provider::{
@@ -194,7 +194,8 @@ fn a_pre_boundary_inexpressible_request_cannot_start_preparation() {
     .unwrap();
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([7; 16]),
-        repository: RepositoryIdentity::new(fx.repo.to_string_lossy()),
+        repository_id: None,
+        repository: RepositoryLocator::new(fx.repo.to_string_lossy()),
         target_ref: RefName::new("mailto:ops@example.com"),
         goal: "Send a notification".into(),
         created_at: ClockReading(1),
@@ -228,11 +229,28 @@ fn a_pre_boundary_inexpressible_request_cannot_start_preparation() {
 #[test]
 fn inexpressible_admissions_refuse_before_an_attempt_is_minted() {
     let fx = fixture("admit");
+    let (ok, registration) = docket(
+        &fx.state,
+        &[
+            "repository",
+            "register",
+            "--repo",
+            fx.repo.to_string_lossy().as_ref(),
+        ],
+    );
+    assert!(ok, "{registration}");
+    let repository_id = registration
+        .lines()
+        .find_map(|l| l.strip_prefix("repository_id: "))
+        .unwrap()
+        .to_string();
     let (ok, out) = docket(
         &fx.state,
         &[
             "request",
             "create",
+            "--repository-id",
+            &repository_id,
             "--repo",
             fx.repo.to_string_lossy().as_ref(),
             "--target-ref",
@@ -410,7 +428,8 @@ fn provider_tool_requests_cannot_become_effect_proposals() {
     let mut store = SqliteStore::open(&fx.state.join("state.sqlite")).unwrap();
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new(fx.repo.to_string_lossy()),
+        repository_id: None,
+        repository: RepositoryLocator::new(fx.repo.to_string_lossy()),
         target_ref: RefName::new(TARGET_REF),
         goal: "goal".into(),
         created_at: ClockReading(1),
@@ -484,7 +503,8 @@ fn pre_boundary_persisted_attempts_remain_readable() {
     let mut store = SqliteStore::open(&fx.state.join("state.sqlite")).unwrap();
     let wr = WorkRequest {
         id: WorkRequestId::from_bytes([1; 16]),
-        repository: RepositoryIdentity::new(fx.repo.to_string_lossy()),
+        repository_id: None,
+        repository: RepositoryLocator::new(fx.repo.to_string_lossy()),
         target_ref: RefName::new("mailto:ops@example.com"),
         goal: "Send a notification".into(),
         created_at: ClockReading(1),

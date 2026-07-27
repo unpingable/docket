@@ -10,7 +10,7 @@ use gwr_core::lifecycle::AttemptState;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::prepared_attempt::PreparedAttempt;
 use gwr_core::refusal::StandingRefusal;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::capabilities::StandingTokenCodec;
 use gwr_local::store::SqliteStore;
@@ -22,7 +22,7 @@ fn attempt(byte: u8) -> PreparedAttempt {
         AttemptId::from_bytes([byte; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new("/tmp/fixture"),
+        RepositoryLocator::new("/tmp/fixture"),
         CommitHash::new("basis-aaa"),
         Sha256Digest::of_bytes(b"candidate"),
         GitRefEffect {
@@ -289,7 +289,7 @@ fn token_scope_survives_separator_injection() {
         StandingScope {
             actor: ActorId::from_bytes([4; 16]),
             act: StandingAct::Ratify,
-            repository: RepositoryIdentity::new(format!(
+            repository: RepositoryLocator::new(format!(
                 "/repo|{}|99999999999999",
                 Sha256Digest::of_bytes(b"attacker digest").to_hex()
             )),
@@ -328,7 +328,7 @@ fn token_round_trips_awkward_repository_paths() {
             StandingScope {
                 actor: ActorId::from_bytes([4; 16]),
                 act: StandingAct::Ratify,
-                repository: RepositoryIdentity::new(repo),
+                repository: RepositoryLocator::new(repo),
                 attempt_digest: att.prepared_attempt_digest,
             },
             ClockReading(1000),

@@ -30,7 +30,7 @@ impl GitRecoveryEvidence {
 impl gwr_runtime::ports::recovery_evidence::RecoveryEvidenceSource for GitRecoveryEvidence {
     fn read_target_ref(
         &mut self,
-        repository: &gwr_core::work_request::RepositoryIdentity,
+        repository: &gwr_core::work_request::RepositoryLocator,
         target_ref: &gwr_core::work_request::RefName,
     ) -> Result<CommitHash, String> {
         let out = Command::new("git")

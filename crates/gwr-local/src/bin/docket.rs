@@ -13,7 +13,8 @@ use gwr_core::lifecycle::AttemptState;
 use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::preparation::{PreparationRun, PreparationStatus};
 use gwr_core::prepared_attempt::PreparedAttempt;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity, WorkRequest};
+use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegistration};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FsArtifactStore, FsProvenanceSink, HashChainIds, SystemClock};
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::capabilities::StandingTokenCodec;
@@ -76,6 +77,54 @@ fn parse16(s: &str) -> Result<[u8; 16], String> {
         out[i] = u8::from_str_radix(s, 16).map_err(|_| "bad id")?;
     }
     Ok(out)
+}
+
+fn parse_repository_id(s: &str) -> Result<RepositoryId, String> {
+    if s.len() != 37 || !s.starts_with("repo-") {
+        return Err(
+            "repository identity must be an opaque repo- followed by 32 lowercase hex digits; \
+             paths, remotes, and Git object hashes are locators/content, not repository identity"
+                .into(),
+        );
+    }
+    if !s[5..]
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("repository identity contains non-lowercase-hex bytes".into());
+    }
+    Ok(RepositoryId::from_bytes(parse16(s)?))
+}
+
+fn require_absolute_path(raw: &str) -> Result<RepositoryLocator, String> {
+    if !std::path::Path::new(raw).is_absolute() {
+        return Err(
+            "repository path locator must be explicit and absolute; cwd discovery is not \
+             repository identity"
+                .into(),
+        );
+    }
+    Ok(RepositoryLocator::new(raw))
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn parse_digest(s: &str) -> Result<Sha256Digest, String> {
@@ -200,6 +249,162 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(String::as_str)
         .collect();
     match cmd.as_slice() {
+        ["repository", "register"] => {
+            let mut st = State::open(args)?;
+            let path = require_absolute_path(&need(args, "--repo")?)?;
+            let repository_id = match flag(args, "--repository-id") {
+                Some(raw) => parse_repository_id(&raw)?,
+                None => RepositoryId::from_bytes(st.ids.fresh16()),
+            };
+            let now = st.clock.now();
+            st.store
+                .register_repository(&RepositoryRegistration {
+                    id: repository_id,
+                    registered_at: now,
+                    aliases: vec![RepositoryAlias {
+                        kind: RepositoryAliasKind::Path,
+                        locator: path.clone(),
+                        registered_at: now,
+                        current: true,
+                    }],
+                })
+                .map_err(|e| format!("{e:?}"))?;
+            println!("repository_id: {repository_id}");
+            println!("path_locator: {}", path.as_str());
+            println!("note: path is an operational alias, not repository identity");
+            println!(
+                "migration: existing attempts remain unbound until `repository migrate-attempt`"
+            );
+            Ok(())
+        }
+        ["repository", "migrate-attempt"] => {
+            let mut st = State::open(args)?;
+            let repository_id = parse_repository_id(&need(args, "--repository-id")?)?;
+            let attempt_id = resolve_attempt(&mut st, args)?;
+            let projected = st
+                .store
+                .get_attempt(attempt_id)
+                .map_err(|e| format!("{e:?}"))?;
+            let registration = st
+                .store
+                .get_repository(repository_id)
+                .map_err(|_| format!("repository {repository_id} is not registered"))?;
+            if !registration.has_path(&projected.attempt.repository) {
+                return Err(format!(
+                    "attempt path {} is not an explicitly retained locator for \
+                     {repository_id}; refusing to infer or launder repository identity",
+                    projected.attempt.repository.as_str()
+                ));
+            }
+            st.store
+                .bind_work_request_repository(projected.attempt.work_request, repository_id)
+                .map_err(|e| format!("{e:?}"))?;
+            println!("repository_id: {repository_id}");
+            println!("attempt: {}", hex16s(attempt_id.as_bytes()));
+            println!("path_locator: {}", projected.attempt.repository.as_str());
+            println!(
+                "note: selected legacy work request is now explicitly bound; path remains a locator"
+            );
+            Ok(())
+        }
+        ["repository", "relocate"] => {
+            let mut st = State::open(args)?;
+            let repository_id = parse_repository_id(&need(args, "--repository-id")?)?;
+            let path = require_absolute_path(&need(args, "--repo")?)?;
+            st.store
+                .add_repository_alias(
+                    repository_id,
+                    &RepositoryAlias {
+                        kind: RepositoryAliasKind::Path,
+                        locator: path.clone(),
+                        registered_at: st.clock.now(),
+                        current: true,
+                    },
+                )
+                .map_err(|e| format!("{e:?}"))?;
+            println!("repository_id: {repository_id}");
+            println!("current_path_locator: {}", path.as_str());
+            println!("note: prior path aliases were retained; logical identity did not change");
+            Ok(())
+        }
+        ["repository", "alias"] => {
+            let mut st = State::open(args)?;
+            let repository_id = parse_repository_id(&need(args, "--repository-id")?)?;
+            let kind = match need(args, "--kind")?.as_str() {
+                "path" => RepositoryAliasKind::Path,
+                "remote" => RepositoryAliasKind::Remote,
+                other => return Err(format!("unknown alias kind {other:?}; use path or remote")),
+            };
+            let raw = need(args, "--value")?;
+            let locator = match kind {
+                RepositoryAliasKind::Path => require_absolute_path(&raw)?,
+                RepositoryAliasKind::Remote if raw.is_empty() => {
+                    return Err("remote alias must not be empty".into())
+                }
+                RepositoryAliasKind::Remote => RepositoryLocator::new(raw),
+            };
+            st.store
+                .add_repository_alias(
+                    repository_id,
+                    &RepositoryAlias {
+                        kind,
+                        locator: locator.clone(),
+                        registered_at: st.clock.now(),
+                        current: false,
+                    },
+                )
+                .map_err(|e| format!("{e:?}"))?;
+            println!("repository_id: {repository_id}");
+            println!("alias_kind: {}", kind.tag());
+            println!("alias: {}", locator.as_str());
+            println!("note: alias registration does not derive or change logical identity");
+            Ok(())
+        }
+        ["repository", "show"] => {
+            let mut st = State::open(args)?;
+            let repository_id = parse_repository_id(&need(args, "--repository-id")?)?;
+            let registration = st
+                .store
+                .get_repository(repository_id)
+                .map_err(|e| format!("{e:?}"))?;
+            if has(args, "--json") {
+                let aliases = registration
+                    .aliases
+                    .iter()
+                    .map(|a| {
+                        format!(
+                            "{{\"kind\":{},\"locator\":{},\"registered_at_ms\":{},\
+                             \"current\":{}}}",
+                            json_quote(a.kind.tag()),
+                            json_quote(a.locator.as_str()),
+                            a.registered_at.0,
+                            a.current
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "{{\"schema\":\"gwr:repository-registration:v0\",\
+                     \"repository_id\":{},\"registered_at_ms\":{},\"aliases\":[{}],\
+                     \"does_not_establish\":[\"a path or remote alias is repository identity\",\
+                     \"Git supplies a canonical repository identity\"]}}",
+                    json_quote(&repository_id.to_string()),
+                    registration.registered_at.0,
+                    aliases
+                );
+            } else {
+                println!("repository_id: {repository_id}");
+                for alias in registration.aliases {
+                    println!(
+                        "alias: {} {} current={}",
+                        alias.kind.tag(),
+                        alias.locator.as_str(),
+                        alias.current
+                    );
+                }
+            }
+            Ok(())
+        }
         ["request", "create"] => {
             let mut st = State::open(args)?;
             let target = need(args, "--target-ref")?;
@@ -209,9 +414,26 @@ fn run(args: &[String]) -> Result<(), String> {
             // before any provider runs, before any standing or reservation —
             // not eleven steps later as a mechanical Git refusal.
             GitRefEffect::validate_target_ref(&target).map_err(|e| format!("{e:?}"))?;
+            let repository_id = parse_repository_id(&need(args, "--repository-id")?)?;
+            let repository = require_absolute_path(&need(args, "--repo")?)?;
+            let registration = st.store.get_repository(repository_id).map_err(|_| {
+                format!(
+                    "repository {repository_id} is not registered; run `docket repository \
+                         register` rather than deriving identity from --repo"
+                )
+            })?;
+            if registration.current_path() != Some(&repository) {
+                return Err(format!(
+                    "path {} is not the current explicitly registered path locator for \
+                     {repository_id}; historical paths remain aliases but do not select \
+                     repository identity or authorize execution",
+                    repository.as_str()
+                ));
+            }
             let wr = WorkRequest {
                 id: WorkRequestId::from_bytes(st.ids.fresh16()),
-                repository: RepositoryIdentity::new(need(args, "--repo")?),
+                repository_id: Some(repository_id),
+                repository,
                 target_ref: RefName::new(target),
                 goal: need(args, "--goal")?,
                 created_at: st.clock.now(),
@@ -703,6 +925,69 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["continuity", "subject"] => {
+            let mut st = State::open(args)?;
+            let attempt = resolve_attempt(&mut st, args)?;
+            let d = dossier::assemble(&mut st.store, attempt).map_err(|e| format!("{e:?}"))?;
+            let repository_id = d.repository_id.ok_or_else(|| {
+                format!(
+                    "legacy dossier has no explicitly registered RepositoryId for path {}; \
+                     register or migrate the locator explicitly; refusing path-derived identity",
+                    d.attempt.repository.as_str()
+                )
+            })?;
+            let subject = d.ref_continuity_subject.as_ref().ok_or_else(|| {
+                "no exact ref-continuity subject: the attempt has no full committed result \
+                 bound to its governed target ref"
+                    .to_string()
+            })?;
+            let commitment = d
+                .execution
+                .commitment
+                .as_ref()
+                .ok_or_else(|| "attempt carries no commitment".to_string())?;
+            if has(args, "--json") {
+                println!(
+                    "{{\"schema\":\"gwr:ref-continuity-operation:v0\",\
+                     \"subject\":{},\"repository_id\":{},\"target_ref\":{},\
+                     \"result_commit\":{},\"docket_attempt\":{},\"dossier_version\":{},\
+                     \"prepared_attempt_digest\":{},\
+                     \"repository_locator\":{{\"kind\":\"path\",\"value\":{}}},\
+                     \"establishes\":\"Docket supplied the complete logical subject and its \
+                     exact recorded components\",\
+                     \"does_not_establish\":[\"the result commit remains incorporated now\",\
+                     \"the repository locator is logical identity\",\
+                     \"Continuity has committed or relied on this assumption\"]}}",
+                    json_quote(subject.as_str()),
+                    json_quote(&repository_id.to_string()),
+                    json_quote(d.attempt.effect.target_ref.as_str()),
+                    json_quote(commitment.result_commit.as_str()),
+                    json_quote(&hex16s(d.attempt.attempt_id.as_bytes())),
+                    d.version,
+                    json_quote(&d.attempt.prepared_attempt_digest.to_hex()),
+                    json_quote(d.attempt.repository.as_str()),
+                );
+            } else {
+                println!("subject: {}", subject.as_str());
+                println!("repository_id: {repository_id}");
+                println!("target_ref: {}", d.attempt.effect.target_ref.as_str());
+                println!("result_commit: {}", commitment.result_commit.as_str());
+                println!(
+                    "docket_attempt: {}",
+                    hex16s(d.attempt.attempt_id.as_bytes())
+                );
+                println!("dossier_version: {}", d.version);
+                println!(
+                    "prepared_attempt_digest: {}",
+                    d.attempt.prepared_attempt_digest.to_hex()
+                );
+                println!(
+                    "repository_locator: {} (operational alias; not identity)",
+                    d.attempt.repository.as_str()
+                );
+            }
+            Ok(())
+        }
         ["docket", "journal"] | ["journal"] => {
             let mut st = State::open(args)?;
             let attempt = resolve_attempt(&mut st, args)?;
@@ -743,10 +1028,12 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(format!(
-            "unknown command {cmd:?}; commands: request create, prepare start, prepare poll, \
+            "unknown command {cmd:?}; commands: repository register, repository relocate, \
+             repository alias, repository show, repository migrate-attempt, request create, \
+             prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
              rely review-queue, reconcile, recover fact, recover resolve, authz request, \
-             authz accept, docket list, docket show, docket journal"
+             authz accept, docket list, docket show, docket journal, continuity subject"
         )),
     }
 }

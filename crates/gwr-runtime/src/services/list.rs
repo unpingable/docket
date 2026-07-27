@@ -10,7 +10,7 @@ use crate::services::dossier::{state_tag, Settlement};
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::AttemptId;
 use gwr_core::lifecycle::AttemptState;
-use gwr_core::work_request::{ClockReading, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, RefName, RepositoryLocator};
 
 /// The versioned JSON format identifier for attempt lists.
 pub const LIST_FORMAT: &str = "gwr:attempt-list:v1";
@@ -23,7 +23,7 @@ pub struct AttemptSummary {
     pub state: AttemptState,
     pub version: u64,
     pub effect_class: &'static str,
-    pub repository: RepositoryIdentity,
+    pub repository: RepositoryLocator,
     pub target_ref: RefName,
     pub allowed_paths: Vec<String>,
     pub settlement: Settlement,

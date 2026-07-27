@@ -13,7 +13,7 @@
 use crate::digest::Sha256Digest;
 use crate::ids::{ActorId, StandingGrantId, StandingUseId};
 use crate::refusal::StandingRefusal;
-use crate::work_request::{ClockReading, RepositoryIdentity};
+use crate::work_request::{ClockReading, RepositoryLocator};
 
 /// The specific acts standing can authorize. Recovery resolution is separate
 /// authority, distinct from and never implied by ratification standing.
@@ -48,7 +48,7 @@ impl StandingAct {
 pub struct StandingScope {
     pub actor: ActorId,
     pub act: StandingAct,
-    pub repository: RepositoryIdentity,
+    pub repository: RepositoryLocator,
     pub attempt_digest: Sha256Digest,
 }
 
@@ -132,7 +132,7 @@ impl StandingGrant {
         &self,
         actor: ActorId,
         act: StandingAct,
-        repository: &RepositoryIdentity,
+        repository: &RepositoryLocator,
         attempt_digest: &Sha256Digest,
         now: ClockReading,
     ) -> Result<(), StandingRefusal> {
@@ -159,7 +159,7 @@ impl StandingGrant {
         &self,
         actor: ActorId,
         act: StandingAct,
-        repository: &RepositoryIdentity,
+        repository: &RepositoryLocator,
         attempt_digest: &Sha256Digest,
         now: ClockReading,
         use_id: StandingUseId,
@@ -189,7 +189,7 @@ mod tests {
             StandingScope {
                 actor: ActorId::from_bytes([2; 16]),
                 act: StandingAct::Ratify,
-                repository: RepositoryIdentity::new("/repo"),
+                repository: RepositoryLocator::new("/repo"),
                 attempt_digest: Sha256Digest::of_bytes(b"attempt"),
             },
             ClockReading(expires),

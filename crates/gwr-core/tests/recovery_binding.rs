@@ -21,7 +21,7 @@ use gwr_core::observation_plan::ObservationPlan;
 use gwr_core::prepared_attempt::PreparedAttempt;
 use gwr_core::recovery::{validate_fact_binding, AuthoritativeBinding, FactSource, RecoveryFact};
 use gwr_core::refusal::RecoveryRefusal;
-use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryIdentity};
+use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 
 const REAL_REPO: &str = "/governed/repo";
 const REAL_REF: &str = "refs/gwr/target";
@@ -34,7 +34,7 @@ fn attempt() -> PreparedAttempt {
         AttemptId::from_bytes([9; 16]),
         WorkRequestId::from_bytes([1; 16]),
         CandidateArtifactId::from_bytes([2; 16]),
-        RepositoryIdentity::new(REAL_REPO),
+        RepositoryLocator::new(REAL_REPO),
         CommitHash::new(REAL_BASIS),
         Sha256Digest::of_bytes(b"candidate"),
         GitRefEffect {
@@ -91,7 +91,7 @@ fn truthful_fact(att: &PreparedAttempt, w: &World) -> RecoveryFact {
         attempt: att.attempt_id,
         dispatch: DispatchId::from_bytes([8; 16]),
         prepared_attempt_digest: att.prepared_attempt_digest,
-        repository: RepositoryIdentity::new(REAL_REPO),
+        repository: RepositoryLocator::new(REAL_REPO),
         target_ref: RefName::new(REAL_REF),
         basis: CommitHash::new(REAL_BASIS),
         observed_ref: w.observed_ref.clone(),
@@ -112,7 +112,7 @@ fn contradictory_context_is_refused() {
     let w = world(REAL_BASIS, None, None);
     let a = auth(&att, &w);
     let mut contradictory = truthful_fact(&att, &w);
-    contradictory.repository = RepositoryIdentity::new("/some/entirely/other/repo");
+    contradictory.repository = RepositoryLocator::new("/some/entirely/other/repo");
     contradictory.target_ref = RefName::new("refs/heads/unrelated");
     contradictory.basis = CommitHash::new("a-basis-the-attempt-never-had");
     assert_eq!(
@@ -139,7 +139,7 @@ fn each_contextual_binding_is_checked_independently() {
     let cases: Vec<Case> = vec![
         (
             "repository",
-            Box::new(|f: &mut RecoveryFact| f.repository = RepositoryIdentity::new("/elsewhere")),
+            Box::new(|f: &mut RecoveryFact| f.repository = RepositoryLocator::new("/elsewhere")),
             RecoveryRefusal::RepositoryMismatch,
         ),
         (
