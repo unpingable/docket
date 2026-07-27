@@ -61,6 +61,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | Current conformance classification | [`conformance-v0-second-pass.md`](docs/governed-runtime/conformance-v0-second-pass.md) |
 | What it does not do | [`greenfield-known-gaps.md`](docs/governed-runtime/greenfield-known-gaps.md) · [`non-goals.md`](docs/governed-runtime/non-goals.md) |
 | Test coverage | [`greenfield-test-matrix.md`](docs/governed-runtime/greenfield-test-matrix.md) |
+| Install from source and bootstrap clean state | [`source-install-and-bootstrap.md`](docs/governed-runtime/source-install-and-bootstrap.md) |
 | First governed execution (pilot) | [`pilot-01.md`](docs/pilot-01.md) · [`pilot-01-followup.md`](docs/pilot-01-followup.md) |
 | The supported evidence/read surface | [`attempt-dossier.md`](docs/governed-runtime/attempt-dossier.md) |
 | Repository identity and ref-continuity handoff | [`repository-identity-and-ref-continuity.md`](docs/governed-runtime/repository-identity-and-ref-continuity.md) |
@@ -72,6 +73,23 @@ might expect to be enforced are deliberately written down there as premises inst
 Documents cite an external "normative packet" as their requirements source. That packet is
 held privately and is not part of this repository; the citations are to an external source,
 not to missing files.
+
+## Install from source
+
+Docket currently has a source installation path, not a published-package promise. From a
+clean checkout, build both required executables and inspect the operator surface:
+
+```bash
+cargo build --locked --workspace
+./target/debug/docket --help
+test -x ./target/debug/gwr-git-broker
+```
+
+The `docket` and `gwr-git-broker` executables must remain siblings, unless
+`GWR_BROKER_BIN` explicitly names the broker. Required build and runtime dependencies,
+an optional `cargo install --path` flow, clean state creation, provider configuration, and
+supported versus unsupported invocation paths are recorded in
+[`source-install-and-bootstrap.md`](docs/governed-runtime/source-install-and-bootstrap.md).
 
 ## Workspace
 

@@ -36,6 +36,55 @@ use gwr_runtime::services::reliance::{rely_review_queue, RelyError};
 use gwr_runtime::services::reservation::reserve;
 use std::path::PathBuf;
 
+const ROOT_HELP: &str = "\
+Docket governed-work runtime
+
+Usage:
+  docket <command> [options]
+  docket --help
+  docket -h
+
+Put the command before its options. Every stateful command requires
+--state <directory>; Docket creates an empty state directory on first use.
+Repository paths are explicit absolute locators, never repository identity.
+
+Repository identity:
+  repository register         Mint or register an opaque RepositoryId
+  repository relocate         Make a new absolute path the current locator
+  repository alias            Retain a non-current path or remote alias
+  repository show             Inspect a registration [--json]
+  repository migrate-attempt  Explicitly bind one legacy work request
+  continuity subject          Export the exact Docket-owned subject [--json]
+
+Governed workflow:
+  request create
+  prepare start | prepare poll
+  candidate admit
+  grant standing | ratify | reserve | dispatch
+  observe | rely review-queue | reconcile
+  recover fact | recover resolve
+
+Authorization and evidence:
+  authz request | authz accept
+  list [--json]
+  show (--attempt <id> | --dispatch <id>) [--json]
+  journal (--attempt <id> | --dispatch <id>) [--json]
+
+Preparation providers:
+  --provider fake  requires --fake-patch <file>
+  --provider codex uses `codex` from PATH unless GWR_CODEX_BIN is set
+
+Runtime environment:
+  GWR_BROKER_BIN     explicit path to gwr-git-broker; otherwise a sibling
+                     of the running docket executable is required
+  GWR_WORKSPACE_ROOT writable parent for disposable provider workspaces;
+                     defaults to the system temporary directory
+  GWR_CODEX_BIN      optional codex executable override
+
+Source installation and clean-state bootstrap:
+  docs/governed-runtime/source-install-and-bootstrap.md
+";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
@@ -243,6 +292,11 @@ fn state_tag(state: &AttemptState) -> &'static str {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    if matches!(args, [arg] if arg == "--help" || arg == "-h") {
+        print!("{ROOT_HELP}");
+        return Ok(());
+    }
+
     let cmd: Vec<&str> = args
         .iter()
         .take_while(|a| !a.starts_with("--"))
