@@ -1,0 +1,200 @@
+# Campaign-Stage Standing (S-2)
+
+Status: implemented on branch `campaign/stage-standing`. This document is the law of the
+campaign-stage standing domain: what it is, what it premises, what it refuses, and what it
+never claims. It is a distinct standing domain alongside the effect-standing domain
+(`git-ref-update:v1`); neither document nor code of that domain is altered by this one.
+
+## What this domain is
+
+An orchestration office (AG-NG) runs campaigns in stages. A stage needs authority to run
+exactly once, against an exact basis, inside an exact scope, before an exact expiry. This
+domain issues that authority as a **campaign-stage standing instrument** and records its
+consumption, its outcome, and the adjudication of its review.
+
+The vocabulary, in `gwr_core::campaign`:
+
+- **Stage classes** with standing: `operator_stage`, `reviewer_stage`,
+  `records_repair_stage`, `existing_source_scope_repair_stage`, `final_review_stage`.
+- **Stage classes without standing, ever**: `new_source_scope`, `architecture`,
+  `authority`, `basis`, `candidate`, `freeze`, `qualification`, `certificate`, `registry`,
+  `deployment`. Requesting one refuses with
+  `CampaignRefusal::StageClassNeverAdmitted { class }` — a typed refusal that names the
+  class, at the input boundary, before anything is created.
+- **Worker roles**: `operator`, `reviewer`, `repair`. The stage class fixes the role.
+- **Effect classes**: `workspace_mutation` (operator), `review_read_only` (reviewer and
+  final review), `records_only` (records repair), `existing_source_scope` (source-scope
+  repair). The stage class fixes the effect class; proposing anything else is
+  effect-class widening and refuses at proposal validation.
+
+## Digests and dual identity
+
+Every digest is over an explicit versioned transcript with a domain tag:
+
+- Proposal: `gwr:campaign-stage-proposal:v1`
+- Standing: `gwr:campaign-stage-standing:v1`
+- Consumption: `gwr:campaign-stage-consumption:v1`
+- Adjudication: `gwr:campaign-stage-adjudication:v1`
+
+The proposal binds, in a fixed transcript order: the upstream digest, campaign and stage
+identity, stage class, role, effect class, predecessor stage or root authorization
+identity, every repository pin (locator, commit, tree) in order, every allowed path in
+order, evidence contract, handoff schema identity, expiry, nonce, isolated worktree
+identity, review requirement, nonclaims, repair basis when present, and the proposal
+timestamp. Changing any field, label, order, or domain tag is a version bump.
+
+**Dual identity.** AG-NG emits stage proposals carrying a digest under its own domain
+(`ag.campaign.stage-proposal/v1`). Admission binds that digest verbatim as an opaque
+upstream identity: it is recorded as a field of the proposal and of the standing, and is
+never recomputed from a different canonicalization. Docket's own proposal digest is
+computed independently over Docket's own transcript. Neither is derived from the other.
+
+The issued standing digest is the value AG-NG effect/runtime receipts and sidecar
+(campaign-driver) execution envelopes reference. Consumption records reference the
+standing digest at burn time and the consuming receipt digest once it is known; the
+receipt digest is recorded verbatim (the same dual-identity pattern) and is immutable
+once recorded.
+
+Persistence reads recompute the content address from the persisted fields; a record whose
+fields were altered after the fact reads as typed corruption, not as the original record.
+
+## The instruments
+
+**Proposal** (`CampaignStageProposal`). Exact and content-addressed. Validation refuses,
+typed: empty required fields; non-exact repository pins (commit and tree must be full
+lowercase-hex object ids); zero repositories; zero or inadmissible paths
+(repository-relative, non-traversing); role not the stage class's role; effect class not
+the stage class's effect class; review classes without an isolated worktree identity;
+repair classes without a repair basis (or non-repair classes with one); repair scope
+class disagreeing with the repair stage class; repair basis without findings.
+
+**Standing** (`CampaignStageStanding`). Issued only from an exact recorded proposal, by
+`campaign admit`. It is role-bound, stage-bound, basis-bound (the proposal digest binds
+every repository pin), path-bound, effect-bound, and expiring; its window is never wider
+than its proposal's. Its fields are private. It is consumable exactly once. It is
+non-transferable across roles: consumption presents an execution context (campaign,
+stage, role, proposal digest) and every divergence refuses — campaign, stage, role, and
+proposal substitution each have their own typed refusal. It cannot be broadened by worker
+output: there is no API that edits a standing's scope, and expiry never revives. It is
+not derivable from a historical receipt: issuance takes a proposal, never a receipt.
+A standing for a stage that has since been re-proposed and re-admitted is historical;
+presenting it as current refuses (`Superseded`).
+
+**Consumption** (`CampaignStageConsumption`). The durable record of the one burn.
+Consumption is burn-before-effect: `campaign consume` makes the record durable before
+the caller runs any effect, and the effect happens outside this runtime (AG-NG or the
+sidecar runs it). A replayed burn refuses.
+
+**Adjudication** (`AdjudicationReceipt`). The durable receipt of a verdict over a review:
+`continue`, `exact_repair`, or `refuse`, binding campaign, stage, the exact review
+receipt adjudicated, the adjudicator, the findings, and the residual obligations.
+Adjudicating a review receipt this runtime never recorded as the outcome of a consumed
+standing for that campaign and stage refuses (`AdjudicationSubjectUnknown`).
+
+**Residual obligations** (`ResidualStatement`, persisted in
+`campaign_residual_obligation`). Recorded with their adjudication and preserved. There
+is no discharge API, matching the runtime's reconciliation law.
+
+## The crash-recovery law
+
+The durable records classify a stage execution into exactly four states
+(`ConsumptionState`):
+
+1. **Effect not begun** — no burn is recorded. The stage may proceed.
+2. **Standing consumed, effect outcome unresolved** — a burn exists with no completion
+   marker. Ambiguous: the effect may or may not have run.
+3. **Effect completed, receipt missing** — completion is marked but no consuming receipt
+   is recorded. Ambiguous: the outcome exists but is not receipted.
+4. **Effect completed and receipted** — terminal.
+
+Only state 1 may (re-)execute. States 2 and 3 refuse re-execution
+(`OutcomeUnresolved`, `ReceiptMissing`) — the runtime never guesses and re-runs an
+ambiguous effect. State 4 refuses a duplicate effect (`EffectAlreadyReceipted`). The
+service applies this classification before any consumption, so a crashed-and-restarted
+runner that re-attempts a burn gets the refusal for the state it is actually in.
+
+## Reviewer standing
+
+Reviewer and final-review stages issue standing that is role-bound to `reviewer`,
+effect-bound to `review_read_only`, and bound to the exact committed review bases (the
+repository pins) and an isolated worktree identity (required at proposal validation).
+Read and test effects are permitted; every mutation — commit, push, tag, reset, rebase,
+branch mutation, remote mutation — refuses with the operation named
+(`ReviewerMutationForbidden`). Reviewer standing is one-use, like every standing here,
+and an operator presenting it (or a reviewer presenting operator standing) refuses
+(`RoleMismatch`).
+
+## Repair standing
+
+A repair proposal carries a repair basis: the original stage, the exact rejected review
+receipt digest, the exact finding identifiers, the scope class, repair nonclaims, and a
+new review requirement. Only the two repair stage classes can carry one, and each binds
+its scope class: `records_repair_stage` ↔ `records_only`,
+`existing_source_scope_repair_stage` ↔ `existing_source_scope`.
+
+Admission (`campaign admit` for a repair proposal) requires an adjudication of the
+original stage with verdict `exact_repair` covering the cited review receipt, with an
+exactly matching finding set. The **subset decision lives here, in Docket** — never in
+the sidecar: every requested repository must be one of the original stage authority's
+repositories, and every requested path must be one of its allowed paths. A repair may
+narrow scope, never widen it. Any other verdict authorizes no repair; a repair citing a
+receipt the adjudication does not cover refuses; substituted findings refuse; a widened
+path or repository refuses by name. New-source-scope and architecture "repairs" are not
+repairs: those classes are never admitted at all.
+
+## Relationship to the effect-standing domain
+
+The effect-standing domain (`domain::standing`, act `git-ref-update:v1`) is unchanged:
+no shared types, no shared tables, no shared refusals, no conversion between domains.
+Campaign-stage standing does not ratify attempts, does not reserve refs, and is never
+presented to the broker. Effect standing does not admit, consume, or adjudicate campaign
+stages. A `git-ref-update:v1` effect inside a campaign stage, if one is ever wanted,
+would require both instruments independently; this domain neither grants nor implies the
+other.
+
+## Premises
+
+- **Runtime clock.** Expiry is judged against runtime clock readings; monotone time is
+  an environment assumption (shared with the existing trust model).
+- **The burn is durable before the effect.** The crash-recovery law is only as strong as
+  the store's durability; a caller that runs the effect before `campaign consume`
+  returns has stepped outside the governed path.
+- **Upstream identity is opaque.** The upstream proposal digest is recorded verbatim;
+  Docket does not verify AG-NG's canonicalization, only binds it.
+- **Receipt digests are as-presented.** The consuming receipt digest recorded at outcome
+  time is testimony about which receipt the effect produced; this runtime does not
+  recompute the consumer's receipt.
+
+## Nonclaims
+
+- No claim that a stage's effect is correct, complete, or safe to merge; the domain
+  governs authority and occurrence, not quality.
+- No claim of OS-level confinement of the worker that holds standing (per the v0.1
+  threat model).
+- No automatic standing for any class outside the five admitted ones, and no path by
+  which worker output broadens issued standing.
+- No discharge of residual obligations, ever.
+- No re-execution from an ambiguous crash state; the law is refuse, not guess.
+
+## Invariants added by this domain
+
+Stated here rather than in `invariants-v0.md`, which is the v0 audit-era table:
+
+- **S2-1.** Campaign-stage standing is issued only from an exact, validated, recorded
+  proposal. No standing from a receipt; no standing from worker output.
+- **S2-2.** One consumption per standing, durable before the effect; replay refuses.
+- **S2-3.** Consumption binds campaign, stage, role, and proposal digest; every
+  substitution refuses.
+- **S2-4.** Reviewer standing permits read/test only; every mutation refuses by name.
+- **S2-5.** Repair admission requires an exact-repair adjudication over the cited review
+  receipt with the exact finding set, and the requested scope is a subset of the
+  original stage authority's scope — decided in Docket.
+- **S2-6.** The never-admitted classes refuse by name at the input boundary.
+- **S2-7.** Crash recovery has exactly four states; only effect-not-begun may proceed.
+- **S2-8.** Residual obligations are recorded and preserved; there is no discharge.
+- **S2-9.** A superseded standing is historical and refuses consumption.
+- **S2-10.** This domain does not weaken, alter, or substitute for the effect-standing
+  domain.
+
+Each invariant has at least one test in `crates/gwr-local/tests/campaign_stage_standing.rs`
+or the `gwr_core::campaign` unit tests.
