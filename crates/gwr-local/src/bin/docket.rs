@@ -21,6 +21,7 @@ use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegis
 use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator, WorkRequest};
 use gwr_local::adapters::{FsArtifactStore, FsProvenanceSink, HashChainIds, SystemClock};
 use gwr_local::broker::SubprocessGitBroker;
+use gwr_local::campaign_export;
 use gwr_local::capabilities::StandingTokenCodec;
 use gwr_local::providers::fake::{Script, ScriptedProvider};
 use gwr_local::store::SqliteStore;
@@ -40,6 +41,11 @@ use gwr_runtime::services::reconcile::reconcile;
 use gwr_runtime::services::reliance::{rely_review_queue, RelyError};
 use gwr_runtime::services::reservation::reserve;
 use std::path::PathBuf;
+
+/// Verifier-generation identity emitted into repair-authority artifacts:
+/// adapter name and crate version. File-level metadata, not part of the
+/// typed content address.
+const VERIFIER_ID: &str = concat!("gwr-local ", env!("CARGO_PKG_VERSION"));
 
 const ROOT_HELP: &str = "\
 Docket governed-work runtime
@@ -81,6 +87,8 @@ Campaign-stage standing (S-2; a distinct domain from effect standing):
   campaign consume          Burn standing before the stage's effect runs
   campaign outcome          Record effect completion / the consuming receipt
   campaign adjudicate       Record a verdict (continue|exact-repair|refuse)
+  campaign export-repair-authority   Emit the exact repair-authority artifact (read-only)
+  campaign verify-repair-authority   Verify a repair-authority artifact (read-only)
   campaign show             Inspect proposals, standing, adjudications
 
 Preparation providers:
@@ -1168,6 +1176,69 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        ["campaign", "export-repair-authority"] => {
+            // Read-only P1 export: the exact Docket authority for one repair
+            // stage's execution, as canonical JSON. No campaign state is
+            // created or altered; the law (chain, supersession, expiry,
+            // subset) is re-verified at export time.
+            let mut st = State::open(args)?;
+            let standing = parse_digest(&need(args, "--standing")?)?;
+            let bundle = campaign_svc::export_repair_authority(
+                &mut st.store,
+                &standing,
+                st.clock.now(),
+                VERIFIER_ID,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            let json = campaign_export::render(&bundle);
+            match flag(args, "--out") {
+                Some(path) => {
+                    std::fs::write(&path, &json).map_err(|e| e.to_string())?;
+                    let file_digest = campaign_export::sha256_hex(json.as_bytes());
+                    std::fs::write(format!("{path}.sha256"), format!("{file_digest}\n"))
+                        .map_err(|e| e.to_string())?;
+                    println!("repair_authority_file: {path}");
+                    println!("file_sha256: {file_digest}");
+                }
+                None => print!("{json}"),
+            }
+            println!("repair_authority: {}", bundle.digest.to_hex());
+            println!("note: read-only export; no campaign state was created or altered");
+            Ok(())
+        }
+        ["campaign", "verify-repair-authority"] => {
+            // Read-only P1 verification: the artifact must parse, its typed
+            // digest must recompute, and it must equal — field for field,
+            // including exact burn state — the authority Docket re-derives
+            // now. A stale, substituted, corrupted, or foreign artifact
+            // refuses. No campaign state is created or altered.
+            let mut st = State::open(args)?;
+            let raw =
+                std::fs::read_to_string(need(args, "--bundle")?).map_err(|e| e.to_string())?;
+            let bundle = campaign_export::parse(&raw)?;
+            if let Some(expect) = flag(args, "--expect-standing") {
+                let expect = parse_digest(&expect)?;
+                if bundle.standing != expect {
+                    return Err(format!(
+                        "Refusal(RepairAuthorityMismatch {{ field: \"standing\" }}): \
+                         expected {expect}, artifact binds {}",
+                        bundle.standing.to_hex()
+                    ));
+                }
+            }
+            campaign_svc::verify_repair_authority(
+                &mut st.store,
+                &bundle,
+                st.clock.now(),
+                VERIFIER_ID,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            println!("verification: ok");
+            println!("repair_authority: {}", bundle.digest.to_hex());
+            println!("standing: {}", bundle.standing.to_hex());
+            println!("adjudication: {}", bundle.adjudication.to_hex());
+            Ok(())
+        }
         ["campaign", "show"] => {
             // Read-only: no proposal, standing, consumption, or adjudication
             // is created or altered by this verb.
@@ -1397,7 +1468,8 @@ fn run(args: &[String]) -> Result<(), String> {
              rely review-queue, reconcile, recover fact, recover resolve, authz request, \
              authz accept, docket list, docket show, docket journal, continuity subject, \
              campaign propose-stage, campaign admit, campaign consume, campaign outcome, \
-             campaign adjudicate, campaign show"
+             campaign adjudicate, campaign export-repair-authority, \
+             campaign verify-repair-authority, campaign show"
         )),
     }
 }
