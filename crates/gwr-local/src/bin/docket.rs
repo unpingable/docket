@@ -4,6 +4,10 @@
 //! holds authority of its own. State lives under `--state <dir>`:
 //! `state.sqlite`, `artifacts/`, `journals/`, `provenance/`, `standing.key`.
 
+use gwr_core::campaign::adjudication::{AdjudicationVerdict, ResidualStatement};
+use gwr_core::campaign::proposal::{CampaignStageProposal, RepairBasis, RepoPin, StageBasis};
+use gwr_core::campaign::standing::{classify, ConsumptionState, ExecutionContext};
+use gwr_core::campaign::{RepairScopeClass, ReviewRequirement, StageClass, WorkerRole};
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::evidence::Claim;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
@@ -25,6 +29,7 @@ use gwr_runtime::ports::labor_provider::BoundedAssignment;
 use gwr_runtime::ports::store::Store;
 use gwr_runtime::services::authz_request;
 use gwr_runtime::services::authz_standing;
+use gwr_runtime::services::campaign as campaign_svc;
 use gwr_runtime::services::dispatch::{dispatch, DispatchOutcome};
 use gwr_runtime::services::dossier;
 use gwr_runtime::services::journal;
@@ -69,6 +74,14 @@ Authorization and evidence:
   list [--json]
   show (--attempt <id> | --dispatch <id>) [--json]
   journal (--attempt <id> | --dispatch <id>) [--json]
+
+Campaign-stage standing (S-2; a distinct domain from effect standing):
+  campaign propose-stage    Record an exact stage proposal; prints its digest
+  campaign admit            Issue standing for a recorded proposal
+  campaign consume          Burn standing before the stage's effect runs
+  campaign outcome          Record effect completion / the consuming receipt
+  campaign adjudicate       Record a verdict (continue|exact-repair|refuse)
+  campaign show             Inspect proposals, standing, adjudications
 
 Preparation providers:
   --provider fake  requires --fake-patch <file>
@@ -195,6 +208,48 @@ fn actor_id(name: &str) -> ActorId {
     let mut b = [0u8; 16];
     b.copy_from_slice(&d.as_bytes()[..16]);
     ActorId::from_bytes(b)
+}
+
+/// All values of a repeated flag, in order.
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, a)| *a == name)
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect()
+}
+
+/// A repository pin as `locator:commit:tree`. Commit and tree are object ids
+/// (no colons), so splitting from the right is unambiguous.
+fn parse_pin(raw: &str) -> Result<RepoPin, String> {
+    let (head, tree) = raw
+        .rsplit_once(':')
+        .ok_or("pin must be locator:commit:tree")?;
+    let (locator, commit) = head
+        .rsplit_once(':')
+        .ok_or("pin must be locator:commit:tree")?;
+    Ok(RepoPin {
+        repository: RepositoryLocator::new(locator),
+        commit: CommitHash::new(commit),
+        tree: tree.to_string(),
+    })
+}
+
+fn parse_review_requirement_flag(args: &[String], name: &str) -> Result<ReviewRequirement, String> {
+    match flag(args, name).as_deref() {
+        None | Some("not-required") => Ok(ReviewRequirement::NotRequired),
+        Some("required") => Ok(ReviewRequirement::Required),
+        Some(other) => Err(format!("unknown review requirement {other:?}")),
+    }
+}
+
+fn consumption_state_tag(state: ConsumptionState) -> &'static str {
+    match state {
+        ConsumptionState::EffectNotBegun => "effect_not_begun",
+        ConsumptionState::ConsumedOutcomeUnresolved => "consumed_outcome_unresolved",
+        ConsumptionState::EffectCompletedReceiptMissing => "effect_completed_receipt_missing",
+        ConsumptionState::EffectCompletedReceipted => "effect_completed_receipted",
+    }
 }
 
 struct State {
@@ -954,6 +1009,259 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        ["campaign", "propose-stage"] => {
+            // Record an exact stage proposal. The stage class fixes the role
+            // and effect class; the never-admitted classes refuse here, by
+            // name, before anything is created.
+            let mut st = State::open(args)?;
+            let class =
+                StageClass::admit_tag(&need(args, "--class")?).map_err(|e| format!("{e:?}"))?;
+            let now = st.clock.now();
+            let ttl: u64 = flag(args, "--ttl-ms")
+                .map(|s| s.parse().unwrap_or(3_600_000))
+                .unwrap_or(3_600_000);
+            let basis = match (flag(args, "--basis-root"), flag(args, "--basis-stage")) {
+                (Some(identity), None) => StageBasis::RootAuthorization { identity },
+                (None, Some(stage)) => StageBasis::PredecessorStage {
+                    stage,
+                    adjudication_digest: parse_digest(&need(args, "--basis-adjudication")?)?,
+                },
+                _ => {
+                    return Err("give exactly one of --basis-root or --basis-stage with \
+                         --basis-adjudication"
+                        .into())
+                }
+            };
+            let pins = flags(args, "--pin")
+                .iter()
+                .map(|p| parse_pin(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            let repair = if class.is_repair() {
+                Some(RepairBasis {
+                    original_stage: need(args, "--repair-original-stage")?,
+                    rejected_review_receipt: parse_digest(&need(args, "--repair-receipt")?)?,
+                    finding_ids: flags(args, "--repair-finding"),
+                    scope_class: RepairScopeClass::from_tag(&need(args, "--repair-scope")?)
+                        .ok_or("unknown repair scope class")?,
+                    nonclaims: flags(args, "--repair-nonclaim"),
+                    review_requirement: parse_review_requirement_flag(args, "--repair-review")?,
+                })
+            } else {
+                None
+            };
+            let proposal = CampaignStageProposal::propose(
+                need(args, "--upstream-digest")?,
+                need(args, "--campaign")?,
+                need(args, "--stage")?,
+                class,
+                class.required_role(),
+                class.required_effect_class(),
+                basis,
+                pins,
+                flags(args, "--allow"),
+                need(args, "--evidence-contract")?,
+                need(args, "--handoff-schema")?,
+                ClockReading(now.0 + ttl),
+                need(args, "--nonce")?,
+                flag(args, "--worktree").unwrap_or_default(),
+                parse_review_requirement_flag(args, "--review")?,
+                flags(args, "--nonclaim"),
+                repair,
+                now,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            let digest = campaign_svc::propose_stage(&mut st.store, &proposal)
+                .map_err(|e| format!("{e:?}"))?;
+            println!("proposal: {}", digest.to_hex());
+            println!("note: recording a proposal creates no standing; `campaign admit` does");
+            Ok(())
+        }
+        ["campaign", "admit"] => {
+            let mut st = State::open(args)?;
+            let digest = parse_digest(&need(args, "--proposal")?)?;
+            let standing = campaign_svc::admit(&mut st.store, &digest, st.clock.now())
+                .map_err(|e| format!("{e:?}"))?;
+            println!("standing: {}", standing.digest().to_hex());
+            println!("role: {}", standing.role().tag());
+            println!("effect_class: {}", standing.effect_class().tag());
+            Ok(())
+        }
+        ["campaign", "consume"] => {
+            // Burn-before-effect: the consumption is durable before the
+            // caller runs any effect. A second consumption hits the
+            // crash-recovery classification and refuses.
+            let mut st = State::open(args)?;
+            let standing = parse_digest(&need(args, "--standing")?)?;
+            let role = WorkerRole::from_tag(&need(args, "--role")?)
+                .ok_or("unknown role; use operator, reviewer, or repair")?;
+            let context = ExecutionContext {
+                campaign: need(args, "--campaign")?,
+                stage: need(args, "--stage")?,
+                role,
+                proposal_digest: parse_digest(&need(args, "--proposal")?)?,
+            };
+            let record = campaign_svc::consume(&mut st.store, &standing, &context, st.clock.now())
+                .map_err(|e| format!("{e:?}"))?;
+            println!("consumption: {}", record.digest.to_hex());
+            println!("note: the burn is durable; the stage's effect may now run exactly once");
+            Ok(())
+        }
+        ["campaign", "outcome"] => {
+            let mut st = State::open(args)?;
+            let standing = parse_digest(&need(args, "--standing")?)?;
+            match flag(args, "--receipt") {
+                Some(r) => {
+                    let receipt = parse_digest(&r)?;
+                    campaign_svc::record_receipt(&mut st.store, &standing, &receipt)
+                        .map_err(|e| format!("{e:?}"))?;
+                    println!("outcome: effect_completed_receipted");
+                    println!("receipt: {}", receipt.to_hex());
+                }
+                None => {
+                    campaign_svc::record_effect_completed(&mut st.store, &standing)
+                        .map_err(|e| format!("{e:?}"))?;
+                    println!("outcome: effect_completed_receipt_missing");
+                    println!("note: ambiguous states refuse re-execution; never guess and re-run");
+                }
+            }
+            Ok(())
+        }
+        ["campaign", "adjudicate"] => {
+            let mut st = State::open(args)?;
+            let verdict = match need(args, "--verdict")?.as_str() {
+                "continue" => AdjudicationVerdict::Continue,
+                "exact-repair" => AdjudicationVerdict::ExactRepair,
+                "refuse" => AdjudicationVerdict::Refuse,
+                other => {
+                    return Err(format!(
+                        "unknown verdict {other:?}; use continue, exact-repair, or refuse"
+                    ))
+                }
+            };
+            let residuals = flags(args, "--residual")
+                .iter()
+                .map(|r| {
+                    let (kind, statement) =
+                        r.split_once('=').ok_or("residual must be kind=statement")?;
+                    Ok(ResidualStatement {
+                        kind: kind.to_string(),
+                        statement: statement.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, &str>>()?;
+            let receipt = campaign_svc::adjudicate(
+                &mut st.store,
+                &need(args, "--campaign")?,
+                &need(args, "--stage")?,
+                &parse_digest(&need(args, "--review-receipt")?)?,
+                verdict,
+                &need(args, "--adjudicator")?,
+                flags(args, "--finding"),
+                residuals,
+                st.clock.now(),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+            println!("adjudication: {}", receipt.digest.to_hex());
+            println!("verdict: {}", receipt.verdict.tag());
+            for r in &receipt.residuals {
+                println!("residual_obligation: {}: {}", r.kind, r.statement);
+            }
+            Ok(())
+        }
+        ["campaign", "show"] => {
+            // Read-only: no proposal, standing, consumption, or adjudication
+            // is created or altered by this verb.
+            let mut st = State::open(args)?;
+            if let Some(p) = flag(args, "--proposal") {
+                let digest = parse_digest(&p)?;
+                let proposal = st
+                    .store
+                    .get_campaign_proposal(&digest)
+                    .map_err(|e| format!("{e:?}"))?
+                    .ok_or_else(|| format!("unknown proposal {p}"))?;
+                println!("proposal: {}", proposal.digest.to_hex());
+                println!("upstream_digest: {}", proposal.upstream_digest);
+                println!("campaign: {}", proposal.campaign);
+                println!("stage: {}", proposal.stage);
+                println!("stage_class: {}", proposal.stage_class.tag());
+                println!("role: {}", proposal.role.tag());
+                println!("effect_class: {}", proposal.effect_class.tag());
+                println!("expires_at_ms: {}", proposal.expires_at.0);
+                println!("nonce: {}", proposal.nonce);
+                for pin in &proposal.repositories {
+                    println!(
+                        "repository: {} commit={} tree={}",
+                        pin.repository.as_str(),
+                        pin.commit.as_str(),
+                        pin.tree
+                    );
+                }
+                for path in &proposal.allowed_paths {
+                    println!("allowed_path: {path}");
+                }
+                for nonclaim in &proposal.nonclaims {
+                    println!("nonclaim: {nonclaim}");
+                }
+            } else if let Some(s) = flag(args, "--standing") {
+                let digest = parse_digest(&s)?;
+                let standing = st
+                    .store
+                    .get_campaign_standing(&digest)
+                    .map_err(|e| format!("{e:?}"))?
+                    .ok_or_else(|| format!("unknown standing {s}"))?;
+                println!("standing: {}", standing.digest().to_hex());
+                println!("proposal: {}", standing.proposal_digest().to_hex());
+                println!("upstream_digest: {}", standing.upstream_digest());
+                println!("campaign: {}", standing.campaign());
+                println!("stage: {}", standing.stage());
+                println!("stage_class: {}", standing.stage_class().tag());
+                println!("role: {}", standing.role().tag());
+                println!("effect_class: {}", standing.effect_class().tag());
+                println!("expires_at_ms: {}", standing.expires_at().0);
+                println!("nonce: {}", standing.nonce());
+                let consumption = st
+                    .store
+                    .get_campaign_consumption(&standing.digest())
+                    .map_err(|e| format!("{e:?}"))?;
+                println!(
+                    "consumption_state: {}",
+                    consumption_state_tag(classify(consumption.as_ref()))
+                );
+                if let Some(c) = &consumption {
+                    println!("consumption: {}", c.digest.to_hex());
+                    if let Some(r) = &c.receipt {
+                        println!("receipt: {}", r.to_hex());
+                    }
+                }
+            } else if has(args, "--adjudications") {
+                let campaign = need(args, "--campaign")?;
+                let stage = need(args, "--stage")?;
+                for a in st
+                    .store
+                    .get_campaign_adjudications(&campaign, &stage)
+                    .map_err(|e| format!("{e:?}"))?
+                {
+                    println!("adjudication: {}", a.digest.to_hex());
+                    println!("verdict: {}", a.verdict.tag());
+                    println!("review_receipt: {}", a.review_receipt.to_hex());
+                    for f in &a.findings {
+                        println!("finding: {f}");
+                    }
+                }
+                for r in st
+                    .store
+                    .get_campaign_residuals(&campaign, &stage)
+                    .map_err(|e| format!("{e:?}"))?
+                {
+                    println!("residual_obligation: {}: {}", r.kind, r.statement);
+                }
+            } else {
+                return Err("give --proposal <digest>, --standing <digest>, or \
+                     --adjudications with --campaign and --stage"
+                    .into());
+            }
+            Ok(())
+        }
         ["docket", "list"] | ["list"] => {
             let mut st = State::open(args)?;
             // One canonical list model sources both renderings; the human
@@ -1087,7 +1395,9 @@ fn run(args: &[String]) -> Result<(), String> {
              prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
              rely review-queue, reconcile, recover fact, recover resolve, authz request, \
-             authz accept, docket list, docket show, docket journal, continuity subject"
+             authz accept, docket list, docket show, docket journal, continuity subject, \
+             campaign propose-stage, campaign admit, campaign consume, campaign outcome, \
+             campaign adjudicate, campaign show"
         )),
     }
 }
