@@ -189,7 +189,10 @@ fn one_use_consumption_success_path() {
         .unwrap()
         .unwrap();
     assert_eq!(persisted, record);
-    let reloaded = store.get_campaign_standing(&standing.digest()).unwrap().unwrap();
+    let reloaded = store
+        .get_campaign_standing(&standing.digest())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         reloaded.state(),
         &CampaignStandingState::Consumed {
@@ -326,7 +329,10 @@ fn standing_replay_refuses() {
         svc::consume(&mut store, &standing.digest(), &ctx, ClockReading(3_100)),
         Err(CampaignError::Refusal(CampaignRefusal::OutcomeUnresolved))
     );
-    let reloaded = store.get_campaign_standing(&standing.digest()).unwrap().unwrap();
+    let reloaded = store
+        .get_campaign_standing(&standing.digest())
+        .unwrap()
+        .unwrap();
     assert_eq!(
         reloaded.consume(&ctx, ClockReading(3_100)),
         Err(CampaignRefusal::AlreadyConsumed)
@@ -451,7 +457,9 @@ fn effect_class_widening_refuses_at_proposal() {
             StageClass::ReviewerStage,
             WorkerRole::Reviewer,
             gwr_core::campaign::StageEffectClass::WorkspaceMutation,
-            StageBasis::RootAuthorization { identity: "r".into() },
+            StageBasis::RootAuthorization {
+                identity: "r".into()
+            },
             vec![pin("/repo", COMMIT_A, TREE_A)],
             vec!["src/lib.rs".into()],
             "e".into(),
@@ -549,7 +557,9 @@ fn repair_finding_substitution_refuses() {
     svc::propose_stage(&mut store, &p).unwrap();
     assert_eq!(
         svc::admit(&mut store, &p.digest, ClockReading(5_000)),
-        Err(CampaignError::Refusal(CampaignRefusal::RepairFindingsMismatch))
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairFindingsMismatch
+        ))
     );
 }
 
@@ -574,9 +584,9 @@ fn repair_referencing_a_different_review_receipt_refuses() {
     svc::propose_stage(&mut store, &p).unwrap();
     assert_eq!(
         svc::admit(&mut store, &p.digest, ClockReading(5_000)),
-        Err(CampaignError::Refusal(CampaignRefusal::RepairNotAuthorized {
-            verdict: "none"
-        }))
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairNotAuthorized { verdict: "none" }
+        ))
     );
 }
 
