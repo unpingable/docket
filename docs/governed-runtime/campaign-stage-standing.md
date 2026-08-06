@@ -55,8 +55,13 @@ standing digest at burn time and the consuming receipt digest once it is known; 
 receipt digest is recorded verbatim (the same dual-identity pattern) and is immutable
 once recorded.
 
-Persistence reads recompute the content address from the persisted fields; a record whose
-fields were altered after the fact reads as typed corruption, not as the original record.
+Persistence reads of proposals, standings, and adjudications recompute the content
+address from the persisted fields; a record whose fields were altered after the fact
+reads as typed corruption, not as the original record. Consumption rows are the mutable
+exception by design: the burn row is primary-keyed on the standing and its
+`effect_completed`/`receipt` columns are filled in as the outcome becomes known — the
+receipt once, immutably (`ImmutableRebind` on any change) — so a consumption digest is
+not recomputed on read.
 
 ## The instruments
 
@@ -113,6 +118,15 @@ ambiguous effect. State 4 refuses a duplicate effect (`EffectAlreadyReceipted`).
 service applies this classification before any consumption, so a crashed-and-restarted
 runner that re-attempts a burn gets the refusal for the state it is actually in.
 
+The burn itself is atomic. `burn_campaign_standing` runs the supersession check, the
+existing-burn check, and the insert inside one immediate SQLite transaction, so exactly
+one consumer — across threads, service instances, and processes sharing one file-backed
+store — receives success, even when two consumers would write byte-identical records
+(same standing, same context, same clock reading). Every other consumer receives the
+exact classification of the durable winner's row, never a second success, and a failed
+transaction leaves no row: standing is available exactly when no burn committed. The
+law is carried by the database, not by any in-memory state or application-level lock.
+
 ## Reviewer standing
 
 Reviewer and final-review stages issue standing that is role-bound to `reviewer`,
@@ -132,9 +146,22 @@ new review requirement. Only the two repair stage classes can carry one, and eac
 its scope class: `records_repair_stage` ↔ `records_only`,
 `existing_source_scope_repair_stage` ↔ `existing_source_scope`.
 
-Admission (`campaign admit` for a repair proposal) requires an adjudication of the
-original stage with verdict `exact_repair` covering the cited review receipt, with an
-exactly matching finding set. The **subset decision lives here, in Docket** — never in
+Admission (`campaign admit` for a repair proposal) requires the repair's predecessor
+basis to cite the authorizing adjudication by exact digest. The cited adjudication must
+be recorded, must belong to the same campaign, must adjudicate the original stage and
+the cited rejected review receipt with verdict `exact_repair`, must carry an exactly
+matching finding set, and must not be superseded by a newer adjudication of the same
+receipt. The **original stage authority is then resolved through the immutable
+consumed-standing chain**, never by stage name: the adjudicated review receipt
+identifies the one durable burn of the original stage that carries it; that burn's
+standing names the exact `proposal_digest` of the proposal that was actually executed;
+that proposal is the original authority. If no burn carries the receipt
+(`AdjudicationSubjectUnknown`), or more than one does
+(`RepairOriginalStandingAmbiguous`), admission refuses rather than guess. A same-name
+re-proposal — wider or narrower — is a record-only artifact and never re-bases the
+anchor.
+
+The **subset decision lives here, in Docket** — never in
 the sidecar: every requested repository must be one of the original stage authority's
 repositories, and every requested path must be one of its allowed paths. A repair may
 narrow scope, never widen it. Any other verdict authorizes no repair; a repair citing a
@@ -182,13 +209,16 @@ Stated here rather than in `invariants-v0.md`, which is the v0 audit-era table:
 
 - **S2-1.** Campaign-stage standing is issued only from an exact, validated, recorded
   proposal. No standing from a receipt; no standing from worker output.
-- **S2-2.** One consumption per standing, durable before the effect; replay refuses.
+- **S2-2.** One consumption per standing, durable before the effect; the burn is one
+  atomic transaction with exactly one winner under concurrency; replay refuses.
 - **S2-3.** Consumption binds campaign, stage, role, and proposal digest; every
   substitution refuses.
 - **S2-4.** Reviewer standing permits read/test only; every mutation refuses by name.
-- **S2-5.** Repair admission requires an exact-repair adjudication over the cited review
-  receipt with the exact finding set, and the requested scope is a subset of the
-  original stage authority's scope — decided in Docket.
+- **S2-5.** Repair admission cites the authorizing adjudication by exact digest and
+  resolves the original stage authority through the consumed-standing chain (rejected
+  review receipt → durable burn → consumed standing → proposal digest); the requested
+  scope is a subset of that exact proposal's scope — decided in Docket, never anchored
+  to a record-only re-proposal.
 - **S2-6.** The never-admitted classes refuse by name at the input boundary.
 - **S2-7.** Crash recovery has exactly four states; only effect-not-begun may proceed.
 - **S2-8.** Residual obligations are recorded and preserved; there is no discharge.
@@ -196,5 +226,6 @@ Stated here rather than in `invariants-v0.md`, which is the v0 audit-era table:
 - **S2-10.** This domain does not weaken, alter, or substitute for the effect-standing
   domain.
 
-Each invariant has at least one test in `crates/gwr-local/tests/campaign_stage_standing.rs`
-or the `gwr_core::campaign` unit tests.
+Each invariant has at least one test in `crates/gwr-local/tests/campaign_stage_standing.rs`,
+`crates/gwr-local/tests/campaign_burn_concurrency.rs`, or the `gwr_core::campaign` unit
+tests.
