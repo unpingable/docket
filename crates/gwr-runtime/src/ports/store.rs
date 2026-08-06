@@ -338,6 +338,17 @@ pub trait Store {
         &mut self,
         c: &CampaignStageConsumption,
     ) -> Result<(), StoreError>;
+    /// Atomically burn campaign standing: inside one immediate transaction,
+    /// verify the presented standing is not superseded and no burn exists,
+    /// then insert the one consumption row. Exactly one concurrent caller —
+    /// across threads, processes, and service instances — receives
+    /// `CampaignBurn::Burned`; every other caller receives the exact durable
+    /// state, never a second success.
+    fn burn_campaign_standing(
+        &mut self,
+        standing: &CampaignStageStanding,
+        record: &CampaignStageConsumption,
+    ) -> Result<CampaignBurn, StoreError>;
     fn get_campaign_consumption(
         &mut self,
         standing: &Sha256Digest,
@@ -396,4 +407,20 @@ pub trait Store {
         campaign: &str,
         stage: &str,
     ) -> Result<Vec<ResidualStatement>, StoreError>;
+}
+
+/// The outcome of an atomic campaign-standing burn attempt. Exactly one
+/// concurrent caller receives `Burned`; every other outcome is an exact
+/// durable state, never a second success.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CampaignBurn {
+    /// This caller's burn is the durable one.
+    Burned,
+    /// A newer standing exists for the campaign stage; the presented one is
+    /// historical.
+    Superseded,
+    /// A burn already exists for this standing. The exact durable row is
+    /// returned so the service can classify it (replay, ambiguous outcome,
+    /// or duplicate effect) — never a second success.
+    Existing(CampaignStageConsumption),
 }

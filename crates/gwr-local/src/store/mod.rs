@@ -29,7 +29,8 @@ use gwr_core::refusal::RelianceRefusal;
 use gwr_core::repository::{RepositoryAlias, RepositoryAliasKind, RepositoryRegistration};
 use gwr_core::work_request::{ClockReading, RepositoryLocator, WorkRequest};
 use gwr_runtime::ports::store::{
-    ProjectedAttempt, RelianceRefusalRecord, RelianceSubject, Store, StoreError, TimelineEntry,
+    CampaignBurn, ProjectedAttempt, RelianceRefusalRecord, RelianceSubject, Store, StoreError,
+    TimelineEntry,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
@@ -133,6 +134,13 @@ impl SqliteStore {
     /// records. Test support only.
     pub fn execute_raw_for_test(&mut self, sql: &str) -> Result<usize, StoreError> {
         self.conn.execute(sql, []).map_err(backend)
+    }
+
+    /// Raw single-string query for tests asserting deployment properties
+    /// (for example the journal mode the durability law rides on). Test
+    /// support only.
+    pub fn query_string_for_test(&mut self, sql: &str) -> Result<String, StoreError> {
+        self.conn.query_row(sql, [], |r| r.get(0)).map_err(backend)
     }
 
     fn tx(&mut self) -> Result<Transaction<'_>, StoreError> {
@@ -2766,6 +2774,68 @@ impl Store for SqliteStore {
             )
             .optional()
             .map_err(backend)
+    }
+
+    fn burn_campaign_standing(
+        &mut self,
+        standing: &CampaignStageStanding,
+        record: &CampaignStageConsumption,
+    ) -> Result<CampaignBurn, StoreError> {
+        // One immediate transaction: SQLite serializes writers, so the
+        // check-and-insert below is atomic across threads, processes, and
+        // service instances. Exactly one concurrent caller inserts the row.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(backend)?;
+        // Supersession, decided inside the transaction.
+        let latest: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT digest, issued_at FROM campaign_stage_standing
+                 WHERE campaign=?1 AND stage=?2
+                 ORDER BY issued_at DESC, rowid DESC LIMIT 1",
+                params![standing.campaign(), standing.stage()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some((digest, issued_at)) = latest {
+            if digest != standing.digest().to_hex() && issued_at as u64 > standing.issued_at().0 {
+                return Ok(CampaignBurn::Superseded);
+            }
+        }
+        // An existing burn is returned for exact classification, never
+        // overwritten and never a second success.
+        let existing = tx
+            .query_row(
+                "SELECT digest, campaign, stage, role, consumed_at, effect_completed, receipt
+                 FROM campaign_stage_consumption WHERE standing=?1",
+                params![standing.digest().to_hex()],
+                |r| consumption_from_row_at(standing.digest(), r, 0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(row) = existing {
+            return Ok(CampaignBurn::Existing(row));
+        }
+        tx.execute(
+            "INSERT INTO campaign_stage_consumption
+             (standing, digest, campaign, stage, role, consumed_at, effect_completed, receipt)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                record.standing.to_hex(),
+                record.digest.to_hex(),
+                record.campaign,
+                record.stage,
+                role_tag(record.role),
+                record.consumed_at.0 as i64,
+                record.effect_completed as i64,
+                record.receipt.map(|r| r.to_hex())
+            ],
+        )
+        .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(CampaignBurn::Burned)
     }
 
     fn mark_campaign_effect_completed(

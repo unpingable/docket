@@ -267,14 +267,14 @@ impl CampaignStageStanding {
             && other.digest != self.digest
     }
 
-    /// Consume the one use against a presented execution context. Pure;
-    /// refusals consume nothing. The returned consumption record must be
-    /// durable before the stage's effect runs — burn-before-effect.
-    pub fn consume(
+    /// The execution-context and window checks, shared by `consume` and
+    /// `preflight`. Consumption state is deliberately not checked here: the
+    /// durable store is the one-use authority.
+    fn validate_execution(
         &self,
         context: &ExecutionContext,
         now: ClockReading,
-    ) -> Result<(CampaignStageStanding, CampaignStageConsumption), CampaignRefusal> {
+    ) -> Result<(), CampaignRefusal> {
         if self.campaign != context.campaign {
             return Err(CampaignRefusal::CampaignMismatch);
         }
@@ -290,6 +290,18 @@ impl CampaignStageStanding {
         if now >= self.expires_at {
             return Err(CampaignRefusal::Expired);
         }
+        Ok(())
+    }
+
+    /// Consume the one use against a presented execution context. Pure;
+    /// refusals consume nothing. The returned consumption record must be
+    /// durable before the stage's effect runs — burn-before-effect.
+    pub fn consume(
+        &self,
+        context: &ExecutionContext,
+        now: ClockReading,
+    ) -> Result<(CampaignStageStanding, CampaignStageConsumption), CampaignRefusal> {
+        self.validate_execution(context, now)?;
         if matches!(self.state, CampaignStandingState::Consumed { .. }) {
             return Err(CampaignRefusal::AlreadyConsumed);
         }
@@ -301,6 +313,19 @@ impl CampaignStageStanding {
             ..self.clone()
         };
         Ok((consumed, consumption))
+    }
+
+    /// Validate the execution context and window and build the burn record,
+    /// without checking consumption state. The service's atomic burn is the
+    /// one durable winner; a burn that already exists is classified from the
+    /// durable row, never from this value's in-memory state.
+    pub fn preflight(
+        &self,
+        context: &ExecutionContext,
+        now: ClockReading,
+    ) -> Result<CampaignStageConsumption, CampaignRefusal> {
+        self.validate_execution(context, now)?;
+        Ok(CampaignStageConsumption::record(self.digest, context, now))
     }
 }
 

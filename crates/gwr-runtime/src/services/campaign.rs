@@ -7,7 +7,7 @@
 //! the crash-recovery classification and refuses — ambiguous states are never
 //! guessed and re-run.
 
-use crate::ports::store::{Store, StoreError};
+use crate::ports::store::{CampaignBurn, Store, StoreError};
 use gwr_core::campaign::adjudication::{
     AdjudicationReceipt, AdjudicationVerdict, ResidualStatement,
 };
@@ -132,7 +132,12 @@ pub fn admit(
 /// Refusals, in order: supersession (a newer standing exists for this stage;
 /// the presented one is historical), the crash-recovery classification of any
 /// existing burn (replay, ambiguous outcome, duplicate effect), then the
-/// standing's own scope, expiry, and one-use validation.
+/// standing's own scope, expiry, and one-use validation. The fast-path reads
+/// preserve this exact refusal vocabulary; the atomic burn re-decides
+/// supersession and existence inside one immediate transaction, so exactly
+/// one concurrent consumer — across threads, processes, and service
+/// instances — receives success, and every other consumer receives the exact
+/// classification of the durable winner's row.
 pub fn consume(
     store: &mut dyn Store,
     standing_digest: &Sha256Digest,
@@ -149,9 +154,23 @@ pub fn consume(
     }
     let existing = store.get_campaign_consumption(standing_digest)?;
     reexecution_decision(classify(existing.as_ref()))?;
-    let (_consumed, record) = standing.consume(context, now)?;
-    store.record_campaign_consumption(&record)?;
-    Ok(record)
+    let record = standing.preflight(context, now)?;
+    match store.burn_campaign_standing(&standing, &record)? {
+        CampaignBurn::Burned => Ok(record),
+        CampaignBurn::Superseded => Err(CampaignRefusal::Superseded.into()),
+        CampaignBurn::Existing(row) => Err(existing_burn_refusal(&row).into()),
+    }
+}
+
+/// The exact refusal for a burn that already exists: the four-state
+/// recovery classification of the durable row. A row is never
+/// `EffectNotBegun`; the unreachable arm fails closed as `AlreadyConsumed`
+/// rather than panic.
+fn existing_burn_refusal(row: &CampaignStageConsumption) -> CampaignRefusal {
+    match reexecution_decision(classify(Some(row))) {
+        Err(refusal) => refusal,
+        Ok(()) => CampaignRefusal::AlreadyConsumed,
+    }
 }
 
 /// Record that the effect of a consumed standing completed, with the receipt
