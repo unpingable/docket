@@ -57,11 +57,24 @@ fn backend(e: rusqlite::Error) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Bounded writer-contention window (P4). When another connection holds the
+/// write lock, SQLite sleeps and retries inside this budget before returning
+/// `SQLITE_BUSY`. This never changes outcomes: a waiting consumer that
+/// acquires the lock observes the committed burn and receives the exact
+/// typed replay classification; a consumer that outlasts the budget receives
+/// a bounded store error, never a success. It is not a guarantee of eventual
+/// success — only ordinary short contention gets a bounded chance to
+/// resolve. Five seconds covers process-level CLI overlap without turning a
+/// stuck writer into an unbounded hang.
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
+
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(backend)?;
+        conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
             .map_err(backend)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
@@ -69,6 +82,8 @@ impl SqliteStore {
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
+        conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
+            .map_err(backend)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
     }

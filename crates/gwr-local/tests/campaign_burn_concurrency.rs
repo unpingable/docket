@@ -343,3 +343,105 @@ fn cross_process_burn_refuses_replay_and_survives_process_exit() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- P4: bounded writer contention (busy_timeout) ---------------------------
+
+#[test]
+fn busy_timeout_is_configured_and_bounded() {
+    let dir = scratch("busy-pragma");
+    let db = dir.join("state.sqlite");
+    let mut store = SqliteStore::open(&db).unwrap();
+    let timeout: String = store
+        .query_string_for_test("SELECT printf('%d', (SELECT * FROM pragma_busy_timeout))")
+        .unwrap();
+    assert_eq!(timeout, "5000");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn writer_lock_held_briefly_loser_waits_then_gets_typed_classification() {
+    let dir = scratch("busy-wait");
+    let db = dir.join("state.sqlite");
+    let standing = admitted_operator_at(&db, "nonce-1");
+    let ctx = context(&standing);
+    // The exact burn record the loser would write, computed purely.
+    let record = standing.preflight(&ctx, ClockReading(3_000)).unwrap();
+    // A raw connection holds the write lock, then commits the winning burn
+    // while the loser waits inside its bounded busy window.
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let db_b = db.clone();
+    let standing_digest = standing.digest();
+    let loser = std::thread::spawn(move || {
+        let mut store = SqliteStore::open(&db_b).unwrap();
+        svc::consume(&mut store, &standing_digest, &ctx, ClockReading(3_000))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    raw.execute(
+        "INSERT INTO campaign_stage_consumption
+         (standing, digest, campaign, stage, role, consumed_at, effect_completed, receipt)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![
+            record.standing.to_hex(),
+            record.digest.to_hex(),
+            record.campaign,
+            record.stage,
+            "operator",
+            record.consumed_at.0 as i64,
+            0,
+            rusqlite::types::Null,
+        ],
+    )
+    .unwrap();
+    raw.execute_batch("COMMIT").unwrap();
+    // The loser waited out the short lock, observed the committed burn, and
+    // received the exact replay classification — never a raw SQLITE_BUSY,
+    // never a success.
+    let result = loser.join().unwrap();
+    assert_eq!(
+        result,
+        Err(CampaignError::Refusal(CampaignRefusal::OutcomeUnresolved))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn writer_lock_held_beyond_timeout_fails_bounded_never_succeeds() {
+    let dir = scratch("busy-timeout");
+    let db = dir.join("state.sqlite");
+    let standing = admitted_operator_at(&db, "nonce-1");
+    let ctx = context(&standing);
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let db_b = db.clone();
+    let standing_digest = standing.digest();
+    let loser = std::thread::spawn(move || {
+        let mut store = SqliteStore::open(&db_b).unwrap();
+        svc::consume(&mut store, &standing_digest, &ctx, ClockReading(3_000))
+    });
+    // Hold past the five-second budget.
+    std::thread::sleep(std::time::Duration::from_millis(6_500));
+    let result = loser.join().unwrap();
+    match result {
+        Err(CampaignError::Store(_)) => {}
+        other => panic!("a lock held past the budget must fail bounded, got: {other:?}"),
+    }
+    raw.execute_batch("ROLLBACK").unwrap();
+    // No burn committed anywhere: the standing is still available, and the
+    // next ordinary consumer wins.
+    {
+        let mut store = SqliteStore::open(&db).unwrap();
+        assert!(store
+            .get_campaign_consumption(&standing.digest())
+            .unwrap()
+            .is_none());
+        svc::consume(
+            &mut store,
+            &standing.digest(),
+            &context(&standing),
+            ClockReading(3_000),
+        )
+        .unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
