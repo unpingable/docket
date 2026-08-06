@@ -2,6 +2,7 @@
 
 pub mod authz_request;
 pub mod authz_standing;
+pub mod campaign;
 pub mod dispatch;
 pub mod dossier;
 pub mod journal;
