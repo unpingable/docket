@@ -15,6 +15,7 @@
 //! digest over `gwr:campaign-stage-proposal:v1`.
 
 pub mod adjudication;
+pub mod authority;
 pub mod proposal;
 pub mod repair;
 pub mod standing;

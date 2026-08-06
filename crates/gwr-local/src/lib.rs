@@ -6,6 +6,7 @@
 pub mod adapters;
 pub mod authz_intake;
 pub mod broker;
+pub mod campaign_export;
 pub mod capabilities;
 pub mod observe;
 pub mod providers;

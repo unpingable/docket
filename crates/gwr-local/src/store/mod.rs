@@ -1,7 +1,7 @@
 //! SQLite implementation of the store port: transactional current-state
 //! projections plus immutable typed ledger records.
 
-mod codec;
+pub(crate) mod codec;
 
 use codec::*;
 use gwr_core::authorization::{

@@ -230,6 +230,10 @@ pub enum CampaignRefusal {
     /// adjudicated review receipt, so the original stage authority cannot be
     /// resolved exactly. Admission refuses rather than guess.
     RepairOriginalStandingAmbiguous,
+    /// A repair-authority bundle disagrees with Docket's own re-derived
+    /// authority in the named field — a substituted, corrupted, or foreign
+    /// artifact.
+    RepairAuthorityMismatch { field: &'static str },
     /// The repair basis cites a different review receipt than the one the
     /// authorizing adjudication records.
     RepairReviewReceiptMismatch,
