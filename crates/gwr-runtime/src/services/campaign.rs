@@ -11,7 +11,7 @@ use crate::ports::store::{Store, StoreError};
 use gwr_core::campaign::adjudication::{
     AdjudicationReceipt, AdjudicationVerdict, ResidualStatement,
 };
-use gwr_core::campaign::proposal::CampaignStageProposal;
+use gwr_core::campaign::proposal::{CampaignStageProposal, StageBasis};
 use gwr_core::campaign::repair::validate_repair;
 use gwr_core::campaign::standing::{
     classify, reexecution_decision, CampaignStageConsumption, CampaignStageStanding,
@@ -54,10 +54,15 @@ pub fn propose_stage(
 
 /// Admit a recorded proposal and issue the standing it justifies.
 ///
-/// For repair stage classes this is where the subset decision is made: the
-/// original stage's proposal and the authorizing adjudication are gathered
-/// here, and `validate_repair` refuses anything outside the original stage
-/// authority's scope. The sidecar never makes this decision.
+/// For repair stage classes this is where the subset decision is made, and
+/// the anchor is exact: the repair's predecessor basis cites the authorizing
+/// adjudication by digest; the adjudication's rejected review receipt
+/// resolves, through the durable consumption row that carries it, to the one
+/// consumed standing of the original stage; that standing's
+/// `proposal_digest` names the original stage authority. The subset check
+/// runs against that proposal — never against the newest, earliest, or any
+/// same-name record-only proposal, which carry no authority. The sidecar
+/// never makes this decision.
 pub fn admit(
     store: &mut dyn Store,
     proposal_digest: &Sha256Digest,
@@ -67,18 +72,53 @@ pub fn admit(
         .get_campaign_proposal(proposal_digest)?
         .ok_or_else(|| CampaignError::NotFound(format!("proposal {proposal_digest}")))?;
     if let Some(basis) = &proposal.repair {
-        let originals = store.find_campaign_proposals(&proposal.campaign, &basis.original_stage)?;
-        let original = originals
-            .last()
-            .ok_or(CampaignRefusal::RepairOriginalStageMismatch)?;
+        // The repair must cite the authorizing adjudication by exact digest
+        // in its predecessor basis, naming the original stage.
+        let cited = match &proposal.basis {
+            StageBasis::PredecessorStage {
+                stage,
+                adjudication_digest,
+            } if stage == &basis.original_stage => *adjudication_digest,
+            _ => return Err(CampaignRefusal::RepairOriginalStageMismatch.into()),
+        };
         let adjudication = store
-            .find_campaign_adjudication(
-                &proposal.campaign,
-                &basis.original_stage,
-                &basis.rejected_review_receipt,
-            )?
-            .ok_or(CampaignRefusal::RepairNotAuthorized { verdict: "none" })?;
-        validate_repair(&proposal, original, &adjudication)?;
+            .get_campaign_adjudication(&cited)?
+            .ok_or(CampaignRefusal::RepairAdjudicationUnknown)?;
+        // A cited adjudication superseded by a newer adjudication of the
+        // same review receipt authorizes nothing current.
+        for other in store.get_campaign_adjudications(&proposal.campaign, &basis.original_stage)? {
+            if other.digest != adjudication.digest
+                && other.review_receipt == adjudication.review_receipt
+                && other.adjudicated_at >= adjudication.adjudicated_at
+            {
+                return Err(CampaignRefusal::Superseded.into());
+            }
+        }
+        // The original authority chain: the adjudicated review receipt is
+        // carried by exactly one durable burn of the original stage; that
+        // burn's standing names the exact proposal that was executed. No
+        // stage-name query may substitute for any edge of this chain.
+        let burns = store.find_campaign_consumptions_by_receipt(
+            &proposal.campaign,
+            &basis.original_stage,
+            &basis.rejected_review_receipt,
+        )?;
+        let [burn] = burns.as_slice() else {
+            return Err(if burns.is_empty() {
+                CampaignRefusal::AdjudicationSubjectUnknown.into()
+            } else {
+                CampaignRefusal::RepairOriginalStandingAmbiguous.into()
+            });
+        };
+        let original_standing = store
+            .get_campaign_standing(&burn.standing)?
+            .ok_or_else(|| CampaignError::NotFound(format!("standing {}", burn.standing)))?;
+        let original = store
+            .get_campaign_proposal(&original_standing.proposal_digest())?
+            .ok_or_else(|| {
+                CampaignError::NotFound(format!("proposal {}", original_standing.proposal_digest()))
+            })?;
+        validate_repair(&proposal, &original, &adjudication)?;
     }
     let standing = CampaignStageStanding::issue(&proposal, now)?;
     store.record_campaign_standing(&standing)?;

@@ -221,6 +221,15 @@ pub enum CampaignRefusal {
     RepairFindingsMissing,
     /// No adjudication authorizing exact repair covers this review receipt.
     RepairNotAuthorized { verdict: &'static str },
+    /// The repair proposal's predecessor basis cites no recorded
+    /// adjudication by exact digest — or cites no adjudication at all.
+    /// Repair standing requires the exact adjudication identity; a stage
+    /// name or a receipt alone does not identify one.
+    RepairAdjudicationUnknown,
+    /// More than one consumed standing for the original stage carries the
+    /// adjudicated review receipt, so the original stage authority cannot be
+    /// resolved exactly. Admission refuses rather than guess.
+    RepairOriginalStandingAmbiguous,
     /// The repair basis cites a different review receipt than the one the
     /// authorizing adjudication records.
     RepairReviewReceiptMismatch,

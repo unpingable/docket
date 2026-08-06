@@ -2,7 +2,9 @@
 //! store and services. Every refusal asserted here is typed; nothing fails
 //! closed by panic or by a generic error.
 
-use gwr_core::campaign::adjudication::{AdjudicationVerdict, ResidualStatement};
+use gwr_core::campaign::adjudication::{
+    AdjudicationReceipt, AdjudicationVerdict, ResidualStatement,
+};
 use gwr_core::campaign::proposal::{CampaignStageProposal, RepairBasis, RepoPin, StageBasis};
 use gwr_core::campaign::standing::{
     CampaignStageConsumption, CampaignStageStanding, CampaignStandingState, ExecutionContext,
@@ -104,22 +106,38 @@ fn repair_basis(
 fn repair_proposal(
     class: StageClass,
     scope: RepairScopeClass,
+    adjudication: &AdjudicationReceipt,
     receipt: Sha256Digest,
     findings: &[&str],
     repositories: Vec<RepoPin>,
     paths: &[&str],
 ) -> CampaignStageProposal {
-    proposal(
+    // A repair cites the authorizing adjudication by exact digest in its
+    // predecessor basis; admission verifies the citation.
+    CampaignStageProposal::propose(
+        "upstream-repair".into(),
+        "camp-1".into(),
+        "stage-a-repair".into(),
         class,
-        "camp-1",
-        "stage-a-repair",
-        "nonce-repair",
-        "upstream-repair",
+        class.required_role(),
+        class.required_effect_class(),
+        StageBasis::PredecessorStage {
+            stage: "stage-a".into(),
+            adjudication_digest: adjudication.digest,
+        },
         repositories,
-        paths,
-        "",
+        paths.iter().map(|p| p.to_string()).collect(),
+        "evidence-contract-1".into(),
+        "handoff-schema-1".into(),
+        ClockReading(10_000),
+        "nonce-repair".into(),
+        String::new(),
+        ReviewRequirement::Required,
+        vec!["does-not-establish-correctness".into()],
         Some(repair_basis("stage-a", receipt, findings, scope)),
+        ClockReading(4_500),
     )
+    .unwrap()
 }
 
 fn context(standing: &CampaignStageStanding, role: WorkerRole) -> ExecutionContext {
@@ -138,13 +156,14 @@ fn admitted_operator(store: &mut SqliteStore) -> CampaignStageStanding {
     svc::admit(store, &p.digest, ClockReading(2_000)).unwrap()
 }
 
-/// Run a stage to a receipted review outcome and adjudicate it.
+/// Run a stage to a receipted review outcome and adjudicate it, returning
+/// the durable adjudication receipt repairs must cite.
 fn adjudicated_stage(
     store: &mut SqliteStore,
     verdict: AdjudicationVerdict,
     receipt: Sha256Digest,
     findings: &[&str],
-) {
+) -> AdjudicationReceipt {
     let standing = admitted_operator(store);
     svc::consume(
         store,
@@ -165,7 +184,7 @@ fn adjudicated_stage(
         vec![],
         ClockReading(4_000),
     )
-    .unwrap();
+    .unwrap()
 }
 
 // --- Success paths -------------------------------------------------------
@@ -238,7 +257,7 @@ fn reviewer_read_only_standing_is_issued_and_consumed_once() {
 #[test]
 fn records_only_repair_within_original_paths_is_admitted() {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    adjudicated_stage(
+    let adjudication = adjudicated_stage(
         &mut store,
         AdjudicationVerdict::ExactRepair,
         REVIEW_RECEIPT,
@@ -247,6 +266,7 @@ fn records_only_repair_within_original_paths_is_admitted() {
     let p = repair_proposal(
         StageClass::RecordsRepairStage,
         RepairScopeClass::RecordsOnly,
+        &adjudication,
         REVIEW_RECEIPT,
         &["finding-1"],
         vec![pin("/repo", COMMIT_B, TREE_B)],
@@ -260,7 +280,7 @@ fn records_only_repair_within_original_paths_is_admitted() {
 #[test]
 fn existing_source_scope_repair_within_the_allowlist_is_admitted() {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    adjudicated_stage(
+    let adjudication = adjudicated_stage(
         &mut store,
         AdjudicationVerdict::ExactRepair,
         REVIEW_RECEIPT,
@@ -269,6 +289,7 @@ fn existing_source_scope_repair_within_the_allowlist_is_admitted() {
     let p = repair_proposal(
         StageClass::ExistingSourceScopeRepairStage,
         RepairScopeClass::ExistingSourceScope,
+        &adjudication,
         REVIEW_RECEIPT,
         &["finding-1"],
         vec![pin("/repo", COMMIT_B, TREE_B)],
@@ -540,7 +561,7 @@ fn reviewer_using_operator_standing_refuses() {
 #[test]
 fn repair_finding_substitution_refuses() {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    adjudicated_stage(
+    let adjudication = adjudicated_stage(
         &mut store,
         AdjudicationVerdict::ExactRepair,
         REVIEW_RECEIPT,
@@ -549,6 +570,7 @@ fn repair_finding_substitution_refuses() {
     let p = repair_proposal(
         StageClass::RecordsRepairStage,
         RepairScopeClass::RecordsOnly,
+        &adjudication,
         REVIEW_RECEIPT,
         &["finding-2"],
         vec![pin("/repo", COMMIT_B, TREE_B)],
@@ -566,16 +588,18 @@ fn repair_finding_substitution_refuses() {
 #[test]
 fn repair_referencing_a_different_review_receipt_refuses() {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    adjudicated_stage(
+    let adjudication = adjudicated_stage(
         &mut store,
         AdjudicationVerdict::ExactRepair,
         REVIEW_RECEIPT,
         &["finding-1"],
     );
-    // The repair cites a receipt the adjudication does not cover.
+    // The repair cites a receipt no consumed standing of the original stage
+    // ever produced: the authority chain does not resolve.
     let p = repair_proposal(
         StageClass::RecordsRepairStage,
         RepairScopeClass::RecordsOnly,
+        &adjudication,
         OTHER_RECEIPT,
         &["finding-1"],
         vec![pin("/repo", COMMIT_B, TREE_B)],
@@ -585,7 +609,7 @@ fn repair_referencing_a_different_review_receipt_refuses() {
     assert_eq!(
         svc::admit(&mut store, &p.digest, ClockReading(5_000)),
         Err(CampaignError::Refusal(
-            CampaignRefusal::RepairNotAuthorized { verdict: "none" }
+            CampaignRefusal::AdjudicationSubjectUnknown
         ))
     );
 }
@@ -593,7 +617,7 @@ fn repair_referencing_a_different_review_receipt_refuses() {
 #[test]
 fn repair_path_outside_original_scope_refuses() {
     let mut store = SqliteStore::open_in_memory().unwrap();
-    adjudicated_stage(
+    let adjudication = adjudicated_stage(
         &mut store,
         AdjudicationVerdict::ExactRepair,
         REVIEW_RECEIPT,
@@ -603,6 +627,7 @@ fn repair_path_outside_original_scope_refuses() {
     let p = repair_proposal(
         StageClass::RecordsRepairStage,
         RepairScopeClass::RecordsOnly,
+        &adjudication,
         REVIEW_RECEIPT,
         &["finding-1"],
         vec![pin("/repo", COMMIT_B, TREE_B)],
@@ -621,6 +646,7 @@ fn repair_path_outside_original_scope_refuses() {
     let p = repair_proposal(
         StageClass::RecordsRepairStage,
         RepairScopeClass::RecordsOnly,
+        &adjudication,
         REVIEW_RECEIPT,
         &["finding-1"],
         vec![pin("/other", COMMIT_B, TREE_B)],
@@ -744,4 +770,627 @@ fn a_consumption_record_references_standing_and_receipt() {
         store.campaign_stage_receipts("camp-1", "stage-a").unwrap(),
         vec![REVIEW_RECEIPT]
     );
+}
+
+// --- F1 regression: the repair-scope anchor is the consumed standing -------
+//
+// The repair subset law anchors to the exact proposal that produced the
+// consumed standing of the adjudicated stage, recovered through the durable
+// burn carrying the rejected review receipt — never to the newest, earliest,
+// or any same-name record-only proposal.
+
+/// A widened same-name re-proposal of the original stage: records only, no
+/// standing, no authority.
+fn widened_reproposal(
+    store: &mut SqliteStore,
+    nonce: &str,
+    extra_path: &str,
+) -> CampaignStageProposal {
+    let p = proposal(
+        StageClass::OperatorStage,
+        "camp-1",
+        "stage-a",
+        nonce,
+        "upstream-9",
+        vec![pin("/repo", COMMIT_A, TREE_A)],
+        &["src/lib.rs", "docs/x.md", extra_path],
+        "",
+        None,
+    );
+    svc::propose_stage(store, &p).unwrap();
+    p
+}
+
+#[test]
+fn widened_reproposal_after_adjudication_cannot_rebase_repair_scope() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // The exploit: a wider same-name proposal recorded after the original
+    // stage was consumed and adjudicated. Its digest differs from the
+    // consumed original's, and recording it creates nothing.
+    let widened = widened_reproposal(&mut store, "nonce-9", "src/widened.rs");
+    let original = operator_proposal("camp-1", "stage-a", "nonce-1");
+    assert_ne!(widened.digest, original.digest);
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs", "src/widened.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairPathOutsideOriginalScope {
+                path: "src/widened.rs".into()
+            }
+        ))
+    );
+    // The valid exact-subset repair still admits against the consumed
+    // original authority.
+    let ok = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &ok).unwrap();
+    svc::admit(&mut store, &ok.digest, ClockReading(5_000)).unwrap();
+}
+
+#[test]
+fn widened_reproposal_recorded_before_adjudication_cannot_rebase_repair_scope() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let standing = admitted_operator(&mut store);
+    svc::consume(
+        &mut store,
+        &standing.digest(),
+        &context(&standing, WorkerRole::Operator),
+        ClockReading(3_000),
+    )
+    .unwrap();
+    svc::record_receipt(&mut store, &standing.digest(), &REVIEW_RECEIPT).unwrap();
+    // The widened re-proposal is recorded after consumption but before the
+    // adjudication exists; the anchor still does not move.
+    widened_reproposal(&mut store, "nonce-9", "src/widened.rs");
+    let adjudication = svc::adjudicate(
+        &mut store,
+        "camp-1",
+        "stage-a",
+        &REVIEW_RECEIPT,
+        AdjudicationVerdict::ExactRepair,
+        "adjudicator-1",
+        vec!["finding-1".into()],
+        vec![],
+        ClockReading(4_000),
+    )
+    .unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/widened.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairPathOutsideOriginalScope {
+                path: "src/widened.rs".into()
+            }
+        ))
+    );
+}
+
+#[test]
+fn narrower_reproposal_cannot_replace_the_consumed_authority_anchor() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // A narrower same-name re-proposal is recorded. The anchor is the
+    // consumed original, not any re-proposal: a repair for "docs/x.md" — in
+    // the consumed original, absent from the narrower re-proposal — admits.
+    let narrower = proposal(
+        StageClass::OperatorStage,
+        "camp-1",
+        "stage-a",
+        "nonce-9",
+        "upstream-9",
+        vec![pin("/repo", COMMIT_A, TREE_A)],
+        &["src/lib.rs"],
+        "",
+        None,
+    );
+    svc::propose_stage(&mut store, &narrower).unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["docs/x.md"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    svc::admit(&mut store, &p.digest, ClockReading(5_000)).unwrap();
+}
+
+#[test]
+fn same_stage_name_in_another_campaign_never_resolves() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    // camp-2 runs a wide stage-a to an adjudicated exact repair.
+    let wide = proposal(
+        StageClass::OperatorStage,
+        "camp-2",
+        "stage-a",
+        "nonce-c2",
+        "upstream-c2",
+        vec![pin("/repo", COMMIT_A, TREE_A)],
+        &["src/lib.rs", "docs/x.md", "src/widened.rs"],
+        "",
+        None,
+    );
+    svc::propose_stage(&mut store, &wide).unwrap();
+    let c2_standing = svc::admit(&mut store, &wide.digest, ClockReading(2_000)).unwrap();
+    svc::consume(
+        &mut store,
+        &c2_standing.digest(),
+        &context(&c2_standing, WorkerRole::Operator),
+        ClockReading(3_000),
+    )
+    .unwrap();
+    svc::record_receipt(&mut store, &c2_standing.digest(), &OTHER_RECEIPT).unwrap();
+    svc::adjudicate(
+        &mut store,
+        "camp-2",
+        "stage-a",
+        &OTHER_RECEIPT,
+        AdjudicationVerdict::ExactRepair,
+        "adjudicator-1",
+        vec!["finding-1".into()],
+        vec![],
+        ClockReading(4_000),
+    )
+    .unwrap();
+    // camp-1 runs its own narrow stage-a.
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // A camp-1 repair is bounded by camp-1's consumed original — the camp-2
+    // width is invisible to it.
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/widened.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairPathOutsideOriginalScope {
+                path: "src/widened.rs".into()
+            }
+        ))
+    );
+    // A camp-2 repair citing camp-1's adjudication refuses: the cited
+    // adjudication belongs to another campaign.
+    let cross = CampaignStageProposal::propose(
+        "upstream-repair-c2".into(),
+        "camp-2".into(),
+        "stage-a-repair".into(),
+        StageClass::RecordsRepairStage,
+        StageClass::RecordsRepairStage.required_role(),
+        StageClass::RecordsRepairStage.required_effect_class(),
+        StageBasis::PredecessorStage {
+            stage: "stage-a".into(),
+            adjudication_digest: adjudication.digest,
+        },
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        vec!["src/lib.rs".to_string()],
+        "evidence-contract-1".into(),
+        "handoff-schema-1".into(),
+        ClockReading(10_000),
+        "nonce-repair-c2".into(),
+        String::new(),
+        ReviewRequirement::Required,
+        vec![],
+        Some(repair_basis(
+            "stage-a",
+            REVIEW_RECEIPT,
+            &["finding-1"],
+            RepairScopeClass::RecordsOnly,
+        )),
+        ClockReading(4_500),
+    )
+    .unwrap();
+    svc::propose_stage(&mut store, &cross).unwrap();
+    // The camp-1 review receipt was never the outcome of a consumed camp-2
+    // standing: the camp-2 chain does not resolve at all.
+    assert_eq!(
+        svc::admit(&mut store, &cross.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::AdjudicationSubjectUnknown
+        ))
+    );
+}
+
+#[test]
+fn an_unknown_or_missing_adjudication_citation_refuses() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // A fabricated adjudication digest: the citation does not resolve.
+    let fabricated = CampaignStageProposal::propose(
+        "upstream-repair".into(),
+        "camp-1".into(),
+        "stage-a-repair".into(),
+        StageClass::RecordsRepairStage,
+        StageClass::RecordsRepairStage.required_role(),
+        StageClass::RecordsRepairStage.required_effect_class(),
+        StageBasis::PredecessorStage {
+            stage: "stage-a".into(),
+            adjudication_digest: Sha256Digest::from_bytes([3; 32]),
+        },
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        vec!["src/lib.rs".to_string()],
+        "evidence-contract-1".into(),
+        "handoff-schema-1".into(),
+        ClockReading(10_000),
+        "nonce-repair".into(),
+        String::new(),
+        ReviewRequirement::Required,
+        vec![],
+        Some(repair_basis(
+            "stage-a",
+            REVIEW_RECEIPT,
+            &["finding-1"],
+            RepairScopeClass::RecordsOnly,
+        )),
+        ClockReading(4_500),
+    )
+    .unwrap();
+    svc::propose_stage(&mut store, &fabricated).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &fabricated.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairAdjudicationUnknown
+        ))
+    );
+    // Omitting the citation entirely (root basis on a repair) refuses.
+    let uncited = proposal(
+        StageClass::RecordsRepairStage,
+        "camp-1",
+        "stage-a-repair",
+        "nonce-repair-2",
+        "upstream-repair-2",
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+        "",
+        Some(repair_basis(
+            "stage-a",
+            REVIEW_RECEIPT,
+            &["finding-1"],
+            RepairScopeClass::RecordsOnly,
+        )),
+    );
+    svc::propose_stage(&mut store, &uncited).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &uncited.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairOriginalStageMismatch
+        ))
+    );
+}
+
+#[test]
+fn an_adjudication_for_a_different_receipt_or_stage_refuses() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    // Two executions of stage-a: receipt R1, then (after re-proposal)
+    // receipt R2, each adjudicated.
+    let adjudication_r1 = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    let reproposal = operator_proposal("camp-1", "stage-a", "nonce-2");
+    svc::propose_stage(&mut store, &reproposal).unwrap();
+    let second = svc::admit(&mut store, &reproposal.digest, ClockReading(4_100)).unwrap();
+    svc::consume(
+        &mut store,
+        &second.digest(),
+        &context(&second, WorkerRole::Operator),
+        ClockReading(4_200),
+    )
+    .unwrap();
+    svc::record_receipt(&mut store, &second.digest(), &OTHER_RECEIPT).unwrap();
+    let adjudication_r2 = svc::adjudicate(
+        &mut store,
+        "camp-1",
+        "stage-a",
+        &OTHER_RECEIPT,
+        AdjudicationVerdict::ExactRepair,
+        "adjudicator-1",
+        vec!["finding-2".into()],
+        vec![],
+        ClockReading(4_300),
+    )
+    .unwrap();
+    // Citing the R2 adjudication while naming R1 as the rejected review:
+    // the chain resolves R1's burn, and the citation disagrees with it.
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication_r2,
+        REVIEW_RECEIPT,
+        &["finding-2"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairReviewReceiptMismatch
+        ))
+    );
+    // An adjudication of a different stage is not authority for this one.
+    let other_stage = proposal(
+        StageClass::OperatorStage,
+        "camp-1",
+        "stage-b",
+        "nonce-b",
+        "upstream-b",
+        vec![pin("/repo", COMMIT_A, TREE_A)],
+        &["src/lib.rs", "docs/x.md", "src/widened.rs"],
+        "",
+        None,
+    );
+    svc::propose_stage(&mut store, &other_stage).unwrap();
+    let b_standing = svc::admit(&mut store, &other_stage.digest, ClockReading(4_400)).unwrap();
+    svc::consume(
+        &mut store,
+        &b_standing.digest(),
+        &context(&b_standing, WorkerRole::Operator),
+        ClockReading(4_500),
+    )
+    .unwrap();
+    let b_receipt = Sha256Digest::from_bytes([5; 32]);
+    svc::record_receipt(&mut store, &b_standing.digest(), &b_receipt).unwrap();
+    let adjudication_b = svc::adjudicate(
+        &mut store,
+        "camp-1",
+        "stage-b",
+        &b_receipt,
+        AdjudicationVerdict::ExactRepair,
+        "adjudicator-1",
+        vec!["finding-1".into()],
+        vec![],
+        ClockReading(4_600),
+    )
+    .unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication_b,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairOriginalStageMismatch
+        ))
+    );
+    // The R1 adjudication remains the exact authority for R1's chain.
+    let _ = adjudication_r1;
+}
+
+#[test]
+fn a_superseded_adjudication_authorizes_no_repair() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // A newer adjudication of the same review receipt supersedes it.
+    svc::adjudicate(
+        &mut store,
+        "camp-1",
+        "stage-a",
+        &REVIEW_RECEIPT,
+        AdjudicationVerdict::Refuse,
+        "adjudicator-1",
+        vec!["finding-1".into()],
+        vec![],
+        ClockReading(4_900),
+    )
+    .unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(CampaignRefusal::Superseded))
+    );
+}
+
+#[test]
+fn an_ambiguous_consumed_standing_chain_refuses() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    // A second execution of the same stage carries the same review receipt:
+    // the original authority no longer resolves to one consumed standing.
+    let reproposal = operator_proposal("camp-1", "stage-a", "nonce-2");
+    svc::propose_stage(&mut store, &reproposal).unwrap();
+    let second = svc::admit(&mut store, &reproposal.digest, ClockReading(4_100)).unwrap();
+    svc::consume(
+        &mut store,
+        &second.digest(),
+        &context(&second, WorkerRole::Operator),
+        ClockReading(4_200),
+    )
+    .unwrap();
+    svc::record_receipt(&mut store, &second.digest(), &REVIEW_RECEIPT).unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairOriginalStandingAmbiguous
+        ))
+    );
+}
+
+#[test]
+fn a_records_only_repair_cannot_gain_a_source_path() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    // The original stage authority covers records paths only.
+    let docs_only = proposal(
+        StageClass::OperatorStage,
+        "camp-1",
+        "stage-a",
+        "nonce-1",
+        "upstream-0",
+        vec![pin("/repo", COMMIT_A, TREE_A)],
+        &["docs/x.md"],
+        "",
+        None,
+    );
+    svc::propose_stage(&mut store, &docs_only).unwrap();
+    let standing = svc::admit(&mut store, &docs_only.digest, ClockReading(2_000)).unwrap();
+    svc::consume(
+        &mut store,
+        &standing.digest(),
+        &context(&standing, WorkerRole::Operator),
+        ClockReading(3_000),
+    )
+    .unwrap();
+    svc::record_receipt(&mut store, &standing.digest(), &REVIEW_RECEIPT).unwrap();
+    let adjudication = svc::adjudicate(
+        &mut store,
+        "camp-1",
+        "stage-a",
+        &REVIEW_RECEIPT,
+        AdjudicationVerdict::ExactRepair,
+        "adjudicator-1",
+        vec!["finding-1".into()],
+        vec![],
+        ClockReading(4_000),
+    )
+    .unwrap();
+    let p = repair_proposal(
+        StageClass::RecordsRepairStage,
+        RepairScopeClass::RecordsOnly,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/main.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairPathOutsideOriginalScope {
+                path: "src/main.rs".into()
+            }
+        ))
+    );
+}
+
+#[test]
+fn an_existing_source_repair_cannot_use_a_later_widened_proposals_paths() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let adjudication = adjudicated_stage(
+        &mut store,
+        AdjudicationVerdict::ExactRepair,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+    );
+    widened_reproposal(&mut store, "nonce-9", "src/widened.rs");
+    let p = repair_proposal(
+        StageClass::ExistingSourceScopeRepairStage,
+        RepairScopeClass::ExistingSourceScope,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/widened.rs"],
+    );
+    svc::propose_stage(&mut store, &p).unwrap();
+    assert_eq!(
+        svc::admit(&mut store, &p.digest, ClockReading(5_000)),
+        Err(CampaignError::Refusal(
+            CampaignRefusal::RepairPathOutsideOriginalScope {
+                path: "src/widened.rs".into()
+            }
+        ))
+    );
+    // Within the consumed original source allowlist, it admits.
+    let ok = repair_proposal(
+        StageClass::ExistingSourceScopeRepairStage,
+        RepairScopeClass::ExistingSourceScope,
+        &adjudication,
+        REVIEW_RECEIPT,
+        &["finding-1"],
+        vec![pin("/repo", COMMIT_B, TREE_B)],
+        &["src/lib.rs"],
+    );
+    svc::propose_stage(&mut store, &ok).unwrap();
+    svc::admit(&mut store, &ok.digest, ClockReading(5_000)).unwrap();
 }

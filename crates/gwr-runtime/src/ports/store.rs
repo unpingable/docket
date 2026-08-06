@@ -373,6 +373,22 @@ pub trait Store {
         stage: &str,
         review_receipt: &Sha256Digest,
     ) -> Result<Option<AdjudicationReceipt>, StoreError>;
+    /// The adjudication receipt with this exact digest, if recorded. Repair
+    /// admission cites adjudications by exact identity — never by stage name
+    /// or receipt alone.
+    fn get_campaign_adjudication(
+        &mut self,
+        digest: &Sha256Digest,
+    ) -> Result<Option<AdjudicationReceipt>, StoreError>;
+    /// Every consumption row for a campaign stage carrying this exact
+    /// receipt digest. The repair authority chain resolves the consumed
+    /// original standing through the adjudicated review receipt.
+    fn find_campaign_consumptions_by_receipt(
+        &mut self,
+        campaign: &str,
+        stage: &str,
+        receipt: &Sha256Digest,
+    ) -> Result<Vec<CampaignStageConsumption>, StoreError>;
     /// Every residual obligation recorded for a campaign stage, preserved
     /// across adjudications, oldest first.
     fn get_campaign_residuals(

@@ -488,6 +488,26 @@ fn consume_standing(
 // Campaign-stage standing (S-2) row mapping. Every read path recomputes the
 // content address from the persisted fields; a mismatch is typed corruption.
 
+fn consumption_from_row_at(
+    standing: Sha256Digest,
+    r: &rusqlite::Row<'_>,
+    o: usize,
+) -> rusqlite::Result<CampaignStageConsumption> {
+    let receipt: Option<String> = r.get(o + 6)?;
+    Ok(CampaignStageConsumption {
+        digest: parse_digest(&r.get::<_, String>(o)?).map_err(sql_corrupt)?,
+        standing,
+        campaign: r.get(o + 1)?,
+        stage: r.get(o + 2)?,
+        role: parse_role(&r.get::<_, String>(o + 3)?).map_err(sql_corrupt)?,
+        consumed_at: ClockReading(r.get::<_, i64>(o + 4)? as u64),
+        effect_completed: r.get::<_, i64>(o + 5)? != 0,
+        receipt: receipt
+            .map(|h| parse_digest(&h).map_err(sql_corrupt))
+            .transpose()?,
+    })
+}
+
 fn proposal_from_row_at(
     digest: Sha256Digest,
     r: &rusqlite::Row<'_>,
@@ -2742,21 +2762,7 @@ impl Store for SqliteStore {
                 "SELECT digest, campaign, stage, role, consumed_at, effect_completed, receipt
                  FROM campaign_stage_consumption WHERE standing=?1",
                 params![standing.to_hex()],
-                |r| {
-                    let receipt: Option<String> = r.get(6)?;
-                    Ok(CampaignStageConsumption {
-                        digest: parse_digest(&r.get::<_, String>(0)?).map_err(sql_corrupt)?,
-                        standing: *standing,
-                        campaign: r.get(1)?,
-                        stage: r.get(2)?,
-                        role: parse_role(&r.get::<_, String>(3)?).map_err(sql_corrupt)?,
-                        consumed_at: ClockReading(r.get::<_, i64>(4)? as u64),
-                        effect_completed: r.get::<_, i64>(5)? != 0,
-                        receipt: receipt
-                            .map(|h| parse_digest(&h).map_err(sql_corrupt))
-                            .transpose()?,
-                    })
-                },
+                |r| consumption_from_row_at(*standing, r, 0),
             )
             .optional()
             .map_err(backend)
@@ -2918,6 +2924,57 @@ impl Store for SqliteStore {
             )
             .optional()
             .map_err(backend)
+    }
+
+    fn get_campaign_adjudication(
+        &mut self,
+        digest: &Sha256Digest,
+    ) -> Result<Option<AdjudicationReceipt>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT digest, campaign, stage, review_receipt, verdict, adjudicator, findings,
+                        residuals, adjudicated_at
+                 FROM campaign_stage_adjudication WHERE digest=?1",
+                params![digest.to_hex()],
+                adjudication_from_row,
+            )
+            .optional()
+            .map_err(backend)?
+            .map(|a| {
+                if a.recompute_digest() != a.digest {
+                    return Err(StoreError::Corrupt(format!(
+                        "campaign adjudication {} fields do not recompute to their digest",
+                        a.digest
+                    )));
+                }
+                Ok(a)
+            })
+            .transpose()
+    }
+
+    fn find_campaign_consumptions_by_receipt(
+        &mut self,
+        campaign: &str,
+        stage: &str,
+        receipt: &Sha256Digest,
+    ) -> Result<Vec<CampaignStageConsumption>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT standing, digest, campaign, stage, role, consumed_at, effect_completed,
+                        receipt
+                 FROM campaign_stage_consumption
+                 WHERE campaign=?1 AND stage=?2 AND receipt=?3
+                 ORDER BY consumed_at, rowid",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(params![campaign, stage, receipt.to_hex()], |r| {
+                let standing = parse_digest(&r.get::<_, String>(0)?).map_err(sql_corrupt)?;
+                consumption_from_row_at(standing, r, 1)
+            })
+            .map_err(backend)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(backend)
     }
 
     fn get_campaign_residuals(
