@@ -126,6 +126,11 @@ store — receives success, even when two consumers would write byte-identical r
 exact classification of the durable winner's row, never a second success, and a failed
 transaction leaves no row: standing is available exactly when no burn committed. The
 law is carried by the database, not by any in-memory state or application-level lock.
+Connections carry a bounded `busy_timeout` (`SQLITE_BUSY_TIMEOUT_MS`, five seconds):
+ordinary short writer contention gets a bounded chance to resolve so the losing
+consumer observes the committed burn and receives the typed classification; a lock held
+past the budget returns a bounded store error, never a success. The timeout never
+changes outcomes and is not a guarantee of eventual success.
 
 ## Reviewer standing
 
@@ -168,6 +173,35 @@ narrow scope, never widen it. Any other verdict authorizes no repair; a repair c
 receipt the adjudication does not cover refuses; substituted findings refuse; a widened
 path or repository refuses by name. New-source-scope and architecture "repairs" are not
 repairs: those classes are never admitted at all.
+
+## The repair-authority artifact (P1)
+
+A repair stage must not execute because a local file claims an adjudication happened.
+`campaign export-repair-authority --standing <digest>` emits Docket's own read-only,
+content-addressed projection of the durable authority: schema
+`gwr:campaign-repair-authority:v1`, binding the campaign, the repair stage, role, stage
+class, effect class, repair standing and proposal digests, the exact burn state of the
+repair standing (absent before the burn, the burn digest after), the original stage,
+the F1-chain anchors (original proposal, original standing, original consumption), the
+rejected review receipt, the cited adjudication digest and verdict, the exact finding
+IDs, the scope class, the repository pins, the allowed paths, expiry, nonce, and
+nonclaims, plus the verifier-generation identity. Export re-verifies the F1 chain and
+current law (adjudication and standing supersession, expiry, the subset check), so a
+drifted or unlawful authority cannot be exported.
+
+The canonical JSON is deterministic (fixed key order, two-space indent, LF, one
+trailing newline). The typed Docket digest travels inside the artifact as
+`docket_repair_authority`; the file's own identity is SHA-256 over the exact file
+bytes in a `<file>.sha256` companion — the artifact never embeds its own file digest,
+and no consumer re-canonicalizes. `campaign verify-repair-authority --bundle <file>
+[--expect-standing <digest>]` parses strictly (unknown schema, missing or added
+fields, wrong types, unknown tags, or a typed digest that does not recompute all
+refuse), then re-derives the authority from the durable store and requires field-for-field
+equality — including the exact burn state — under the verifier's clock, refusing with
+the first differing field named. A stale, superseded, corrupted, or foreign artifact
+never verifies. Both verbs are read-only. The sidecar's obligation is mechanical only:
+pin the artifact bytes, verify the SHA-256, run this verifier, and compare the
+returned references; Docket remains the semantic verifier.
 
 ## Relationship to the effect-standing domain
 
@@ -227,5 +261,6 @@ Stated here rather than in `invariants-v0.md`, which is the v0 audit-era table:
   domain.
 
 Each invariant has at least one test in `crates/gwr-local/tests/campaign_stage_standing.rs`,
-`crates/gwr-local/tests/campaign_burn_concurrency.rs`, or the `gwr_core::campaign` unit
+`crates/gwr-local/tests/campaign_burn_concurrency.rs`,
+`crates/gwr-local/tests/campaign_repair_authority.rs`, or the `gwr_core::campaign` unit
 tests.
