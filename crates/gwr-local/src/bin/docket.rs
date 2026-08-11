@@ -23,6 +23,7 @@ use gwr_local::adapters::{FsArtifactStore, FsProvenanceSink, HashChainIds, Syste
 use gwr_local::broker::SubprocessGitBroker;
 use gwr_local::campaign_export;
 use gwr_local::capabilities::StandingTokenCodec;
+use gwr_local::governed_loop;
 use gwr_local::providers::fake::{Script, ScriptedProvider};
 use gwr_local::store::SqliteStore;
 use gwr_runtime::ports::adapters::{Clock, IdSource};
@@ -40,6 +41,7 @@ use gwr_runtime::services::ratification::ratify;
 use gwr_runtime::services::reconcile::reconcile;
 use gwr_runtime::services::reliance::{rely_review_queue, RelyError};
 use gwr_runtime::services::reservation::reserve;
+use std::io::Read as _;
 use std::path::PathBuf;
 
 /// Verifier-generation identity emitted into repair-authority artifacts:
@@ -77,6 +79,7 @@ Governed workflow:
 
 Authorization and evidence:
   authz request | authz accept
+  governed-loop accept | reconcile-issuance | reconcile-attempt
   list [--json]
   show (--attempt <id> | --dispatch <id>) [--json]
   journal (--attempt <id> | --dispatch <id>) [--json]
@@ -366,6 +369,76 @@ fn run(args: &[String]) -> Result<(), String> {
         .map(String::as_str)
         .collect();
     match cmd.as_slice() {
+        ["governed-loop", "accept"] => {
+            // The exact signed issuance arrives on stdin. Docket resolves its
+            // own execution standing now, commits custody/attempt identity,
+            // and only then delegates mechanics to the named executor.
+            let st = State::open(args)?;
+            let envelope = read_stdin_bounded()?;
+            let trust = std::fs::read(need(args, "--trust")?)
+                .map_err(|error| format!("reading governed-loop trust: {error}"))?;
+            let custody = governed_loop::accept(
+                &st.dir.join("state.sqlite"),
+                &envelope,
+                &trust,
+                &PathBuf::from(need(args, "--standing-resolver")?),
+                &PathBuf::from(need(args, "--executor")?),
+                &PathBuf::from(need(args, "--executor-config")?),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&custody)
+                    .map_err(|error| format!("governed custody response: {error}"))?
+            );
+            Ok(())
+        }
+        ["governed-loop", "reconcile-issuance"] => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                issuance: String,
+            }
+            let st = State::open(args)?;
+            let request: Request = serde_json::from_slice(&read_stdin_bounded()?)
+                .map_err(|error| format!("governed reconciliation request: {error}"))?;
+            let response = governed_loop::reconcile(
+                &st.dir.join("state.sqlite"),
+                &request.issuance,
+                None,
+                &PathBuf::from(need(args, "--executor")?),
+                &PathBuf::from(need(args, "--executor-config")?),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&response)
+                    .map_err(|error| format!("governed reconciliation response: {error}"))?
+            );
+            Ok(())
+        }
+        ["governed-loop", "reconcile-attempt"] => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                issuance: String,
+                attempt: String,
+            }
+            let st = State::open(args)?;
+            let request: Request = serde_json::from_slice(&read_stdin_bounded()?)
+                .map_err(|error| format!("governed reconciliation request: {error}"))?;
+            let response = governed_loop::reconcile(
+                &st.dir.join("state.sqlite"),
+                &request.issuance,
+                Some(&request.attempt),
+                &PathBuf::from(need(args, "--executor")?),
+                &PathBuf::from(need(args, "--executor-config")?),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&response)
+                    .map_err(|error| format!("governed reconciliation response: {error}"))?
+            );
+            Ok(())
+        }
         ["repository", "register"] => {
             let mut st = State::open(args)?;
             let path = require_absolute_path(&need(args, "--repo")?)?;
@@ -1466,10 +1539,24 @@ fn run(args: &[String]) -> Result<(), String> {
              prepare start, prepare poll, \
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
              rely review-queue, reconcile, recover fact, recover resolve, authz request, \
-             authz accept, docket list, docket show, docket journal, continuity subject, \
+             authz accept, governed-loop accept, governed-loop reconcile-issuance, \
+             governed-loop reconcile-attempt, docket list, docket show, docket journal, continuity subject, \
              campaign propose-stage, campaign admit, campaign consume, campaign outcome, \
              campaign adjudicate, campaign export-repair-authority, \
              campaign verify-repair-authority, campaign show"
         )),
     }
+}
+
+fn read_stdin_bounded() -> Result<Vec<u8>, String> {
+    const LIMIT: u64 = 1_048_576;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("reading governed-loop stdin: {error}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > LIMIT {
+        return Err("governed-loop stdin is empty or exceeds 1 MiB".to_owned());
+    }
+    Ok(bytes)
 }

@@ -40,6 +40,7 @@ const MIGRATION_0002: &str = include_str!("../../migrations/0002_reliance_subjec
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_authz_issuance.sql");
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_repository_registry.sql");
 const MIGRATION_0005: &str = include_str!("../../migrations/0005_campaign_stage_standing.sql");
+const MIGRATION_0006: &str = include_str!("../../migrations/0006_governed_loop_custody.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -142,6 +143,10 @@ impl SqliteStore {
         // (`IF NOT EXISTS`); it shares no table with the effect-standing
         // domain and alters none.
         conn.execute_batch(MIGRATION_0005).map_err(backend)?;
+        // 0006 is the canonical AG-issuance-bound execution-custody ledger.
+        // It shares neither authority nor storage with campaign-stage
+        // standing, AG's spend journal, or executor-local idempotency state.
+        conn.execute_batch(MIGRATION_0006).map_err(backend)?;
         Ok(())
     }
 

@@ -8,6 +8,7 @@ pub mod authz_intake;
 pub mod broker;
 pub mod campaign_export;
 pub mod capabilities;
+pub mod governed_loop;
 pub mod observe;
 pub mod providers;
 pub mod recover;
