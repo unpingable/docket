@@ -72,6 +72,9 @@ impl CampaignStageStanding {
         proposal: &CampaignStageProposal,
         now: ClockReading,
     ) -> Result<Self, CampaignRefusal> {
+        if proposal.stage_class.is_historical_repair() || proposal.repair.is_some() {
+            return Err(CampaignRefusal::LegacyRepairRouteRetired);
+        }
         if now >= proposal.expires_at {
             return Err(CampaignRefusal::Expired);
         }
@@ -275,6 +278,9 @@ impl CampaignStageStanding {
         context: &ExecutionContext,
         now: ClockReading,
     ) -> Result<(), CampaignRefusal> {
+        if self.stage_class.is_historical_repair() {
+            return Err(CampaignRefusal::LegacyRepairRouteRetired);
+        }
         if self.campaign != context.campaign {
             return Err(CampaignRefusal::CampaignMismatch);
         }

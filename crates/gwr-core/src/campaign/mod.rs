@@ -22,9 +22,9 @@ pub mod standing;
 
 use crate::refusal::CampaignRefusal;
 
-/// The stage classes this runtime can issue standing for. Every other class
-/// in the campaign vocabulary is named in [`StageClass::admit_tag`] and
-/// refused there — recognized, and declined.
+/// The closed stage-class vocabulary. Current standing is issued only for
+/// operator/reviewer/final-review classes. The repair classes remain
+/// decode-only history and [`StageClass::admit_tag`] refuses them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageClass {
     OperatorStage,
@@ -58,6 +58,16 @@ impl StageClass {
         })
     }
 
+    /// Whether this class belongs only to the retired campaign-stage repair
+    /// archive. Historical rows still decode through [`Self::from_tag`], but
+    /// no current proposal or standing admission may select either class.
+    pub fn is_historical_repair(self) -> bool {
+        matches!(
+            self,
+            Self::RecordsRepairStage | Self::ExistingSourceScopeRepairStage
+        )
+    }
+
     /// Classes that exist in the campaign vocabulary but for which this
     /// runtime never issues standing. Requesting one is a typed refusal that
     /// names the class — not an unknown-class error, and never a silent drop
@@ -81,6 +91,12 @@ impl StageClass {
     /// Admission of a requested stage class: the admitted classes pass, the
     /// never-admitted classes refuse by name, anything else is unknown.
     pub fn admit_tag(tag: &str) -> Result<Self, CampaignRefusal> {
+        if matches!(
+            tag,
+            "records_repair_stage" | "existing_source_scope_repair_stage"
+        ) {
+            return Err(CampaignRefusal::LegacyRepairRouteRetired);
+        }
         if let Some(class) = Self::from_tag(tag) {
             return Ok(class);
         }
@@ -113,8 +129,7 @@ impl StageClass {
         }
     }
 
-    /// Whether this class carries a repair basis and answers to a rejected
-    /// review.
+    /// Whether this is one of the historical campaign-stage repair classes.
     pub fn is_repair(&self) -> bool {
         matches!(
             self,
@@ -129,8 +144,8 @@ impl StageClass {
     }
 }
 
-/// Who a stage's standing is issued to. Standing is non-transferable across
-/// roles: consumption presents a role and a mismatch refuses.
+/// Campaign-stage worker-role vocabulary. `Repair` is decode-only history;
+/// current standing is non-transferable across operator/reviewer roles.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkerRole {
     Operator,
@@ -168,10 +183,9 @@ pub enum StageEffectClass {
     WorkspaceMutation,
     /// Read and test effects only. Every mutation is forbidden.
     ReviewReadOnly,
-    /// Mutation of records paths only, within the original stage authority's
-    /// scope.
+    /// Historical campaign-stage repair effect; decode-only.
     RecordsOnly,
-    /// Mutation within the original stage authority's existing source scope.
+    /// Historical campaign-stage repair effect; decode-only.
     ExistingSourceScope,
 }
 
@@ -274,8 +288,8 @@ impl ReviewRequirement {
     }
 }
 
-/// The two repair scope classes eligible for repair standing. Nothing else
-/// is repairable through this domain.
+/// Historical campaign-stage repair scope vocabulary. Nothing here is
+/// current repair authority; governed repair has its own closed scope type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RepairScopeClass {
     RecordsOnly,
@@ -333,10 +347,17 @@ mod tests {
                 class: "surreptitious_stage".to_string()
             })
         );
+        for class in ["records_repair_stage", "existing_source_scope_repair_stage"] {
+            assert_eq!(
+                StageClass::admit_tag(class),
+                Err(CampaignRefusal::LegacyRepairRouteRetired)
+            );
+            assert!(StageClass::from_tag(class).unwrap().is_historical_repair());
+        }
     }
 
     #[test]
-    fn each_admitted_class_fixes_one_role_and_one_effect_class() {
+    fn each_decodable_class_fixes_one_role_and_one_effect_class() {
         for class in [
             StageClass::OperatorStage,
             StageClass::ReviewerStage,

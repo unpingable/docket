@@ -1,9 +1,10 @@
 # Campaign-Stage Standing (S-2)
 
-Status: implemented on branch `campaign/stage-standing`. This document is the law of the
-campaign-stage standing domain: what it is, what it premises, what it refuses, and what it
-never claims. It is a distinct standing domain alongside the effect-standing domain
-(`git-ref-update:v1`); neither document nor code of that domain is altered by this one.
+Status: current for operator/reviewer campaign stages. The former campaign-stage
+repair office is retained only as decodable history and is structurally retired;
+new repair custody is specified in
+[`governed-repair-custody.md`](governed-repair-custody.md). This domain remains
+distinct from effect standing (`git-ref-update:v1`).
 
 ## What this domain is
 
@@ -14,18 +15,24 @@ consumption, its outcome, and the adjudication of its review.
 
 The vocabulary, in `gwr_core::campaign`:
 
-- **Stage classes** with standing: `operator_stage`, `reviewer_stage`,
-  `records_repair_stage`, `existing_source_scope_repair_stage`, `final_review_stage`.
+- **Stage classes** with current standing: `operator_stage`, `reviewer_stage`,
+  `final_review_stage`.
+- **Historical decode-only stage classes**: `records_repair_stage` and
+  `existing_source_scope_repair_stage`. Proposal, persistence, admission,
+  issuance, and consumption all refuse them with
+  `CampaignRefusal::LegacyRepairRouteRetired`.
 - **Stage classes without standing, ever**: `new_source_scope`, `architecture`,
   `authority`, `basis`, `candidate`, `freeze`, `qualification`, `certificate`, `registry`,
   `deployment`. Requesting one refuses with
   `CampaignRefusal::StageClassNeverAdmitted { class }` — a typed refusal that names the
   class, at the input boundary, before anything is created.
-- **Worker roles**: `operator`, `reviewer`, `repair`. The stage class fixes the role.
+- **Worker roles**: current standing uses `operator` and `reviewer`; the
+  `repair` role remains in the archive vocabulary only. The stage class fixes
+  the role.
 - **Effect classes**: `workspace_mutation` (operator), `review_read_only` (reviewer and
-  final review), `records_only` (records repair), `existing_source_scope` (source-scope
-  repair). The stage class fixes the effect class; proposing anything else is
-  effect-class widening and refuses at proposal validation.
+  final review). `records_only` and `existing_source_scope` remain historical
+  tags only. The stage class fixes the effect class; proposing anything else
+  is effect-class widening and refuses at proposal validation.
 
 ## Digests and dual identity
 
@@ -70,8 +77,8 @@ typed: empty required fields; non-exact repository pins (commit and tree must be
 lowercase-hex object ids); zero repositories; zero or inadmissible paths
 (repository-relative, non-traversing); role not the stage class's role; effect class not
 the stage class's effect class; review classes without an isolated worktree identity;
-repair classes without a repair basis (or non-repair classes with one); repair scope
-class disagreeing with the repair stage class; repair basis without findings.
+or a historical repair class/basis. Historical repair-shaped proposals refuse
+before a digest is issued or a Store mutation occurs.
 
 **Standing** (`CampaignStageStanding`). Issued only from an exact recorded proposal, by
 `campaign admit`. It is role-bound, stage-bound, basis-bound (the proposal digest binds
@@ -90,9 +97,11 @@ Consumption is burn-before-effect: `campaign consume` makes the record durable b
 the caller runs any effect, and the effect happens outside this runtime (AG-NG or the
 sidecar runs it). A replayed burn refuses.
 
-**Adjudication** (`AdjudicationReceipt`). The durable receipt of a verdict over a review:
-`continue`, `exact_repair`, or `refuse`, binding campaign, stage, the exact review
-receipt adjudicated, the adjudicator, the findings, and the residual obligations.
+**Adjudication** (`AdjudicationReceipt`). The durable receipt of a current verdict over a
+review: `continue` or `refuse`, binding campaign, stage, the exact review receipt
+adjudicated, the adjudicator, findings, and residual obligations. The
+`exact_repair` tag remains decodable for historical rows but current construction,
+Store persistence, runtime adjudication, and CLI adjudication refuse it.
 Adjudicating a review receipt this runtime never recorded as the outcome of a consumed
 standing for that campaign and stage refuses (`AdjudicationSubjectUnknown`).
 
@@ -143,65 +152,21 @@ branch mutation, remote mutation — refuses with the operation named
 and an operator presenting it (or a reviewer presenting operator standing) refuses
 (`RoleMismatch`).
 
-## Repair standing
+## Historical repair archive
 
-A repair proposal carries a repair basis: the original stage, the exact rejected review
-receipt digest, the exact finding identifiers, the scope class, repair nonclaims, and a
-new review requirement. Only the two repair stage classes can carry one, and each binds
-its scope class: `records_repair_stage` ↔ `records_only`,
-`existing_source_scope_repair_stage` ↔ `existing_source_scope`.
+The former repair proposal, exact-repair adjudication, repair standing, and
+`gwr:campaign-repair-authority:v1` artifact formats remain decodable so old rows
+and exact artifact bytes can be inspected. Canonical artifact parsing checks
+historical representation and content-address integrity only. It does not
+re-derive current authority, issue standing, or validate execution custody.
 
-Admission (`campaign admit` for a repair proposal) requires the repair's predecessor
-basis to cite the authorizing adjudication by exact digest. The cited adjudication must
-be recorded, must belong to the same campaign, must adjudicate the original stage and
-the cited rejected review receipt with verdict `exact_repair`, must carry an exactly
-matching finding set, and must not be superseded by a newer adjudication of the same
-receipt. The **original stage authority is then resolved through the immutable
-consumed-standing chain**, never by stage name: the adjudicated review receipt
-identifies the one durable burn of the original stage that carries it; that burn's
-standing names the exact `proposal_digest` of the proposal that was actually executed;
-that proposal is the original authority. If no burn carries the receipt
-(`AdjudicationSubjectUnknown`), or more than one does
-(`RepairOriginalStandingAmbiguous`), admission refuses rather than guess. A same-name
-re-proposal — wider or narrower — is a record-only artifact and never re-bases the
-anchor.
-
-The **subset decision lives here, in Docket** — never in
-the sidecar: every requested repository must be one of the original stage authority's
-repositories, and every requested path must be one of its allowed paths. A repair may
-narrow scope, never widen it. Any other verdict authorizes no repair; a repair citing a
-receipt the adjudication does not cover refuses; substituted findings refuse; a widened
-path or repository refuses by name. New-source-scope and architecture "repairs" are not
-repairs: those classes are never admitted at all.
-
-## The repair-authority artifact (P1)
-
-A repair stage must not execute because a local file claims an adjudication happened.
-`campaign export-repair-authority --standing <digest>` emits Docket's own read-only,
-content-addressed projection of the durable authority: schema
-`gwr:campaign-repair-authority:v1`, binding the campaign, the repair stage, role, stage
-class, effect class, repair standing and proposal digests, the exact burn state of the
-repair standing (absent before the burn, the burn digest after), the original stage,
-the F1-chain anchors (original proposal, original standing, original consumption), the
-rejected review receipt, the cited adjudication digest and verdict, the exact finding
-IDs, the scope class, the repository pins, the allowed paths, expiry, nonce, and
-nonclaims, plus the verifier-generation identity. Export re-verifies the F1 chain and
-current law (adjudication and standing supersession, expiry, the subset check), so a
-drifted or unlawful authority cannot be exported.
-
-The canonical JSON is deterministic (fixed key order, two-space indent, LF, one
-trailing newline). The typed Docket digest travels inside the artifact as
-`docket_repair_authority`; the file's own identity is SHA-256 over the exact file
-bytes in a `<file>.sha256` companion — the artifact never embeds its own file digest,
-and no consumer re-canonicalizes. `campaign verify-repair-authority --bundle <file>
-[--expect-standing <digest>]` parses strictly (unknown schema, missing or added
-fields, wrong types, unknown tags, or a typed digest that does not recompute all
-refuse), then re-derives the authority from the durable store and requires field-for-field
-equality — including the exact burn state — under the verifier's clock, refusing with
-the first differing field named. A stale, superseded, corrupted, or foreign artifact
-never verifies. Both verbs are read-only. The sidecar's obligation is mechanical only:
-pin the artifact bytes, verify the SHA-256, run this verifier, and compare the
-returned references; Docket remains the semantic verifier.
+Every former production entry refuses: proposal construction and persistence,
+`campaign admit`, standing issue and consumption, exact-repair adjudication,
+repair-authority issue/export/verification, and the corresponding CLI verbs.
+There is no conversion from a decoded legacy record into current governed
+repair. See
+[`campaign-stage-repair-retirement.md`](campaign-stage-repair-retirement.md)
+and [`governed-repair-custody.md`](governed-repair-custody.md).
 
 ## Relationship to the effect-standing domain
 
@@ -232,8 +197,10 @@ other.
   governs authority and occurrence, not quality.
 - No claim of OS-level confinement of the worker that holds standing (per the v0.1
   threat model).
-- No automatic standing for any class outside the five admitted ones, and no path by
+- No automatic standing for any class outside the three current ones, and no path by
   which worker output broadens issued standing.
+- No current authority from historical repair rows, exact-repair adjudications,
+  repair artifacts, or NQ C1 fixture possession.
 - No discharge of residual obligations, ever.
 - No re-execution from an ambiguous crash state; the law is refuse, not guess.
 
@@ -248,11 +215,9 @@ Stated here rather than in `invariants-v0.md`, which is the v0 audit-era table:
 - **S2-3.** Consumption binds campaign, stage, role, and proposal digest; every
   substitution refuses.
 - **S2-4.** Reviewer standing permits read/test only; every mutation refuses by name.
-- **S2-5.** Repair admission cites the authorizing adjudication by exact digest and
-  resolves the original stage authority through the consumed-standing chain (rejected
-  review receipt → durable burn → consumed standing → proposal digest); the requested
-  scope is a subset of that exact proposal's scope — decided in Docket, never anchored
-  to a record-only re-proposal.
+- **S2-5.** The historical campaign-stage repair office is decode-only. Its
+  proposal, adjudication, standing, persistence, consumption, export, and
+  verification entrypoints refuse and cannot bootstrap governed-repair custody.
 - **S2-6.** The never-admitted classes refuse by name at the input boundary.
 - **S2-7.** Crash recovery has exactly four states; only effect-not-begun may proceed.
 - **S2-8.** Residual obligations are recorded and preserved; there is no discharge.

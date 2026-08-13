@@ -36,6 +36,27 @@ impl Sha256Digest {
         }
         s
     }
+
+    /// Parses the one algorithm-qualified wire spelling accepted by governed
+    /// office boundaries.
+    pub fn parse_qualified(value: &str) -> Option<Self> {
+        let hex = value.strip_prefix("sha256:")?;
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let text = std::str::from_utf8(pair).ok()?;
+            if !text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            bytes[index] = u8::from_str_radix(text, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 impl fmt::Display for Sha256Digest {

@@ -40,6 +40,9 @@ pub enum StoreError {
     ReservationConflict,
     /// A standing or reservation use was already consumed.
     AlreadyConsumed,
+    /// A caller attempted to persist or mutate the retired campaign-stage
+    /// repair vocabulary. Historical rows remain readable, never writable.
+    LegacyCampaignRepairRouteRetired,
     /// The caller asked to persist a state that is not a legal successor of the
     /// attempt's current state.
     IllegalTransition {

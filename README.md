@@ -44,6 +44,12 @@ cousin, not a predecessor**: the Task 14 comparison
 ([`old-rust-comparison.md`](docs/governed-runtime/old-rust-comparison.md))
 concluded "complementary organs, not rivals" and imported nothing.
 
+The former campaign-stage `exact_repair` proposal/standing/export route is
+historical and structurally retired. Its records remain inspectable but cannot
+bootstrap current authority. New repair custody uses the distinct governed
+repair protocol; see
+[`campaign-stage-repair-retirement.md`](docs/governed-runtime/campaign-stage-repair-retirement.md).
+
 **Read the trust model before relying on anything here.**
 [`docs/governed-runtime/trust-model.md`](docs/governed-runtime/trust-model.md) states what
 is enforced and what is assumed. Three assumptions are load-bearing and are premises rather
@@ -69,6 +75,7 @@ might expect to be enforced are deliberately written down there as premises inst
 | What each outcome means and what to do next | [`operator-runbook.md`](docs/governed-runtime/operator-runbook.md) |
 | First upstream-authorized governed change | [`vertical-01.md`](docs/vertical-01.md) |
 | How upstream authorization becomes local standing | [`upstream-authorization.md`](docs/governed-runtime/upstream-authorization.md) |
+| Why the old campaign-stage repair route cannot mint authority | [`campaign-stage-repair-retirement.md`](docs/governed-runtime/campaign-stage-repair-retirement.md) |
 
 Documents cite an external "normative packet" as their requirements source. That packet is
 held privately and is not part of this repository; the citations are to an external source,

@@ -1,4 +1,4 @@
-//! The canonical JSON projection of the repair-authority bundle (P1).
+//! Archive codec for the retired campaign-stage repair-authority bundle.
 //!
 //! The Docket-owned artifact is deterministic: fixed key order, two-space
 //! indentation, LF line endings, one trailing newline. String encoding is
@@ -7,7 +7,9 @@
 //! content address travels inside the artifact as `docket_repair_authority`;
 //! the file's own identity is SHA-256 over the exact file bytes and travels
 //! alongside in a `<file>.sha256` companion — the artifact never embeds its
-//! own file digest, and no consumer re-canonicalizes.
+//! own file digest, and no consumer re-canonicalizes. Parsing proves only
+//! that archived bytes match the historical record identity; it cannot
+//! validate or recreate current repair authority.
 
 use gwr_core::campaign::adjudication::AdjudicationVerdict;
 use gwr_core::campaign::authority::RepairAuthorityV1;
@@ -170,10 +172,10 @@ const KEYS: &[&str] = &[
     "verifier",
 ];
 
-/// Parse a canonical artifact. Refuses: malformed JSON, unknown schema,
+/// Parse a canonical historical artifact. Refuses: malformed JSON, unknown schema,
 /// missing or added fields, wrong types, unknown enum tags, malformed
 /// digests, and an embedded typed digest that does not recompute from the
-/// fields.
+/// fields. Success is archival integrity, not live authority.
 pub fn parse(raw: &str) -> Result<RepairAuthorityV1, String> {
     let v: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("malformed JSON: {e}"))?;
@@ -217,36 +219,42 @@ pub fn parse(raw: &str) -> Result<RepairAuthorityV1, String> {
         .get("expires_at_ms")
         .and_then(|x| x.as_u64())
         .ok_or("missing or non-integer field expires_at_ms")?;
-    let bundle = RepairAuthorityV1::issue(
-        pstring(&v, "campaign")?,
-        pstring(&v, "repair_stage")?,
-        WorkerRole::from_tag(&pstring(&v, "role")?).ok_or("unknown role tag")?,
-        StageClass::from_tag(&pstring(&v, "stage_class")?).ok_or("unknown stage class tag")?,
-        StageEffectClass::from_tag(&pstring(&v, "effect_class")?)
+    let bundle = RepairAuthorityV1 {
+        digest: embedded,
+        campaign: pstring(&v, "campaign")?,
+        repair_stage: pstring(&v, "repair_stage")?,
+        role: WorkerRole::from_tag(&pstring(&v, "role")?).ok_or("unknown role tag")?,
+        stage_class: StageClass::from_tag(&pstring(&v, "stage_class")?)
+            .ok_or("unknown stage class tag")?,
+        effect_class: StageEffectClass::from_tag(&pstring(&v, "effect_class")?)
             .ok_or("unknown effect class tag")?,
-        pdigest(&v, "standing")?,
-        pdigest(&v, "proposal_digest")?,
+        standing: pdigest(&v, "standing")?,
+        proposal_digest: pdigest(&v, "proposal_digest")?,
         consumption,
-        pstring(&v, "original_stage")?,
-        pdigest(&v, "original_proposal_digest")?,
-        pdigest(&v, "original_standing")?,
-        pdigest(&v, "original_consumption")?,
-        pdigest(&v, "rejected_review_receipt")?,
-        pdigest(&v, "adjudication")?,
-        AdjudicationVerdict::from_tag(&pstring(&v, "adjudication_verdict")?)
+        original_stage: pstring(&v, "original_stage")?,
+        original_proposal_digest: pdigest(&v, "original_proposal_digest")?,
+        original_standing: pdigest(&v, "original_standing")?,
+        original_consumption: pdigest(&v, "original_consumption")?,
+        rejected_review_receipt: pdigest(&v, "rejected_review_receipt")?,
+        adjudication: pdigest(&v, "adjudication")?,
+        adjudication_verdict: AdjudicationVerdict::from_tag(&pstring(&v, "adjudication_verdict")?)
             .ok_or("unknown adjudication verdict tag")?,
-        pstrings(&v, "finding_ids")?,
-        RepairScopeClass::from_tag(&pstring(&v, "scope_class")?)
+        finding_ids: pstrings(&v, "finding_ids")?,
+        scope_class: RepairScopeClass::from_tag(&pstring(&v, "scope_class")?)
             .ok_or("unknown scope class tag")?,
         repositories,
-        pstrings(&v, "allowed_paths")?,
-        ClockReading(expires_at_ms),
-        pstring(&v, "nonce")?,
-        pstrings(&v, "nonclaims")?,
-        pstring(&v, "verifier")?,
-    )
-    .map_err(|e| format!("artifact fails construction law: {e:?}"))?;
-    if bundle.digest != embedded {
+        allowed_paths: pstrings(&v, "allowed_paths")?,
+        expires_at: ClockReading(expires_at_ms),
+        nonce: pstring(&v, "nonce")?,
+        nonclaims: pstrings(&v, "nonclaims")?,
+        verifier: pstring(&v, "verifier")?,
+    };
+    if !bundle.stage_class.is_historical_repair()
+        || bundle.adjudication_verdict != AdjudicationVerdict::ExactRepair
+    {
+        return Err("artifact does not encode the retired repair-authority class".into());
+    }
+    if bundle.recompute_digest() != embedded {
         return Err("docket_repair_authority does not recompute from the artifact fields".into());
     }
     Ok(bundle)
@@ -255,22 +263,51 @@ pub fn parse(raw: &str) -> Result<RepairAuthorityV1, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::SqliteStore;
-    use gwr_runtime::services::campaign as svc;
 
-    /// Build a real adjudicated repair chain in a store and export the
-    /// bundle; the render/parse round-trip and the service verification
-    /// both hold.
+    fn archived_bundle() -> RepairAuthorityV1 {
+        let mut bundle = RepairAuthorityV1 {
+            digest: Sha256Digest::from_bytes([0; 32]),
+            campaign: "historical-campaign".into(),
+            repair_stage: "historical-repair".into(),
+            role: WorkerRole::Repair,
+            stage_class: StageClass::RecordsRepairStage,
+            effect_class: StageEffectClass::RecordsOnly,
+            standing: Sha256Digest::of_bytes(b"standing"),
+            proposal_digest: Sha256Digest::of_bytes(b"proposal"),
+            consumption: None,
+            original_stage: "original".into(),
+            original_proposal_digest: Sha256Digest::of_bytes(b"original-proposal"),
+            original_standing: Sha256Digest::of_bytes(b"original-standing"),
+            original_consumption: Sha256Digest::of_bytes(b"original-consumption"),
+            rejected_review_receipt: Sha256Digest::of_bytes(b"review"),
+            adjudication: Sha256Digest::of_bytes(b"adjudication"),
+            adjudication_verdict: AdjudicationVerdict::ExactRepair,
+            finding_ids: vec!["finding-1".into()],
+            scope_class: RepairScopeClass::RecordsOnly,
+            repositories: vec![RepoPin {
+                repository: RepositoryLocator::new("/repo"),
+                commit: CommitHash::new("72cb3b323fa286cd212378eadae4a42fe4dc093e"),
+                tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".into(),
+            }],
+            allowed_paths: vec!["docs/x.md".into()],
+            expires_at: ClockReading(10_000),
+            nonce: "historical-nonce".into(),
+            nonclaims: vec!["not-current-authority".into()],
+            verifier: "historical-verifier".into(),
+        };
+        bundle.digest = bundle.recompute_digest();
+        bundle
+    }
+
+    /// Historical canonical bytes round-trip, but this is only archival
+    /// integrity and no current service accepts the result as authority.
     #[test]
-    fn render_parse_round_trip_and_service_verification() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let bundle = crate::campaign_export::tests_support::adjudicated_repair_bundle(&mut store);
+    fn render_parse_round_trip_is_archive_integrity_only() {
+        let bundle = archived_bundle();
         let raw = render(&bundle);
         let parsed = parse(&raw).unwrap();
         assert_eq!(parsed, bundle);
         assert_eq!(sha256_hex(raw.as_bytes()), sha256_hex(raw.as_bytes()));
-        svc::verify_repair_authority(&mut store, &parsed, ClockReading(5_500), &bundle.verifier)
-            .unwrap();
         // Byte-level tampering refuses at parse or at digest recompute.
         let tampered = raw.replacen("docs/x.md", "docs/y.md", 1);
         assert!(parse(&tampered).is_err());
@@ -285,120 +322,5 @@ mod tests {
         // Unknown schema refuses.
         let raw2 = raw.replacen(REPAIR_AUTHORITY_SCHEMA, "gwr:other:v9", 1);
         assert!(parse(&raw2).is_err());
-    }
-}
-
-/// Shared fixture used by the export tests and the CLI-facing integration
-/// tests: a consumed, adjudicated original stage and an admitted repair
-/// standing, exported.
-#[cfg(test)]
-pub(crate) mod tests_support {
-    use gwr_core::campaign::adjudication::AdjudicationVerdict;
-    use gwr_core::campaign::authority::RepairAuthorityV1;
-    use gwr_core::campaign::proposal::{CampaignStageProposal, RepairBasis, RepoPin, StageBasis};
-    use gwr_core::campaign::standing::ExecutionContext;
-    use gwr_core::campaign::{RepairScopeClass, ReviewRequirement, StageClass, WorkerRole};
-    use gwr_core::digest::Sha256Digest;
-    use gwr_core::work_request::{ClockReading, CommitHash, RepositoryLocator};
-    use gwr_runtime::services::campaign as svc;
-
-    use crate::store::SqliteStore;
-
-    pub const COMMIT_A: &str = "72cb3b323fa286cd212378eadae4a42fe4dc093e";
-    pub const TREE_A: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    pub const REVIEW_RECEIPT: Sha256Digest = Sha256Digest::from_bytes([9; 32]);
-    pub const VERIFIER: &str = "gwr-local test";
-
-    pub fn adjudicated_repair_bundle(store: &mut SqliteStore) -> RepairAuthorityV1 {
-        let pin = RepoPin {
-            repository: RepositoryLocator::new("/repo"),
-            commit: CommitHash::new(COMMIT_A),
-            tree: TREE_A.into(),
-        };
-        let original = CampaignStageProposal::propose(
-            "upstream-0".into(),
-            "camp-1".into(),
-            "stage-a".into(),
-            StageClass::OperatorStage,
-            WorkerRole::Operator,
-            gwr_core::campaign::StageEffectClass::WorkspaceMutation,
-            StageBasis::RootAuthorization {
-                identity: "root-auth-1".into(),
-            },
-            vec![pin.clone()],
-            vec!["src/lib.rs".into(), "docs/x.md".into()],
-            "evidence-contract-1".into(),
-            "handoff-schema-1".into(),
-            ClockReading(10_000),
-            "nonce-1".into(),
-            String::new(),
-            ReviewRequirement::Required,
-            vec!["does-not-establish-correctness".into()],
-            None,
-            ClockReading(1_000),
-        )
-        .unwrap();
-        svc::propose_stage(store, &original).unwrap();
-        let standing = svc::admit(store, &original.digest, ClockReading(2_000)).unwrap();
-        let ctx = ExecutionContext {
-            campaign: "camp-1".into(),
-            stage: "stage-a".into(),
-            role: WorkerRole::Operator,
-            proposal_digest: original.digest,
-        };
-        svc::consume(store, &standing.digest(), &ctx, ClockReading(3_000)).unwrap();
-        svc::record_receipt(store, &standing.digest(), &REVIEW_RECEIPT).unwrap();
-        let adjudication = svc::adjudicate(
-            store,
-            "camp-1",
-            "stage-a",
-            &REVIEW_RECEIPT,
-            AdjudicationVerdict::ExactRepair,
-            "adjudicator-1",
-            vec!["finding-1".into()],
-            vec![],
-            ClockReading(4_000),
-        )
-        .unwrap();
-        let repair = CampaignStageProposal::propose(
-            "upstream-repair".into(),
-            "camp-1".into(),
-            "stage-a-repair".into(),
-            StageClass::RecordsRepairStage,
-            WorkerRole::Repair,
-            gwr_core::campaign::StageEffectClass::RecordsOnly,
-            StageBasis::PredecessorStage {
-                stage: "stage-a".into(),
-                adjudication_digest: adjudication.digest,
-            },
-            vec![pin],
-            vec!["docs/x.md".into()],
-            "evidence-contract-1".into(),
-            "handoff-schema-1".into(),
-            ClockReading(10_000),
-            "nonce-repair".into(),
-            String::new(),
-            ReviewRequirement::Required,
-            vec!["does-not-widen-scope".into()],
-            Some(RepairBasis {
-                original_stage: "stage-a".into(),
-                rejected_review_receipt: REVIEW_RECEIPT,
-                finding_ids: vec!["finding-1".into()],
-                scope_class: RepairScopeClass::RecordsOnly,
-                nonclaims: vec!["does-not-widen-scope".into()],
-                review_requirement: ReviewRequirement::Required,
-            }),
-            ClockReading(4_500),
-        )
-        .unwrap();
-        svc::propose_stage(store, &repair).unwrap();
-        let repair_standing = svc::admit(store, &repair.digest, ClockReading(5_000)).unwrap();
-        svc::export_repair_authority(
-            store,
-            &repair_standing.digest(),
-            ClockReading(5_500),
-            VERIFIER,
-        )
-        .unwrap()
     }
 }

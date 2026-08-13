@@ -1,5 +1,4 @@
-//! The repair-authority bundle (P1): an exact, content-addressed projection
-//! of the Docket records that authorize one repair stage's execution.
+//! Historical campaign-stage repair-authority bundle (P1).
 //!
 //! A repair stage must not execute because a local file claims an
 //! adjudication happened. This bundle is Docket's own read-only export: it
@@ -12,10 +11,10 @@
 //! SHA-256 alongside, per the cross-repository interop rule — consumers
 //! recompute and equality-check, nobody re-canonicalizes.
 //!
-//! Verification re-derives this exact bundle from the durable store and
-//! evaluates current law — standing and adjudication supersession, expiry,
-//! chain exactness, consumption state — so a stale, substituted, corrupted,
-//! or foreign artifact refuses.
+//! This record remains decodable so archived campaign evidence keeps its
+//! exact identity. The campaign-stage repair office is retired: current code
+//! cannot issue or verify one of these records as live authority. Governed
+//! repair uses the separate closed custody protocol.
 
 use crate::campaign::adjudication::AdjudicationVerdict;
 use crate::campaign::proposal::RepoPin;
@@ -73,93 +72,38 @@ pub struct RepairAuthorityV1 {
 }
 
 impl RepairAuthorityV1 {
-    /// Construct and content-address a bundle. A refusal creates nothing.
+    /// The former live constructor. Campaign-stage repair authority is
+    /// retired, so every invocation refuses before inspecting caller data.
+    /// Historical artifacts are decoded by the local archive codec and may
+    /// recompute their old content address, but that never validates them as
+    /// current authority.
     #[allow(clippy::too_many_arguments)]
     pub fn issue(
-        campaign: String,
-        repair_stage: String,
-        role: WorkerRole,
-        stage_class: StageClass,
-        effect_class: StageEffectClass,
-        standing: Sha256Digest,
-        proposal_digest: Sha256Digest,
-        consumption: Option<Sha256Digest>,
-        original_stage: String,
-        original_proposal_digest: Sha256Digest,
-        original_standing: Sha256Digest,
-        original_consumption: Sha256Digest,
-        rejected_review_receipt: Sha256Digest,
-        adjudication: Sha256Digest,
-        adjudication_verdict: AdjudicationVerdict,
-        finding_ids: Vec<String>,
-        scope_class: RepairScopeClass,
-        repositories: Vec<RepoPin>,
-        allowed_paths: Vec<String>,
-        expires_at: ClockReading,
-        nonce: String,
-        nonclaims: Vec<String>,
-        verifier: String,
+        _campaign: String,
+        _repair_stage: String,
+        _role: WorkerRole,
+        _stage_class: StageClass,
+        _effect_class: StageEffectClass,
+        _standing: Sha256Digest,
+        _proposal_digest: Sha256Digest,
+        _consumption: Option<Sha256Digest>,
+        _original_stage: String,
+        _original_proposal_digest: Sha256Digest,
+        _original_standing: Sha256Digest,
+        _original_consumption: Sha256Digest,
+        _rejected_review_receipt: Sha256Digest,
+        _adjudication: Sha256Digest,
+        _adjudication_verdict: AdjudicationVerdict,
+        _finding_ids: Vec<String>,
+        _scope_class: RepairScopeClass,
+        _repositories: Vec<RepoPin>,
+        _allowed_paths: Vec<String>,
+        _expires_at: ClockReading,
+        _nonce: String,
+        _nonclaims: Vec<String>,
+        _verifier: String,
     ) -> Result<Self, CampaignRefusal> {
-        if !stage_class.is_repair() {
-            return Err(CampaignRefusal::RepairAuthorityMismatch {
-                field: "stage_class",
-            });
-        }
-        if adjudication_verdict != AdjudicationVerdict::ExactRepair {
-            return Err(CampaignRefusal::RepairNotAuthorized {
-                verdict: adjudication_verdict.tag(),
-            });
-        }
-        let digest = Self::transcribe(
-            &campaign,
-            &repair_stage,
-            role,
-            stage_class,
-            effect_class,
-            &standing,
-            &proposal_digest,
-            consumption.as_ref(),
-            &original_stage,
-            &original_proposal_digest,
-            &original_standing,
-            &original_consumption,
-            &rejected_review_receipt,
-            &adjudication,
-            adjudication_verdict,
-            &finding_ids,
-            scope_class,
-            &repositories,
-            &allowed_paths,
-            expires_at,
-            &nonce,
-            &nonclaims,
-        );
-        Ok(Self {
-            digest,
-            campaign,
-            repair_stage,
-            role,
-            stage_class,
-            effect_class,
-            standing,
-            proposal_digest,
-            consumption,
-            original_stage,
-            original_proposal_digest,
-            original_standing,
-            original_consumption,
-            rejected_review_receipt,
-            adjudication,
-            adjudication_verdict,
-            finding_ids,
-            scope_class,
-            repositories,
-            allowed_paths,
-            expires_at,
-            nonce,
-            nonclaims,
-            verifier,
-        })
+        Err(CampaignRefusal::LegacyRepairRouteRetired)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -273,36 +217,38 @@ mod tests {
     use crate::work_request::{CommitHash, RepositoryLocator};
 
     fn bundle() -> RepairAuthorityV1 {
-        RepairAuthorityV1::issue(
-            "campaign-1".into(),
-            "stage-a-repair".into(),
-            WorkerRole::Repair,
-            StageClass::RecordsRepairStage,
-            StageEffectClass::RecordsOnly,
-            Sha256Digest::of_bytes(b"standing"),
-            Sha256Digest::of_bytes(b"proposal"),
-            None,
-            "stage-a".into(),
-            Sha256Digest::of_bytes(b"original-proposal"),
-            Sha256Digest::of_bytes(b"original-standing"),
-            Sha256Digest::of_bytes(b"original-consumption"),
-            Sha256Digest::from_bytes([9; 32]),
-            Sha256Digest::of_bytes(b"adjudication"),
-            AdjudicationVerdict::ExactRepair,
-            vec!["finding-1".into()],
-            RepairScopeClass::RecordsOnly,
-            vec![RepoPin {
+        let mut archived = RepairAuthorityV1 {
+            digest: Sha256Digest::from_bytes([0; 32]),
+            campaign: "campaign-1".into(),
+            repair_stage: "stage-a-repair".into(),
+            role: WorkerRole::Repair,
+            stage_class: StageClass::RecordsRepairStage,
+            effect_class: StageEffectClass::RecordsOnly,
+            standing: Sha256Digest::of_bytes(b"standing"),
+            proposal_digest: Sha256Digest::of_bytes(b"proposal"),
+            consumption: None,
+            original_stage: "stage-a".into(),
+            original_proposal_digest: Sha256Digest::of_bytes(b"original-proposal"),
+            original_standing: Sha256Digest::of_bytes(b"original-standing"),
+            original_consumption: Sha256Digest::of_bytes(b"original-consumption"),
+            rejected_review_receipt: Sha256Digest::from_bytes([9; 32]),
+            adjudication: Sha256Digest::of_bytes(b"adjudication"),
+            adjudication_verdict: AdjudicationVerdict::ExactRepair,
+            finding_ids: vec!["finding-1".into()],
+            scope_class: RepairScopeClass::RecordsOnly,
+            repositories: vec![RepoPin {
                 repository: RepositoryLocator::new("/repo"),
                 commit: CommitHash::new(COMMIT),
                 tree: TREE.into(),
             }],
-            vec!["docs/x.md".into()],
-            ClockReading(10_000),
-            "nonce-1".into(),
-            vec!["does-not-widen-scope".into()],
-            "gwr-local 0.1.0".into(),
-        )
-        .unwrap()
+            allowed_paths: vec!["docs/x.md".into()],
+            expires_at: ClockReading(10_000),
+            nonce: "nonce-1".into(),
+            nonclaims: vec!["does-not-widen-scope".into()],
+            verifier: "gwr-local 0.1.0".into(),
+        };
+        archived.digest = archived.recompute_digest();
+        archived
     }
 
     #[test]
@@ -331,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn non_repair_classes_and_other_verdicts_issue_nothing() {
+    fn the_retired_live_constructor_always_issues_nothing() {
         let mut b = bundle();
         b.stage_class = StageClass::OperatorStage;
         assert!(matches!(
@@ -360,9 +306,7 @@ mod tests {
                 b.nonclaims.clone(),
                 b.verifier.clone(),
             ),
-            Err(CampaignRefusal::RepairAuthorityMismatch {
-                field: "stage_class"
-            })
+            Err(CampaignRefusal::LegacyRepairRouteRetired)
         ));
         assert!(matches!(
             RepairAuthorityV1::issue(
@@ -390,7 +334,7 @@ mod tests {
                 vec![],
                 "v".into(),
             ),
-            Err(CampaignRefusal::RepairNotAuthorized { .. })
+            Err(CampaignRefusal::LegacyRepairRouteRetired)
         ));
     }
 }

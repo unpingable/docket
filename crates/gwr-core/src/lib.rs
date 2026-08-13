@@ -13,6 +13,7 @@ pub mod campaign;
 pub mod digest;
 pub mod domain;
 pub mod effect_spec;
+pub mod governed_repair;
 pub mod ids;
 pub mod lifecycle;
 pub mod observation_plan;

@@ -1,10 +1,11 @@
 //! Adjudication of a campaign-stage review verdict, as a durable receipt.
 //!
-//! A verdict is continue, exact repair, or refuse. The receipt binds the
-//! campaign, the stage, the exact review receipt adjudicated, the verdict,
-//! the adjudicator, the findings, and the residual obligations. Residuals
-//! are recorded and preserved; following the runtime's reconciliation law,
-//! there is no discharge API and nothing here ever removes one.
+//! Current verdicts are continue or refuse. The historical `exact_repair`
+//! tag remains decodable for old receipts but cannot be newly adjudicated;
+//! repair now uses the separate governed-repair custody protocol. A receipt
+//! binds the campaign, stage, exact review receipt, adjudicator, findings,
+//! and residual obligations. Residuals are preserved; there is no discharge
+//! API and nothing here ever removes one.
 
 use crate::digest::{Sha256Digest, Transcript};
 use crate::refusal::CampaignRefusal;
@@ -16,6 +17,8 @@ pub const ADJUDICATION_TRANSCRIPT: &str = "gwr:campaign-stage-adjudication:v1";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AdjudicationVerdict {
     Continue,
+    /// Historical campaign-stage verdict. Decode-only; current adjudication
+    /// returns [`CampaignRefusal::LegacyRepairRouteRetired`].
     ExactRepair,
     Refuse,
 }
@@ -79,6 +82,9 @@ impl AdjudicationReceipt {
         residuals: Vec<ResidualStatement>,
         adjudicated_at: ClockReading,
     ) -> Result<Self, CampaignRefusal> {
+        if verdict == AdjudicationVerdict::ExactRepair {
+            return Err(CampaignRefusal::LegacyRepairRouteRetired);
+        }
         let present = |field: &'static str, value: &str| -> Result<(), CampaignRefusal> {
             if value.is_empty() {
                 Err(CampaignRefusal::EmptyField { field })
@@ -171,7 +177,7 @@ mod tests {
             "campaign-1".into(),
             "stage-a".into(),
             Sha256Digest::of_bytes(b"review"),
-            AdjudicationVerdict::ExactRepair,
+            AdjudicationVerdict::Continue,
             "adjudicator-1".into(),
             vec!["finding-1".into()],
             vec![ResidualStatement {
@@ -189,6 +195,19 @@ mod tests {
         ] {
             assert_eq!(AdjudicationVerdict::from_tag(verdict.tag()), Some(verdict));
         }
+        assert_eq!(
+            AdjudicationReceipt::adjudicate(
+                "campaign-1".into(),
+                "stage-a".into(),
+                Sha256Digest::of_bytes(b"review"),
+                AdjudicationVerdict::ExactRepair,
+                "adjudicator-1".into(),
+                vec!["finding-1".into()],
+                vec![],
+                ClockReading(5_000),
+            ),
+            Err(CampaignRefusal::LegacyRepairRouteRetired)
+        );
     }
 
     #[test]

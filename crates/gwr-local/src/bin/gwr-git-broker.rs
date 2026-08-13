@@ -1,6 +1,6 @@
 //! The Git effect broker binary.
 //!
-//! Usage: gwr-git-broker <envelope-file> <patch-file> <journal-file>
+//! Usage: `gwr-git-broker <envelope-file> <patch-file> <journal-file>`
 //!
 //! Reads one persisted dispatch envelope, applies the exact patch through a
 //! temporary index, and performs the atomic target-ref transition, journaling
@@ -8,7 +8,7 @@
 //! `COMMITTED <result> <previous>` or `REFUSED <ground>`. Anything else —
 //! including death mid-run — is the caller's uncertainty to record.
 //!
-//! GWR_BROKER_CRASH_AFTER=<phase> aborts the process immediately after the
+//! `GWR_BROKER_CRASH_AFTER=<phase>` aborts the process immediately after the
 //! named journal phase is written (failure injection for tests).
 
 use gwr_local::broker::{

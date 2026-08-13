@@ -188,6 +188,10 @@ pub enum CampaignRefusal {
     /// for it (new source scope, architecture, authority, basis, candidate,
     /// freeze, qualification, certificate, registry, deployment).
     StageClassNeverAdmitted { class: String },
+    /// The old campaign-stage `exact_repair` standing/export office is
+    /// historical only. Its records remain decodable, but no live proposal,
+    /// adjudication, standing, or repair-authority artifact may be issued.
+    LegacyRepairRouteRetired,
     /// A required proposal field was empty.
     EmptyField { field: &'static str },
     /// A repository pin's commit or tree is not an exact lowercase-hex object

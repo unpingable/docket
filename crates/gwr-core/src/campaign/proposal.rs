@@ -68,8 +68,7 @@ pub enum StageBasis {
     },
 }
 
-/// What a repair proposal cites: the rejected review, its findings, the
-/// original stage, and the repair's own nonclaims and review requirement.
+/// Decode-only shape of a historical campaign-stage repair basis.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RepairBasis {
     /// The stage whose rejected review this repair answers.
@@ -114,8 +113,8 @@ pub struct CampaignStageProposal {
 }
 
 impl CampaignStageProposal {
-    /// Validate and content-address a proposal. Every refusal is typed and
-    /// creates nothing.
+    /// Validate and content-address a current proposal. Historical repair
+    /// classes or a repair basis refuse before any digest is issued.
     #[allow(clippy::too_many_arguments)]
     pub fn propose(
         upstream_digest: String,
@@ -137,6 +136,9 @@ impl CampaignStageProposal {
         repair: Option<RepairBasis>,
         proposed_at: ClockReading,
     ) -> Result<Self, CampaignRefusal> {
+        if stage_class.is_historical_repair() || repair.is_some() {
+            return Err(CampaignRefusal::LegacyRepairRouteRetired);
+        }
         let present = |field: &'static str, value: &str| -> Result<(), CampaignRefusal> {
             if value.is_empty() {
                 Err(CampaignRefusal::EmptyField { field })

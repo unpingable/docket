@@ -8,7 +8,7 @@ use gwr_core::authorization::{
     AcceptedIssuance, AuthorizationSource, UpstreamPremise, UpstreamResidual,
     UpstreamResidualStatus,
 };
-use gwr_core::campaign::adjudication::AdjudicationReceipt;
+use gwr_core::campaign::adjudication::{AdjudicationReceipt, AdjudicationVerdict};
 use gwr_core::campaign::proposal::CampaignStageProposal;
 use gwr_core::campaign::standing::{
     CampaignStageConsumption, CampaignStageStanding, CampaignStandingState,
@@ -41,6 +41,9 @@ const MIGRATION_0003: &str = include_str!("../../migrations/0003_authz_issuance.
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_repository_registry.sql");
 const MIGRATION_0005: &str = include_str!("../../migrations/0005_campaign_stage_standing.sql");
 const MIGRATION_0006: &str = include_str!("../../migrations/0006_governed_loop_custody.sql");
+const MIGRATION_0007: &str = include_str!("../../migrations/0007_governed_repair_custody.sql");
+const MIGRATION_0008: &str =
+    include_str!("../../migrations/0008_governed_executor_config_binding.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -147,6 +150,24 @@ impl SqliteStore {
         // It shares neither authority nor storage with campaign-stage
         // standing, AG's spend journal, or executor-local idempotency state.
         conn.execute_batch(MIGRATION_0006).map_err(backend)?;
+        // 0007 appends terminal, non-authorizing governed-repair checkpoints.
+        // It deliberately cannot convert historical campaign exact_repair
+        // artifacts into current execution custody.
+        conn.execute_batch(MIGRATION_0007).map_err(backend)?;
+        // 0008 makes executor configuration an independent exact binding.
+        // Historical rows are intentionally not inferred from a mutable path;
+        // a NULL config digest makes their consequence path fail closed.
+        let has_executor_config_digest: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='executor_config_digest'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if has_executor_config_digest == 0 {
+            conn.execute_batch(MIGRATION_0008).map_err(backend)?;
+        }
         Ok(())
     }
 
@@ -2537,6 +2558,9 @@ impl Store for SqliteStore {
     // typed corruption error, never a silently altered record.
 
     fn record_campaign_proposal(&mut self, p: &CampaignStageProposal) -> Result<(), StoreError> {
+        if p.stage_class.is_historical_repair() || p.repair.is_some() {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         let (basis_kind, basis_identity, basis_stage, basis_adjudication) = encode_basis(&p.basis);
         let changed = self
             .conn
@@ -2639,6 +2663,9 @@ impl Store for SqliteStore {
     }
 
     fn record_campaign_standing(&mut self, s: &CampaignStageStanding) -> Result<(), StoreError> {
+        if s.stage_class().is_historical_repair() {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         let changed = self
             .conn
             .execute(
@@ -2752,6 +2779,12 @@ impl Store for SqliteStore {
         &mut self,
         c: &CampaignStageConsumption,
     ) -> Result<(), StoreError> {
+        if self
+            .get_campaign_standing(&c.standing)?
+            .is_some_and(|standing| standing.stage_class().is_historical_repair())
+        {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         let changed = self
             .conn
             .execute(
@@ -2801,6 +2834,9 @@ impl Store for SqliteStore {
         standing: &CampaignStageStanding,
         record: &CampaignStageConsumption,
     ) -> Result<CampaignBurn, StoreError> {
+        if standing.stage_class().is_historical_repair() {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         // One immediate transaction: SQLite serializes writers, so the
         // check-and-insert below is atomic across threads, processes, and
         // service instances. Exactly one concurrent caller inserts the row.
@@ -2862,6 +2898,12 @@ impl Store for SqliteStore {
         &mut self,
         standing: &Sha256Digest,
     ) -> Result<(), StoreError> {
+        if self
+            .get_campaign_standing(standing)?
+            .is_some_and(|value| value.stage_class().is_historical_repair())
+        {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         self.conn
             .execute(
                 "UPDATE campaign_stage_consumption SET effect_completed=1 WHERE standing=?1",
@@ -2876,6 +2918,12 @@ impl Store for SqliteStore {
         standing: &Sha256Digest,
         receipt: &Sha256Digest,
     ) -> Result<(), StoreError> {
+        if self
+            .get_campaign_standing(standing)?
+            .is_some_and(|value| value.stage_class().is_historical_repair())
+        {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         let existing: Option<Option<String>> = self
             .conn
             .query_row(
@@ -2926,6 +2974,9 @@ impl Store for SqliteStore {
     }
 
     fn record_campaign_adjudication(&mut self, a: &AdjudicationReceipt) -> Result<(), StoreError> {
+        if a.verdict == AdjudicationVerdict::ExactRepair {
+            return Err(StoreError::LegacyCampaignRepairRouteRetired);
+        }
         let tx = self.tx()?;
         let changed = tx
             .execute(
