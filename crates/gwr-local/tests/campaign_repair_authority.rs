@@ -66,3 +66,56 @@ fn help_labels_historical_verbs_as_retired_and_does_not_offer_exact_repair() {
     assert!(stdout.contains("campaign adjudicate       Record a verdict (continue|refuse)"));
     assert!(!stdout.contains("continue|exact-repair|refuse"));
 }
+
+fn assert_source_census(source: &str, needle: &str, expected: usize) {
+    assert_eq!(
+        source.matches(needle).count(),
+        expected,
+        "load-bearing governed-repair source census changed for {needle:?}"
+    );
+}
+
+#[test]
+fn structural_census_keeps_one_governed_path_and_retired_route_fences() {
+    let loop_source = include_str!("../src/governed_loop.rs");
+    let repair_source = include_str!("../src/governed_repair.rs");
+    let retired_authority = include_str!("../../gwr-core/src/campaign/authority.rs");
+    let campaign_service = include_str!("../../gwr-runtime/src/services/campaign.rs");
+
+    // Exactly one executor-result ingress performs the scope census and one
+    // governed branch delegates to the sole Store-owned seal operation.
+    assert_source_census(
+        loop_source,
+        "governed_repair::validate_effect_journal_for_issuance(",
+        1,
+    );
+    assert_source_census(loop_source, "governed_repair::seal_requirement(", 1);
+    assert_source_census(
+        repair_source,
+        "governed-repair-blocked-effect-was-performed",
+        1,
+    );
+    assert_source_census(
+        repair_source,
+        "transaction_with_behavior(TransactionBehavior::Immediate)",
+        1,
+    );
+
+    // Historical campaign-stage repair records remain decodable, but their
+    // constructor and adjudication route remain structurally non-production.
+    assert_source_census(
+        retired_authority,
+        "Err(CampaignRefusal::LegacyRepairRouteRetired)",
+        3,
+    );
+    assert_source_census(
+        campaign_service,
+        "if verdict == AdjudicationVerdict::ExactRepair",
+        1,
+    );
+    assert_source_census(
+        campaign_service,
+        "Err(CampaignRefusal::LegacyRepairRouteRetired.into())",
+        7,
+    );
+}

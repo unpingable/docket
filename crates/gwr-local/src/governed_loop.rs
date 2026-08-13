@@ -27,6 +27,15 @@ pub const SIGNED_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.signed-issuance/v2
 pub const AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.issuance/v2";
 pub const CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 pub const SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
+
+#[cfg(test)]
+thread_local! {
+    /// Logical process-loss seam used only to prove reopen behaviour after an
+    /// executor response exists in memory but before Docket seals it. This is
+    /// not a claim about physical power-loss durability.
+    static CRASH_AFTER_EXECUTOR_RESULT_BEFORE_SEAL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-standing-request/v1";
 pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
@@ -523,6 +532,13 @@ pub fn accept_with_checkpoint_verifier(
         &dispatch,
     ) {
         Ok(outcome) => {
+            #[cfg(test)]
+            CRASH_AFTER_EXECUTOR_RESULT_BEFORE_SEAL.with(|failpoint| {
+                assert!(
+                    !failpoint.replace(false),
+                    "injected logical crash after executor result before Docket seal"
+                );
+            });
             store.record_executor_outcome(&issuance.issuance, &custody, outcome, now_unix_ms()?)?
         }
         Err(error) => store.record_indeterminate(
@@ -2395,6 +2411,116 @@ mod tests {
             reopened,
             DocketReconciliationWireV1::GovernedRepairRequired { .. }
         ));
+    }
+
+    #[test]
+    fn logical_crash_after_executor_result_before_seal_reopens_without_repeat_execution() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        CRASH_AFTER_EXECUTOR_RESULT_BEFORE_SEAL.with(|failpoint| failpoint.set(true));
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            );
+        }));
+        assert!(crashed.is_err(), "logical crash seam must be reached");
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("invocations")).unwrap(),
+            b"x",
+            "the consequence-bearing execute operation ran exactly once"
+        );
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        let status: String = connection
+            .query_row("SELECT status FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let checkpoints: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_repair_checkpoint",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), checkpoints), ("accepted", 0));
+        drop(connection);
+
+        let reopened = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            Some(&fixture.custody.attempt),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened,
+            DocketReconciliationWireV1::GovernedRepairRequired { .. }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("invocations")).unwrap(),
+            b"x",
+            "reopen uses reconcile and never repeats execute"
+        );
+    }
+
+    #[test]
+    fn governed_requirement_with_blocked_effect_in_journal_refuses_without_terminal_write() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        let response_path = fixture.executor_program.with_extension("response");
+        let mut response: ExecutorOutcomeWireV1 =
+            serde_json::from_slice(&std::fs::read(&response_path).unwrap()).unwrap();
+        response.effect_journal.push(EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/new.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("forbidden-blocked-effect"),
+        });
+        std::fs::write(&response_path, serde_json::to_vec(&response).unwrap()).unwrap();
+
+        assert_eq!(
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap_err(),
+            "governed-repair-unauthorized-effect-observed"
+        );
+        let connection = Connection::open(&fixture.database).unwrap();
+        let status: String = connection
+            .query_row("SELECT status FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let checkpoints: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_repair_checkpoint",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let executor_results: i64 = connection
+            .query_row("SELECT COUNT(*) FROM governed_executor_result", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), checkpoints, executor_results),
+            ("accepted", 0, 0),
+            "an unauthorized observed effect must not be laundered into a sealed halt or settlement"
+        );
     }
 
     #[test]
