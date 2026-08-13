@@ -373,7 +373,7 @@ fn writer_lock_held_briefly_loser_waits_then_gets_typed_classification() {
     let db_b = db.clone();
     let standing_digest = standing.digest();
     let loser = std::thread::spawn(move || {
-        let mut store = SqliteStore::open(&db_b).unwrap();
+        let mut store = SqliteStore::open(&db_b).map_err(CampaignError::from)?;
         svc::consume(&mut store, &standing_digest, &ctx, ClockReading(3_000))
     });
     std::thread::sleep(std::time::Duration::from_millis(1_500));
@@ -416,7 +416,7 @@ fn writer_lock_held_beyond_timeout_fails_bounded_never_succeeds() {
     let db_b = db.clone();
     let standing_digest = standing.digest();
     let loser = std::thread::spawn(move || {
-        let mut store = SqliteStore::open(&db_b).unwrap();
+        let mut store = SqliteStore::open(&db_b).map_err(CampaignError::from)?;
         svc::consume(&mut store, &standing_digest, &ctx, ClockReading(3_000))
     });
     // Hold past the five-second budget.

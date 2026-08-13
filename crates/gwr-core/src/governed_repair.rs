@@ -170,16 +170,16 @@ impl CanonicalEffectScopeV1 {
         Ok(transcript.finalize())
     }
 
-    pub fn fully_admits(&self, delta: &RequestedEffectDeltaV1) -> bool {
+    pub fn overlaps(&self, delta: &RequestedEffectDeltaV1) -> bool {
         self.effect_class == delta.effect_class
-            && delta.resources.iter().all(|requested| {
+            && delta.resources.iter().any(|requested| {
                 self.resources.iter().any(|admitted| {
                     admitted.resource == requested.resource
                         && admitted.path == requested.path
                         && requested
                             .operations
                             .iter()
-                            .all(|operation| admitted.operations.contains(operation))
+                            .any(|operation| admitted.operations.contains(operation))
                 })
             })
     }
@@ -215,7 +215,11 @@ impl GovernedRepairRequirementV1 {
         let transcript = match self {
             Self::ScopeExpansion(value) => {
                 value.requested_delta.validate()?;
-                if binding.original_scope.fully_admits(&value.requested_delta) {
+                // An exact delta is strictly additive. It cannot redundantly
+                // carry even one operation already admitted by the immutable
+                // original scope, because that would make the approved
+                // expansion ambiguous under later set composition.
+                if binding.original_scope.overlaps(&value.requested_delta) {
                     return Err(GovernedRepairRefusal::DeltaAlreadyAuthorized);
                 }
                 if value.requested_delta.effect_class != value.blocked_effect.effect_class
@@ -506,6 +510,48 @@ mod tests {
             readjudication.validate(20),
             Err(GovernedRepairRefusal::BindingMismatch)
         );
+    }
+
+    #[test]
+    fn partially_overlapping_delta_refuses_instead_of_laundering_old_authority() {
+        let delta = CanonicalEffectScopeV1 {
+            schema: CANONICAL_EFFECT_SCOPE_SCHEMA_V1.to_owned(),
+            effect_class: "repository-write/v1".to_owned(),
+            resources: vec![EffectResourceV1 {
+                resource: "nq".to_owned(),
+                path: "crates/nq-store/src/lib.rs".to_owned(),
+                operations: vec![
+                    CanonicalEffectOperationV1::Modify,
+                    CanonicalEffectOperationV1::Delete,
+                ],
+            }],
+        };
+        let expansion = GovernedRepairRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
+            binding: binding(),
+            requested_delta_digest: digest(17),
+            requested_delta: delta,
+            blocked_effect: BlockedEffectV1 {
+                effect_class: "repository-write/v1".to_owned(),
+                resource: "nq".to_owned(),
+                path: "crates/nq-store/src/lib.rs".to_owned(),
+                operation: CanonicalEffectOperationV1::Delete,
+            },
+            reason: digest(18),
+            dependency_evidence: vec![digest(15)],
+            unauthorized_effect_not_performed: true,
+            limitations: vec![digest(19)],
+        });
+        assert_eq!(
+            expansion.validate(20),
+            Err(GovernedRepairRefusal::DeltaAlreadyAuthorized)
+        );
+
+        let mut strictly_additive = expansion;
+        let GovernedRepairRequirementV1::ScopeExpansion(value) = &mut strictly_additive else {
+            unreachable!()
+        };
+        value.requested_delta.resources[0].operations = vec![CanonicalEffectOperationV1::Delete];
+        assert!(strictly_additive.validate(20).is_ok());
     }
 
     #[test]

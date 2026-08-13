@@ -11,6 +11,7 @@ use crate::governed_repair::{
     self, EffectJournalEntryWireV1, ExecutorGovernedRepairRequirementWireV1,
     ImmutableWorkCheckpointWireV1, StoreSealedGovernedRepairResultV1,
 };
+use gwr_core::digest::{Sha256Digest, Transcript};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -27,6 +28,7 @@ pub const SIGNED_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.signed-issuance/v2
 pub const AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.issuance/v2";
 pub const CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 pub const SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
+pub const ISSUANCE_REFUSAL_SCHEMA_V1: &str = "docket.governed-loop.issuance-refusal/v1";
 
 #[cfg(test)]
 thread_local! {
@@ -41,6 +43,7 @@ pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
 
 const SIGNATURE_PREFIX_V2: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v2\0";
+const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXECUTOR_CONFIG_BYTES: u64 = 512 * 1024 * 1024;
 static NEXT_EXECUTOR_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
@@ -148,6 +151,8 @@ pub struct AgIssuanceWireV2 {
     pub proposal: String,
     pub work_schema: String,
     pub work: String,
+    pub nonclaims: Vec<String>,
+    pub expires_at_unix_ms: u64,
     pub subject: String,
     pub effect_scope: CanonicalEffectScopeWireV1,
     pub effect_scope_digest: String,
@@ -301,10 +306,50 @@ pub struct ExecutorOutcomeWireV1 {
     pub governed_repair: Option<ExecutorGovernedRepairRequirementWireV1>,
 }
 
+/// Terminal Docket result for one authenticated canonical AG issuance that
+/// was refused before custody. It is sealed evidence, never standing or a
+/// continuation permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocketIssuanceRefusalClassWireV1 {
+    IssuanceInvalid,
+    IssuanceExpired,
+    CheckpointInvalid,
+    StandingInvalid,
+    InstrumentSubstitution,
+}
+
+impl DocketIssuanceRefusalClassWireV1 {
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::IssuanceInvalid => "issuance_invalid",
+            Self::IssuanceExpired => "issuance_expired",
+            Self::CheckpointInvalid => "checkpoint_invalid",
+            Self::StandingInvalid => "standing_invalid",
+            Self::InstrumentSubstitution => "instrument_substitution",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketIssuanceRefusalWireV1 {
+    pub schema: String,
+    pub refusal: String,
+    pub issuance: String,
+    pub campaign: String,
+    pub occurrence: String,
+    pub refusal_class: DocketIssuanceRefusalClassWireV1,
+    pub reason_code: String,
+    pub evidence: String,
+    pub refused_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "record", rename_all = "snake_case")]
 pub enum DocketExecutionResponseWireV1 {
     Custody(DocketCustodyWireV1),
+    Refused(DocketIssuanceRefusalWireV1),
     GovernedRepairRequired {
         custody: DocketCustodyWireV1,
         result: Box<StoreSealedGovernedRepairResultV1>,
@@ -349,6 +394,7 @@ pub struct IndeterminateOutcomeWireV1 {
 )]
 pub enum DocketReconciliationWireV1 {
     NotAccepted,
+    Refused(DocketIssuanceRefusalWireV1),
     Accepted(DocketCustodyWireV1),
     Settled {
         custody: DocketCustodyWireV1,
@@ -379,12 +425,56 @@ struct CustodyRecordV1 {
     indeterminate: Option<IndeterminateOutcomeWireV1>,
 }
 
+#[derive(Clone, Debug)]
+struct IssuanceRefusalRecordV1 {
+    refusal: DocketIssuanceRefusalWireV1,
+    signed_body_b64: String,
+    authentication: IssuanceAuthenticationWireV1,
+}
+
+#[derive(Clone, Debug)]
+struct RefusalDraftV1 {
+    refusal_class: DocketIssuanceRefusalClassWireV1,
+    reason_code: String,
+    evidence: String,
+}
+
+enum IntakeValidationErrorV1 {
+    Transient(String),
+    Refusal(RefusalDraftV1),
+}
+
+enum JsonInvocationErrorV1 {
+    Unavailable(String),
+    InvalidResponse {
+        reason_code: String,
+        evidence: String,
+    },
+}
+
 /// Authenticates the exact AG issuance bytes against explicit Docket trust.
 pub fn verify_signed_issuance(
     envelope_bytes: &[u8],
     trust_bytes: &[u8],
 ) -> Result<(SignedIssuanceEnvelopeWireV1, AgIssuanceWireV2), String> {
+    let (envelope, issuance, _) = authenticate_signed_issuance(envelope_bytes, trust_bytes)?;
+    validate_issuance(&issuance)?;
+    Ok((envelope, issuance))
+}
+
+fn authenticate_signed_issuance(
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+) -> Result<(SignedIssuanceEnvelopeWireV1, AgIssuanceWireV2, Vec<u8>), String> {
     let envelope: SignedIssuanceEnvelopeWireV1 = strict_json(envelope_bytes, "issuance-envelope")?;
+    let canonical_envelope = serde_json::to_vec(
+        &serde_json::to_value(&envelope)
+            .map_err(|error| format!("issuance-envelope-canonical-value:{error}"))?,
+    )
+    .map_err(|error| format!("issuance-envelope-canonical:{error}"))?;
+    if canonical_envelope != envelope_bytes {
+        return Err("governed-issuance-envelope-not-canonical".to_owned());
+    }
     if envelope.schema != SIGNED_ISSUANCE_SCHEMA_V2 {
         return Err("governed-issuance-envelope-schema".to_owned());
     }
@@ -410,14 +500,13 @@ pub fn verify_signed_issuance(
         .verify(&signed, &signature)
         .map_err(|_| "governed-issuance-signature-invalid".to_owned())?;
     let issuance: AgIssuanceWireV2 = strict_json(&body, "issuance-body")?;
-    validate_issuance(&issuance)?;
     let canonical_value: serde_json::Value = strict_json(&body, "issuance-canonical-value")?;
     let canonical = serde_json::to_vec(&canonical_value)
         .map_err(|error| format!("issuance-canonical:{error}"))?;
     if canonical != body {
         return Err("governed-issuance-body-not-canonical".to_owned());
     }
-    Ok((envelope, issuance))
+    Ok((envelope, issuance, body))
 }
 
 /// Accepts one exact issuance, consumes fresh Docket standing transactionally,
@@ -453,8 +542,35 @@ pub fn accept_with_checkpoint_verifier(
     executor_config: &Path,
     checkpoint_verifier: Option<&Path>,
 ) -> Result<DocketExecutionResponseWireV1, String> {
-    let (envelope, issuance) = verify_signed_issuance(envelope_bytes, trust_bytes)?;
+    let (envelope, issuance, authenticated_body) =
+        authenticate_signed_issuance(envelope_bytes, trust_bytes)?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
+    if let Err(reason_code) = validate_issuance(&issuance) {
+        validate_refusable_issuance_identity(&issuance)?;
+        if let Some(existing) = store.get_refusal(&issuance.issuance)? {
+            require_same_refusal_envelope(&existing, &envelope, &issuance)?;
+            return Ok(DocketExecutionResponseWireV1::Refused(existing.refusal));
+        }
+        return store.refuse(
+            &envelope,
+            &issuance,
+            RefusalDraftV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::IssuanceInvalid,
+                evidence: refusal_evidence(
+                    &issuance,
+                    DocketIssuanceRefusalClassWireV1::IssuanceInvalid,
+                    &reason_code,
+                    &authenticated_body,
+                )?,
+                reason_code,
+            },
+            now_unix_ms()?,
+        );
+    }
+    if let Some(existing) = store.get_refusal(&issuance.issuance)? {
+        require_same_refusal_envelope(&existing, &envelope, &issuance)?;
+        return Ok(DocketExecutionResponseWireV1::Refused(existing.refusal));
+    }
     if let Some(existing) = store.get(&issuance.issuance)? {
         require_same_envelope(&existing, &envelope, &issuance)?;
         // Starting-checkpoint correspondence is process-local evidence.  It
@@ -474,19 +590,76 @@ pub fn accept_with_checkpoint_verifier(
     }
 
     let now = now_unix_ms()?;
-    let prepared_executor = prepare_executor(executor, executor_config, &issuance.work)?;
-    let executor_binding = prepared_executor.binding.clone();
-    verify_starting_checkpoint(&issuance, checkpoint_verifier, now)?;
-    let standing: ExecutionStandingResolutionV1 = invoke_json(
-        standing_resolver,
-        &[],
-        &ExecutionStandingRequestV1 {
-            schema: STANDING_REQUEST_SCHEMA_V1.to_owned(),
-            issuance: issuance.clone(),
-            now_unix_ms: now,
-        },
-    )?;
-    validate_standing(&issuance, &standing, now)?;
+    if let Err(reason_code) = validate_fresh_issuance(&issuance, now) {
+        return store.refuse(
+            &envelope,
+            &issuance,
+            RefusalDraftV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::IssuanceExpired,
+                evidence: refusal_evidence(
+                    &issuance,
+                    DocketIssuanceRefusalClassWireV1::IssuanceExpired,
+                    &reason_code,
+                    &issuance.expires_at_unix_ms.to_be_bytes(),
+                )?,
+                reason_code,
+            },
+            now,
+        );
+    }
+    if let Err(error) = verify_starting_checkpoint_for_intake(&issuance, checkpoint_verifier, now) {
+        return match error {
+            IntakeValidationErrorV1::Transient(error) => Err(error),
+            IntakeValidationErrorV1::Refusal(draft) => {
+                store.refuse(&envelope, &issuance, draft, now)
+            }
+        };
+    }
+    let (standing, standing_bytes): (ExecutionStandingResolutionV1, Vec<u8>) =
+        match invoke_json_classified(
+            standing_resolver,
+            &[],
+            &ExecutionStandingRequestV1 {
+                schema: STANDING_REQUEST_SCHEMA_V1.to_owned(),
+                issuance: issuance.clone(),
+                now_unix_ms: now,
+            },
+        ) {
+            Ok(value) => value,
+            Err(JsonInvocationErrorV1::Unavailable(error)) => return Err(error),
+            Err(JsonInvocationErrorV1::InvalidResponse {
+                reason_code,
+                evidence,
+            }) => {
+                return store.refuse(
+                    &envelope,
+                    &issuance,
+                    RefusalDraftV1 {
+                        refusal_class: DocketIssuanceRefusalClassWireV1::StandingInvalid,
+                        reason_code,
+                        evidence,
+                    },
+                    now,
+                )
+            }
+        };
+    if let Err(reason_code) = validate_standing(&issuance, &standing, now) {
+        return store.refuse(
+            &envelope,
+            &issuance,
+            RefusalDraftV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::StandingInvalid,
+                evidence: refusal_evidence(
+                    &issuance,
+                    DocketIssuanceRefusalClassWireV1::StandingInvalid,
+                    &reason_code,
+                    &standing_bytes,
+                )?,
+                reason_code,
+            },
+            now,
+        );
+    }
     let attempt = digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance)?;
     let marker = hash_domain(
         "docket.governed-loop.executor-marker/v1",
@@ -499,8 +672,25 @@ pub fn accept_with_checkpoint_verifier(
         || issuance.spend.as_str() == marker.as_str()
         || attempt.as_str() == marker.as_str()
     {
-        return Err("governed-instrument-substitution".to_owned());
+        let reason_code = "governed-instrument-substitution".to_owned();
+        return store.refuse(
+            &envelope,
+            &issuance,
+            RefusalDraftV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::InstrumentSubstitution,
+                evidence: refusal_evidence(
+                    &issuance,
+                    DocketIssuanceRefusalClassWireV1::InstrumentSubstitution,
+                    &reason_code,
+                    &standing_bytes,
+                )?,
+                reason_code,
+            },
+            now,
+        );
     }
+    let prepared_executor = prepare_executor(executor, executor_config, &issuance.work)?;
+    let executor_binding = prepared_executor.binding.clone();
     let custody = DocketCustodyWireV1 {
         schema: CUSTODY_SCHEMA_V1.to_owned(),
         issuance: issuance.issuance.clone(),
@@ -517,6 +707,10 @@ pub fn accept_with_checkpoint_verifier(
             if let Some(existing) = store.get(&issuance.issuance)? {
                 require_same_envelope(&existing, &envelope, &issuance)?;
                 return Ok(DocketExecutionResponseWireV1::Custody(existing.custody));
+            }
+            if let Some(existing) = store.get_refusal(&issuance.issuance)? {
+                require_same_refusal_envelope(&existing, &envelope, &issuance)?;
+                return Ok(DocketExecutionResponseWireV1::Refused(existing.refusal));
             }
             return Err(error);
         }
@@ -575,6 +769,12 @@ pub fn reconcile(
     require_digest(issuance, "issuance")?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
     let Some(mut record) = store.get(issuance)? else {
+        if let Some(refusal) = store.get_refusal(issuance)? {
+            if expected_attempt.is_some() {
+                return Err("governed-refusal-has-no-attempt".to_owned());
+            }
+            return Ok(DocketReconciliationWireV1::Refused(refusal.refusal));
+        }
         return Ok(DocketReconciliationWireV1::NotAccepted);
     };
     if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
@@ -682,6 +882,154 @@ fn require_result_custody(
     Ok(())
 }
 
+fn build_refusal(
+    issuance: &AgIssuanceWireV2,
+    draft: RefusalDraftV1,
+    refused_at_unix_ms: u64,
+) -> Result<DocketIssuanceRefusalWireV1, String> {
+    require_digest(&draft.evidence, "issuance refusal evidence")?;
+    if draft.reason_code.is_empty()
+        || draft.reason_code.len() > 256
+        || !draft
+            .reason_code
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        || refused_at_unix_ms > MAX_JCS_SAFE_INTEGER
+    {
+        return Err("governed-refusal-constraints".to_owned());
+    }
+    let mut refusal = DocketIssuanceRefusalWireV1 {
+        schema: ISSUANCE_REFUSAL_SCHEMA_V1.to_owned(),
+        refusal: String::new(),
+        issuance: issuance.issuance.clone(),
+        campaign: issuance.key.campaign.clone(),
+        occurrence: issuance.key.occurrence.clone(),
+        refusal_class: draft.refusal_class,
+        reason_code: draft.reason_code,
+        evidence: draft.evidence,
+        refused_at_unix_ms,
+    };
+    refusal.refusal = refusal_identity(&refusal)?;
+    Ok(refusal)
+}
+
+fn refusal_identity(refusal: &DocketIssuanceRefusalWireV1) -> Result<String, String> {
+    Ok(format!(
+        "sha256:{}",
+        Transcript::new(ISSUANCE_REFUSAL_SCHEMA_V1)
+            .text_field("schema", &refusal.schema)
+            .text_field("issuance", &refusal.issuance)
+            .text_field("campaign", &refusal.campaign)
+            .text_field("occurrence", &refusal.occurrence)
+            .text_field("refusal_class", refusal.refusal_class.tag())
+            .text_field("reason_code", &refusal.reason_code)
+            .text_field("evidence", &refusal.evidence)
+            .text_field(
+                "refused_at_unix_ms",
+                &refusal.refused_at_unix_ms.to_string(),
+            )
+            .finalize()
+    ))
+}
+
+fn refusal_evidence(
+    issuance: &AgIssuanceWireV2,
+    refusal_class: DocketIssuanceRefusalClassWireV1,
+    reason_code: &str,
+    exact_evidence_bytes: &[u8],
+) -> Result<String, String> {
+    let evidence_bytes = format!("sha256:{}", Sha256Digest::of_bytes(exact_evidence_bytes));
+    Ok(format!(
+        "sha256:{}",
+        Transcript::new("docket.governed-loop.issuance-refusal-evidence/v1")
+            .text_field("issuance", &issuance.issuance)
+            .text_field("refusal_class", refusal_class.tag())
+            .text_field("reason_code", reason_code)
+            .text_field("evidence_bytes", &evidence_bytes)
+            .finalize()
+    ))
+}
+
+fn require_same_refusal_envelope(
+    stored: &IssuanceRefusalRecordV1,
+    envelope: &SignedIssuanceEnvelopeWireV1,
+    issuance: &AgIssuanceWireV2,
+) -> Result<(), String> {
+    if stored.refusal.issuance != issuance.issuance
+        || stored.signed_body_b64 != envelope.body_b64
+        || stored.authentication != envelope.authentication
+    {
+        return Err("governed-refusal-envelope-substitution".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_stored_refusal(
+    connection: &Connection,
+    record: &IssuanceRefusalRecordV1,
+) -> Result<(), String> {
+    let refusal = &record.refusal;
+    if refusal.schema != ISSUANCE_REFUSAL_SCHEMA_V1
+        || refusal.campaign.is_empty()
+        || refusal.occurrence.is_empty()
+        || refusal.reason_code.is_empty()
+        || refusal.reason_code.len() > 256
+        || !refusal
+            .reason_code
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        || refusal.refused_at_unix_ms > MAX_JCS_SAFE_INTEGER
+    {
+        return Err("governed-stored-refusal-constraints".to_owned());
+    }
+    for (value, label) in [
+        (&refusal.refusal, "stored refusal"),
+        (&refusal.issuance, "stored refusal issuance"),
+        (&refusal.campaign, "stored refusal campaign"),
+        (&refusal.evidence, "stored refusal evidence"),
+    ] {
+        require_digest(value, label)?;
+    }
+    require_uuid(&refusal.occurrence)?;
+    if refusal_identity(refusal)? != refusal.refusal {
+        return Err("governed-stored-refusal-identity".to_owned());
+    }
+    let disposition: Option<(String, String)> = connection
+        .query_row(
+            "SELECT disposition,artifact FROM governed_loop_issuance_disposition
+             WHERE issuance=?1",
+            params![refusal.issuance],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("governed-refusal-disposition-read:{error}"))?;
+    if disposition != Some(("refused".to_owned(), refusal.refusal.clone())) {
+        return Err("governed-stored-refusal-disposition".to_owned());
+    }
+    let custody_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM governed_loop_attempt WHERE issuance=?1",
+            params![refusal.issuance],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("governed-refusal-custody-census:{error}"))?;
+    if custody_count != 0 {
+        return Err("governed-refusal-custody-collision".to_owned());
+    }
+    Ok(())
+}
+
+fn refusal_class_from_tag(value: &str) -> Result<DocketIssuanceRefusalClassWireV1, String> {
+    match value {
+        "issuance_invalid" => Ok(DocketIssuanceRefusalClassWireV1::IssuanceInvalid),
+        "issuance_expired" => Ok(DocketIssuanceRefusalClassWireV1::IssuanceExpired),
+        "checkpoint_invalid" => Ok(DocketIssuanceRefusalClassWireV1::CheckpointInvalid),
+        "standing_invalid" => Ok(DocketIssuanceRefusalClassWireV1::StandingInvalid),
+        "instrument_substitution" => Ok(DocketIssuanceRefusalClassWireV1::InstrumentSubstitution),
+        _ => Err("governed-refusal-class-corrupt".to_owned()),
+    }
+}
+
 struct GovernedCustodyStoreV1 {
     connection: Connection,
 }
@@ -699,6 +1047,120 @@ impl GovernedCustodyStoreV1 {
         Ok(Self { connection })
     }
 
+    fn refuse(
+        &mut self,
+        envelope: &SignedIssuanceEnvelopeWireV1,
+        issuance: &AgIssuanceWireV2,
+        draft: RefusalDraftV1,
+        refused_at_unix_ms: u64,
+    ) -> Result<DocketExecutionResponseWireV1, String> {
+        let refusal = build_refusal(issuance, draft, refused_at_unix_ms)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("governed-refusal-transaction:{error}"))?;
+        let inserted = (|| {
+            transaction
+                .execute(
+                    "INSERT INTO governed_loop_issuance_disposition
+                     (issuance,disposition,artifact) VALUES (?1,'refused',?2)",
+                    params![issuance.issuance, refusal.refusal],
+                )
+                .map_err(|error| format!("governed-refusal-disposition:{error}"))?;
+            transaction
+                .execute(
+                    "INSERT INTO governed_loop_issuance_refusal
+                     (issuance,refusal,signed_body_b64,issuer_principal,signer_key_id,
+                      signer_public_key,signature,campaign,occurrence,refusal_class,
+                      reason_code,evidence,refused_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![
+                        refusal.issuance,
+                        refusal.refusal,
+                        envelope.body_b64,
+                        envelope.authentication.issuer_principal,
+                        envelope.authentication.signer_key_id,
+                        envelope.authentication.signer_public_key,
+                        envelope.authentication.signature,
+                        refusal.campaign,
+                        refusal.occurrence,
+                        refusal.refusal_class.tag(),
+                        refusal.reason_code,
+                        refusal.evidence,
+                        u64_to_i64(refusal.refused_at_unix_ms)?,
+                    ],
+                )
+                .map_err(|error| format!("governed-refusal-insert:{error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("governed-refusal-commit:{error}"))
+        })();
+        if let Err(error) = inserted {
+            if let Some(existing) = self.get_refusal(&issuance.issuance)? {
+                require_same_refusal_envelope(&existing, envelope, issuance)?;
+                if existing.refusal.issuance != refusal.issuance
+                    || existing.refusal.campaign != refusal.campaign
+                    || existing.refusal.occurrence != refusal.occurrence
+                    || existing.refusal.refusal_class != refusal.refusal_class
+                    || existing.refusal.reason_code != refusal.reason_code
+                    || existing.refusal.evidence != refusal.evidence
+                {
+                    return Err("governed-refusal-exact-replay-collision".to_owned());
+                }
+                return Ok(DocketExecutionResponseWireV1::Refused(existing.refusal));
+            }
+            if self.get(&issuance.issuance)?.is_some() {
+                return Err("governed-refusal-after-custody".to_owned());
+            }
+            return Err(error);
+        }
+        Ok(DocketExecutionResponseWireV1::Refused(refusal))
+    }
+
+    fn get_refusal(&self, issuance: &str) -> Result<Option<IssuanceRefusalRecordV1>, String> {
+        let record = self
+            .connection
+            .query_row(
+                "SELECT refusal,signed_body_b64,issuer_principal,signer_key_id,
+                        signer_public_key,signature,campaign,occurrence,refusal_class,
+                        reason_code,evidence,refused_at
+                 FROM governed_loop_issuance_refusal WHERE issuance=?1",
+                params![issuance],
+                |row| {
+                    let refusal_class = refusal_class_from_tag(&row.get::<_, String>(8)?)
+                        .map_err(|detail| sql_decode(&detail))?;
+                    Ok(IssuanceRefusalRecordV1 {
+                        refusal: DocketIssuanceRefusalWireV1 {
+                            schema: ISSUANCE_REFUSAL_SCHEMA_V1.to_owned(),
+                            refusal: row.get(0)?,
+                            issuance: issuance.to_owned(),
+                            campaign: row.get(6)?,
+                            occurrence: row.get(7)?,
+                            refusal_class,
+                            reason_code: row.get(9)?,
+                            evidence: row.get(10)?,
+                            refused_at_unix_ms: read_u64(row.get(11)?, 11)?,
+                        },
+                        signed_body_b64: row.get(1)?,
+                        authentication: IssuanceAuthenticationWireV1 {
+                            issuer_principal: row.get(2)?,
+                            signer_key_id: row.get(3)?,
+                            signer_public_key: row.get(4)?,
+                            signature: row.get(5)?,
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("governed-refusal-read:{error}"))?;
+        record
+            .map(|record| {
+                validate_stored_refusal(&self.connection, &record)?;
+                Ok(record)
+            })
+            .transpose()
+    }
+
     fn insert_custody(
         &mut self,
         envelope: &SignedIssuanceEnvelopeWireV1,
@@ -711,6 +1173,13 @@ impl GovernedCustodyStoreV1 {
             .connection
             .transaction()
             .map_err(|error| format!("governed-custody-transaction:{error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO governed_loop_issuance_disposition
+                 (issuance,disposition,artifact) VALUES (?1,'custody',?2)",
+                params![issuance.issuance, custody.attempt],
+            )
+            .map_err(|error| format!("governed-custody-disposition:{error}"))?;
         transaction
             .execute(
                 "INSERT INTO governed_execution_standing_use
@@ -808,6 +1277,8 @@ impl GovernedCustodyStoreV1 {
                         proposal: row.get(8)?,
                         work_schema: row.get(9)?,
                         work: row.get(10)?,
+                        nonclaims: body_record.nonclaims,
+                        expires_at_unix_ms: body_record.expires_at_unix_ms,
                         subject: row.get(11)?,
                         effect_scope: body_record.effect_scope,
                         effect_scope_digest: row.get(12)?,
@@ -1324,6 +1795,20 @@ fn validate_issuance(issuance: &AgIssuanceWireV2) -> Result<(), String> {
     {
         return Err("governed-issuance-work-schema".to_owned());
     }
+    if issuance.expires_at_unix_ms == 0
+        || issuance.expires_at_unix_ms > MAX_JCS_SAFE_INTEGER
+        || issuance.nonclaims.is_empty()
+    {
+        return Err("governed-issuance-constraints".to_owned());
+    }
+    let mut previous_nonclaim: Option<&str> = None;
+    for nonclaim in &issuance.nonclaims {
+        require_digest(nonclaim, "issuance nonclaim")?;
+        if previous_nonclaim.is_some_and(|previous| previous >= nonclaim.as_str()) {
+            return Err("governed-issuance-nonclaims-not-canonical".to_owned());
+        }
+        previous_nonclaim = Some(nonclaim);
+    }
     let basis = serde_json::json!({
         "key": {
             "campaign": issuance.key.campaign,
@@ -1342,6 +1827,8 @@ fn validate_issuance(issuance: &AgIssuanceWireV2) -> Result<(), String> {
         "subject": issuance.subject,
         "work": issuance.work,
         "work_schema": issuance.work_schema,
+        "nonclaims": issuance.nonclaims,
+        "expires_at_unix_ms": issuance.expires_at_unix_ms,
     });
     let canonical =
         serde_json::to_vec(&basis).map_err(|error| format!("governed-issuance-basis:{error}"))?;
@@ -1350,6 +1837,19 @@ fn validate_issuance(issuance: &AgIssuanceWireV2) -> Result<(), String> {
         return Err("governed-issuance-identity-mismatch".to_owned());
     }
     Ok(())
+}
+
+fn validate_fresh_issuance(issuance: &AgIssuanceWireV2, now_unix_ms: u64) -> Result<(), String> {
+    if now_unix_ms >= issuance.expires_at_unix_ms {
+        return Err("governed-issuance-expired".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_refusable_issuance_identity(issuance: &AgIssuanceWireV2) -> Result<(), String> {
+    require_digest(&issuance.issuance, "refusable issuance")?;
+    require_digest(&issuance.key.campaign, "refusable campaign")?;
+    require_uuid(&issuance.key.occurrence)
 }
 
 fn validate_standing(
@@ -1389,20 +1889,75 @@ fn verify_starting_checkpoint(
     verifier: Option<&Path>,
     now_unix_ms: u64,
 ) -> Result<(), String> {
+    verify_starting_checkpoint_for_intake(issuance, verifier, now_unix_ms).map_err(|error| {
+        match error {
+            IntakeValidationErrorV1::Transient(error) => error,
+            IntakeValidationErrorV1::Refusal(draft) => draft.reason_code,
+        }
+    })
+}
+
+fn verify_starting_checkpoint_for_intake(
+    issuance: &AgIssuanceWireV2,
+    verifier: Option<&Path>,
+    now_unix_ms: u64,
+) -> Result<(), IntakeValidationErrorV1> {
     let Some(checkpoint) = &issuance.governed_repair_checkpoint else {
         return Ok(());
     };
-    validate_checkpoint_evidence(checkpoint)?;
-    let verifier = verifier.ok_or_else(|| "governed-checkpoint-verifier-required".to_owned())?;
-    let result: CheckpointVerificationResultWireV1 = invoke_json(
-        verifier,
-        &[],
-        &CheckpointVerificationRequestWireV1 {
-            schema: "docket.governed-repair.checkpoint-verification-request/v1".to_owned(),
-            issuance: issuance.issuance.clone(),
-            checkpoint: checkpoint.clone(),
-        },
-    )?;
+    if validate_checkpoint_evidence(checkpoint).is_err() {
+        let reason_code = "governed-checkpoint-evidence-invalid".to_owned();
+        let bytes = serde_json::to_vec(checkpoint).map_err(|error| {
+            IntakeValidationErrorV1::Transient(format!(
+                "governed-checkpoint-evidence-canonical:{error}"
+            ))
+        })?;
+        return Err(IntakeValidationErrorV1::Refusal(RefusalDraftV1 {
+            refusal_class: DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+            evidence: refusal_evidence(
+                issuance,
+                DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                &reason_code,
+                &bytes,
+            )
+            .map_err(IntakeValidationErrorV1::Transient)?,
+            reason_code,
+        }));
+    }
+    let verifier = verifier.ok_or_else(|| {
+        IntakeValidationErrorV1::Transient("governed-checkpoint-verifier-required".to_owned())
+    })?;
+    let (result, result_bytes): (CheckpointVerificationResultWireV1, Vec<u8>) =
+        match invoke_json_classified(
+            verifier,
+            &[],
+            &CheckpointVerificationRequestWireV1 {
+                schema: "docket.governed-repair.checkpoint-verification-request/v1".to_owned(),
+                issuance: issuance.issuance.clone(),
+                checkpoint: checkpoint.clone(),
+            },
+        ) {
+            Ok(value) => value,
+            Err(JsonInvocationErrorV1::Unavailable(error)) => {
+                return Err(IntakeValidationErrorV1::Transient(error))
+            }
+            Err(JsonInvocationErrorV1::InvalidResponse {
+                reason_code,
+                evidence,
+            }) => {
+                return Err(IntakeValidationErrorV1::Refusal(RefusalDraftV1 {
+                    refusal_class: DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                    evidence: refusal_evidence(
+                        issuance,
+                        DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                        &reason_code,
+                        evidence.as_bytes(),
+                    )
+                    .map_err(IntakeValidationErrorV1::Transient)?,
+                    reason_code,
+                }))
+            }
+        };
     if result.schema != "docket.governed-repair.checkpoint-verification/v1"
         || result.issuance != issuance.issuance
         || result.checkpoint != *checkpoint
@@ -1410,9 +1965,34 @@ fn verify_starting_checkpoint(
         || result.verified_at_unix_ms > now_unix_ms
         || now_unix_ms >= result.expires_at_unix_ms
     {
-        return Err("governed-checkpoint-verification-mismatch".to_owned());
+        let reason_code = "governed-checkpoint-verification-mismatch".to_owned();
+        return Err(IntakeValidationErrorV1::Refusal(RefusalDraftV1 {
+            refusal_class: DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+            evidence: refusal_evidence(
+                issuance,
+                DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                &reason_code,
+                &result_bytes,
+            )
+            .map_err(IntakeValidationErrorV1::Transient)?,
+            reason_code,
+        }));
     }
-    require_digest(&result.verification, "checkpoint verification")
+    if require_digest(&result.verification, "checkpoint verification").is_err() {
+        let reason_code = "governed-checkpoint-verification-identity-invalid".to_owned();
+        return Err(IntakeValidationErrorV1::Refusal(RefusalDraftV1 {
+            refusal_class: DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+            evidence: refusal_evidence(
+                issuance,
+                DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                &reason_code,
+                &result_bytes,
+            )
+            .map_err(IntakeValidationErrorV1::Transient)?,
+            reason_code,
+        }));
+    }
+    Ok(())
 }
 
 fn validate_checkpoint_evidence(
@@ -1666,38 +2246,53 @@ fn invoke_retained_json<I: Serialize + ?Sized, O: DeserializeOwned>(
     strict_json(&output.stdout, "process-response")
 }
 
-fn invoke_json<I: Serialize + ?Sized, O: DeserializeOwned>(
+fn invoke_json_classified<I: Serialize + ?Sized, O: DeserializeOwned>(
     program: &Path,
     arguments: &[&str],
     input: &I,
-) -> Result<O, String> {
-    let bytes = serde_json::to_vec(input).map_err(|error| format!("process-request:{error}"))?;
+) -> Result<(O, Vec<u8>), JsonInvocationErrorV1> {
+    let bytes = serde_json::to_vec(input)
+        .map_err(|error| JsonInvocationErrorV1::Unavailable(format!("process-request:{error}")))?;
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("process-spawn:{}:{error}", program.display()))?;
+        .map_err(|error| {
+            JsonInvocationErrorV1::Unavailable(format!(
+                "process-spawn:{}:{error}",
+                program.display()
+            ))
+        })?;
     child
         .stdin
         .take()
-        .ok_or_else(|| "process-stdin-unavailable".to_owned())?
+        .ok_or_else(|| JsonInvocationErrorV1::Unavailable("process-stdin-unavailable".to_owned()))?
         .write_all(&bytes)
-        .map_err(|error| format!("process-stdin:{error}"))?;
+        .map_err(|error| JsonInvocationErrorV1::Unavailable(format!("process-stdin:{error}")))?;
     let output = child
         .wait_with_output()
-        .map_err(|error| format!("process-wait:{error}"))?;
+        .map_err(|error| JsonInvocationErrorV1::Unavailable(format!("process-wait:{error}")))?;
     if !output.status.success() {
-        return Err(format!(
+        return Err(JsonInvocationErrorV1::Unavailable(format!(
             "process-refused:{}",
             String::from_utf8_lossy(&output.stderr)
                 .chars()
                 .take(512)
                 .collect::<String>()
-        ));
+        )));
     }
-    strict_json(&output.stdout, "process-response")
+    let parsed = strict_json(&output.stdout, "process-response").map_err(|_| {
+        JsonInvocationErrorV1::InvalidResponse {
+            reason_code: "governed-process-response-invalid".to_owned(),
+            evidence: hash_domain(
+                "docket.governed-loop.invalid-process-response/v1",
+                &output.stdout,
+            ),
+        }
+    })?;
+    Ok((parsed, output.stdout))
 }
 
 fn b64_decode(value: &str) -> Result<Vec<u8>, String> {
@@ -1804,11 +2399,32 @@ mod tests {
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
 
+    #[test]
+    fn issuance_refusal_identity_matches_frozen_cross_repository_vector() {
+        let refusal = DocketIssuanceRefusalWireV1 {
+            schema: ISSUANCE_REFUSAL_SCHEMA_V1.to_owned(),
+            refusal: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_owned(),
+            issuance: format!("sha256:{}", "11".repeat(32)),
+            campaign: format!("sha256:{}", "22".repeat(32)),
+            occurrence: "00000000-0000-0000-0000-000000000001".to_owned(),
+            refusal_class: DocketIssuanceRefusalClassWireV1::StandingInvalid,
+            reason_code: "standing_invalid".to_owned(),
+            evidence: format!("sha256:{}", "33".repeat(32)),
+            refused_at_unix_ms: 42,
+        };
+        assert_eq!(
+            refusal_identity(&refusal).unwrap(),
+            "sha256:14e18c3d74be772ed6e72de25eb735fa26d5154c333a45aba0585f9a09306ce6"
+        );
+    }
+
     struct Fixture {
         root: std::path::PathBuf,
         database: std::path::PathBuf,
         trust: Vec<u8>,
         envelope: Vec<u8>,
+        signing_key_pkcs8: Vec<u8>,
         issuance: AgIssuanceWireV2,
         custody: DocketCustodyWireV1,
         standing_program: std::path::PathBuf,
@@ -1822,6 +2438,13 @@ mod tests {
     }
 
     fn fixture(executor_outcome: ExecutorOutcomeClassWireV1) -> Fixture {
+        fixture_with_expiry(executor_outcome, 4_000_000_000_000)
+    }
+
+    fn fixture_with_expiry(
+        executor_outcome: ExecutorOutcomeClassWireV1,
+        expires_at_unix_ms: u64,
+    ) -> Fixture {
         let root = std::env::temp_dir().join(format!(
             "docket-governed-loop-test-{}-{}",
             std::process::id(),
@@ -1855,6 +2478,8 @@ mod tests {
             proposal: digest("proposal"),
             work_schema: "test.executor/v1".to_owned(),
             work: digest("work"),
+            nonclaims: vec![digest("fixture-is-not-authority")],
+            expires_at_unix_ms,
             subject: digest("subject"),
             effect_scope,
             effect_scope_digest,
@@ -1876,29 +2501,7 @@ mod tests {
             mandate: digest("mandate"),
             spend: digest("ag-spend"),
         };
-        let basis = serde_json::json!({
-            "key": {
-                "campaign": issuance.key.campaign,
-                "occurrence": issuance.key.occurrence,
-            },
-            "mandate": issuance.mandate,
-            "observation": issuance.observation,
-            "program": issuance.program,
-            "proposal": issuance.proposal,
-            "effect_scope": issuance.effect_scope,
-            "effect_scope_digest": issuance.effect_scope_digest,
-            "governed_repair_checkpoint": issuance.governed_repair_checkpoint,
-            "admission_decision": issuance.admission_decision,
-            "spend": issuance.spend,
-            "standing_resolution": issuance.standing_resolution,
-            "subject": issuance.subject,
-            "work": issuance.work,
-            "work_schema": issuance.work_schema,
-        });
-        issuance.issuance = hash_domain(
-            "ag.governed-loop.issuance/v2",
-            &serde_json::to_vec(&basis).unwrap(),
-        );
+        refresh_issuance_identity(&mut issuance);
         let body = serde_json::to_vec(&serde_json::to_value(&issuance).unwrap()).unwrap();
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
@@ -1970,12 +2573,62 @@ mod tests {
             root,
             database,
             trust,
-            envelope: serde_json::to_vec(&envelope).unwrap(),
+            envelope: canonical_json(&envelope),
+            signing_key_pkcs8: document.as_ref().to_vec(),
             issuance,
             custody,
             standing_program,
             executor_program,
         }
+    }
+
+    fn canonical_json<T: Serialize>(value: &T) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::to_value(value).unwrap()).unwrap()
+    }
+
+    fn refresh_issuance_identity(issuance: &mut AgIssuanceWireV2) {
+        let basis = serde_json::json!({
+            "key": {
+                "campaign": issuance.key.campaign,
+                "occurrence": issuance.key.occurrence,
+            },
+            "mandate": issuance.mandate,
+            "observation": issuance.observation,
+            "program": issuance.program,
+            "proposal": issuance.proposal,
+            "effect_scope": issuance.effect_scope,
+            "effect_scope_digest": issuance.effect_scope_digest,
+            "governed_repair_checkpoint": issuance.governed_repair_checkpoint,
+            "admission_decision": issuance.admission_decision,
+            "spend": issuance.spend,
+            "standing_resolution": issuance.standing_resolution,
+            "subject": issuance.subject,
+            "work": issuance.work,
+            "work_schema": issuance.work_schema,
+            "nonclaims": issuance.nonclaims,
+            "expires_at_unix_ms": issuance.expires_at_unix_ms,
+        });
+        issuance.issuance = hash_domain(
+            "ag.governed-loop.issuance/v2",
+            &serde_json::to_vec(&basis).unwrap(),
+        );
+    }
+
+    fn signed_envelope(fixture: &Fixture, issuance: &AgIssuanceWireV2) -> Vec<u8> {
+        let body = canonical_json(issuance);
+        let key = Ed25519KeyPair::from_pkcs8(&fixture.signing_key_pkcs8).unwrap();
+        let mut signed = SIGNATURE_PREFIX_V2.to_vec();
+        signed.extend_from_slice(&body);
+        canonical_json(&SignedIssuanceEnvelopeWireV1 {
+            schema: SIGNED_ISSUANCE_SCHEMA_V2.to_owned(),
+            body_b64: b64_encode(&body),
+            authentication: IssuanceAuthenticationWireV1 {
+                issuer_principal: "ag.test".to_owned(),
+                signer_key_id: "ag-test-key".to_owned(),
+                signer_public_key: b64_encode(key.public_key().as_ref()),
+                signature: b64_encode(key.sign(&signed).as_ref()),
+            },
+        })
     }
 
     #[test]
@@ -2036,6 +2689,506 @@ mod tests {
             )
             .unwrap();
         assert_eq!((attempts, standing_uses), (1, 1));
+    }
+
+    #[test]
+    fn pre_refusal_schema_custody_reopen_backfills_shared_disposition_guard() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let first = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(first, DocketExecutionResponseWireV1::Custody(_)));
+
+        // Recreate the durable shape as it existed after migration 0008: the
+        // exact custody row survives, while the 0009 refusal/disposition
+        // tables and triggers do not yet exist.
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE governed_loop_issuance_refusal;
+                 DROP TABLE governed_loop_issuance_disposition;",
+            )
+            .unwrap();
+        drop(connection);
+
+        // Ordinary store reopen applies 0009 and derives only the disposition
+        // membrane from the already durable attempt identity. It mints no new
+        // custody, standing use, attempt, or refusal.
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let disposition: (String, String) = connection
+            .query_row(
+                "SELECT disposition,artifact FROM governed_loop_issuance_disposition
+                 WHERE issuance=?1",
+                params![fixture.issuance.issuance],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let counts: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM governed_loop_attempt),
+                   (SELECT COUNT(*) FROM governed_execution_standing_use),
+                   (SELECT COUNT(*) FROM governed_loop_issuance_disposition),
+                   (SELECT COUNT(*) FROM governed_loop_issuance_refusal)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            disposition,
+            ("custody".to_owned(), fixture.custody.attempt.clone())
+        );
+        assert_eq!(counts, (1, 1, 1, 0));
+        drop(connection);
+
+        write_refusing_program(&fixture.executor_program);
+        assert_eq!(
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn fresh_custody_requires_closed_nonclaims_and_unexpired_issuance() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        assert!(validate_issuance(&fixture.issuance).is_ok());
+        assert!(validate_fresh_issuance(&fixture.issuance, 0).is_ok());
+        assert_eq!(
+            validate_fresh_issuance(&fixture.issuance, fixture.issuance.expires_at_unix_ms,)
+                .unwrap_err(),
+            "governed-issuance-expired"
+        );
+
+        let mut missing = fixture.issuance.clone();
+        missing.nonclaims.clear();
+        assert_eq!(
+            validate_issuance(&missing).unwrap_err(),
+            "governed-issuance-constraints"
+        );
+        let mut duplicated = fixture.issuance.clone();
+        duplicated.nonclaims.push(duplicated.nonclaims[0].clone());
+        assert_eq!(
+            validate_issuance(&duplicated).unwrap_err(),
+            "governed-issuance-nonclaims-not-canonical"
+        );
+
+        let mut maximum = fixture.issuance.clone();
+        maximum.expires_at_unix_ms = MAX_JCS_SAFE_INTEGER;
+        refresh_issuance_identity(&mut maximum);
+        assert!(validate_issuance(&maximum).is_ok());
+        maximum.expires_at_unix_ms = MAX_JCS_SAFE_INTEGER + 1;
+        assert_eq!(
+            validate_issuance(&maximum).unwrap_err(),
+            "governed-issuance-constraints"
+        );
+    }
+
+    #[test]
+    fn outer_signed_envelope_requires_exact_canonical_bytes() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        assert!(verify_signed_issuance(&fixture.envelope, &fixture.trust).is_ok());
+        let value: serde_json::Value = serde_json::from_slice(&fixture.envelope).unwrap();
+        let altered_spelling = serde_json::to_vec_pretty(&value).unwrap();
+        assert_ne!(altered_spelling, fixture.envelope);
+        assert_eq!(
+            verify_signed_issuance(&altered_spelling, &fixture.trust).unwrap_err(),
+            "governed-issuance-envelope-not-canonical"
+        );
+    }
+
+    #[test]
+    fn authenticated_semantically_invalid_issuance_is_sealed_but_unkeyable_input_is_not() {
+        let first = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut invalid = first.issuance.clone();
+        invalid.admission_decision.disposition = AdmissionDispositionWireV1::Refused;
+        refresh_issuance_identity(&mut invalid);
+        let envelope = signed_envelope(&first, &invalid);
+        assert_eq!(
+            verify_signed_issuance(&envelope, &first.trust).unwrap_err(),
+            "governed-admission-decision-binding"
+        );
+        let response = accept(
+            &first.database,
+            &envelope,
+            &first.trust,
+            &first.standing_program,
+            &first.executor_program,
+            &first.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            DocketExecutionResponseWireV1::Refused(DocketIssuanceRefusalWireV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::IssuanceInvalid,
+                ..
+            })
+        ));
+
+        let second = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut unkeyable = second.issuance.clone();
+        unkeyable.issuance = "caller-selected-not-a-digest".to_owned();
+        let envelope = signed_envelope(&second, &unkeyable);
+        assert_eq!(
+            accept(
+                &second.database,
+                &envelope,
+                &second.trust,
+                &second.standing_program,
+                &second.executor_program,
+                &second.root.join("executor-config"),
+            )
+            .unwrap_err(),
+            "governed-refusable issuance-digest"
+        );
+        let connection = Connection::open(&second.database).unwrap();
+        let refusals: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_loop_issuance_refusal",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refusals, 0);
+    }
+
+    #[test]
+    fn expired_signed_issuance_refuses_before_custody_standing_or_executor() {
+        let fixture = fixture_with_expiry(ExecutorOutcomeClassWireV1::Success, 1);
+        write_refusing_program(&fixture.standing_program);
+        write_refusing_program(&fixture.executor_program);
+        let response = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let DocketExecutionResponseWireV1::Refused(refusal) = &response else {
+            panic!("expired issuance must return a sealed refusal")
+        };
+        assert_eq!(
+            refusal.refusal_class,
+            DocketIssuanceRefusalClassWireV1::IssuanceExpired
+        );
+        assert_eq!(refusal.reason_code, "governed-issuance-expired");
+        assert_eq!(refusal_identity(refusal).unwrap(), refusal.refusal);
+        assert_eq!(
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            response
+        );
+        assert_eq!(
+            reconcile(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                None,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            DocketReconciliationWireV1::Refused(refusal.clone())
+        );
+        let connection = Connection::open(&fixture.database).unwrap();
+        let attempts: i64 = connection
+            .query_row("SELECT COUNT(*) FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let standing_uses: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_execution_standing_use",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let refusals: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_loop_issuance_refusal",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((attempts, standing_uses, refusals), (0, 0, 1));
+        assert!(!fixture
+            .executor_program
+            .with_extension("invocations")
+            .exists());
+    }
+
+    #[test]
+    fn invalid_standing_is_sealed_and_exact_replay_does_not_reinvoke_resolver() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let invalid = ExecutionStandingResolutionV1 {
+            schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
+            resolution: digest("invalid-standing-resolution"),
+            currentness: digest("invalid-standing-currentness"),
+            execution_standing: digest("invalid-execution-standing"),
+            issuance: fixture.issuance.issuance.clone(),
+            campaign: fixture.issuance.key.campaign.clone(),
+            occurrence: fixture.issuance.key.occurrence.clone(),
+            subject: fixture.issuance.subject.clone(),
+            scope: digest("wrong-scope"),
+            status: ExecutionStandingStatusV1::Current,
+            resolved_at_unix_ms: 0,
+            expires_at_unix_ms: i64::MAX as u64,
+        };
+        write_static_program(
+            &fixture.standing_program,
+            &serde_json::to_string(&invalid).unwrap(),
+        );
+        let first = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            DocketExecutionResponseWireV1::Refused(DocketIssuanceRefusalWireV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::StandingInvalid,
+                ..
+            })
+        ));
+        write_refusing_program(&fixture.standing_program);
+        assert_eq!(
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            first
+        );
+        assert!(!fixture
+            .executor_program
+            .with_extension("invocations")
+            .exists());
+    }
+
+    #[test]
+    fn standing_transport_or_process_failure_remains_retryable_and_unrecorded() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        write_refusing_program(&fixture.standing_program);
+        assert!(accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap_err()
+        .starts_with("process-refused:"));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let refusals: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_loop_issuance_refusal",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(refusals, 0);
+    }
+
+    #[test]
+    fn semantic_checkpoint_failure_is_a_sealed_pre_custody_refusal() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut issuance = fixture.issuance.clone();
+        issuance.governed_repair_checkpoint = Some(GovernedRepairCheckpointEvidenceWireV1 {
+            repository: digest("checkpoint-repository"),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            content_manifest: digest("checkpoint-manifest"),
+            docket_checkpoint: None,
+        });
+        refresh_issuance_identity(&mut issuance);
+        let envelope = signed_envelope(&fixture, &issuance);
+        let verifier = fixture.root.join("checkpoint-verifier");
+        let result = CheckpointVerificationResultWireV1 {
+            schema: "docket.governed-repair.checkpoint-verification/v1".to_owned(),
+            verification: digest("checkpoint-verification"),
+            issuance: issuance.issuance.clone(),
+            checkpoint: issuance.governed_repair_checkpoint.clone().unwrap(),
+            status: CheckpointVerificationStatusWireV1::Mismatch,
+            verified_at_unix_ms: 0,
+            expires_at_unix_ms: i64::MAX as u64,
+        };
+        write_static_program(&verifier, &serde_json::to_string(&result).unwrap());
+        let response = accept_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            Some(&verifier),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            DocketExecutionResponseWireV1::Refused(DocketIssuanceRefusalWireV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::CheckpointInvalid,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn altered_durable_refusal_bytes_fail_closed_on_replay() {
+        let fixture = fixture_with_expiry(ExecutorOutcomeClassWireV1::Success, 1);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_loop_issuance_refusal_no_update;
+                 UPDATE governed_loop_issuance_refusal
+                 SET evidence='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';",
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap_err(),
+            "governed-stored-refusal-identity"
+        );
+    }
+
+    #[test]
+    fn concurrent_identical_pre_custody_refusal_has_one_durable_winner() {
+        let fixture = fixture_with_expiry(ExecutorOutcomeClassWireV1::Success, 1);
+        let database = std::sync::Arc::new(fixture.database.clone());
+        let envelope = std::sync::Arc::new(fixture.envelope.clone());
+        let trust = std::sync::Arc::new(fixture.trust.clone());
+        let standing = std::sync::Arc::new(fixture.standing_program.clone());
+        let executor = std::sync::Arc::new(fixture.executor_program.clone());
+        let config = std::sync::Arc::new(fixture.root.join("executor-config"));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let database = database.clone();
+                let envelope = envelope.clone();
+                let trust = trust.clone();
+                let standing = standing.clone();
+                let executor = executor.clone();
+                let config = config.clone();
+                std::thread::spawn(move || {
+                    accept(&database, &envelope, &trust, &standing, &executor, &config).unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(results.windows(2).all(|pair| pair[0] == pair[1]));
+        let connection = Connection::open(&*database).unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_loop_issuance_refusal",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn exact_durable_custody_replay_remains_read_only_after_issuance_expiry() {
+        let expiry = now_unix_ms().unwrap() + 2_000;
+        let fixture = fixture_with_expiry(ExecutorOutcomeClassWireV1::Success, expiry);
+        let first = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        while now_unix_ms().unwrap() < expiry {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        write_refusing_program(&fixture.standing_program);
+        write_refusing_program(&fixture.executor_program);
+        let replay = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("invocations")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn nonclaim_or_expiry_substitution_under_same_issuance_identity_refuses() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut changed_nonclaim = fixture.issuance.clone();
+        changed_nonclaim.nonclaims = vec![digest("different-nonclaim")];
+        let envelope = signed_envelope(&fixture, &changed_nonclaim);
+        assert_eq!(
+            verify_signed_issuance(&envelope, &fixture.trust).unwrap_err(),
+            "governed-issuance-identity-mismatch"
+        );
+
+        let mut changed_expiry = fixture.issuance.clone();
+        changed_expiry.expires_at_unix_ms += 1;
+        let envelope = signed_envelope(&fixture, &changed_expiry);
+        assert_eq!(
+            verify_signed_issuance(&envelope, &fixture.trust).unwrap_err(),
+            "governed-issuance-identity-mismatch"
+        );
     }
 
     #[test]
@@ -2151,18 +3304,22 @@ mod tests {
             &substituted.standing_program,
             &serde_json::to_string(&standing).unwrap(),
         );
-        assert_eq!(
-            accept(
-                &substituted.database,
-                &substituted.envelope,
-                &substituted.trust,
-                &substituted.standing_program,
-                &substituted.executor_program,
-                &substituted.root.join("executor-config"),
-            )
-            .unwrap_err(),
-            "governed-instrument-substitution"
-        );
+        let refusal = accept(
+            &substituted.database,
+            &substituted.envelope,
+            &substituted.trust,
+            &substituted.standing_program,
+            &substituted.executor_program,
+            &substituted.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            refusal,
+            DocketExecutionResponseWireV1::Refused(DocketIssuanceRefusalWireV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::InstrumentSubstitution,
+                ..
+            })
+        ));
         let connection = Connection::open(&substituted.database).unwrap();
         let attempts: i64 = connection
             .query_row("SELECT COUNT(*) FROM governed_loop_attempt", [], |row| {
@@ -2327,7 +3484,11 @@ mod tests {
     fn restart_read_refuses_tampered_custody_and_settlement_rows() {
         for (label, statement) in [
             (
-                "custody",
+                "custody attempt",
+                "UPDATE governed_loop_attempt SET attempt='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            ),
+            (
+                "executor binding",
                 "UPDATE governed_loop_attempt SET executor_binding='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
             ),
             (
@@ -2364,6 +3525,64 @@ mod tests {
                 "{label} substitution must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn changed_immutable_work_checkpoint_bytes_refuse_after_restart() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        let response_path = fixture.executor_program.with_extension("response");
+        let mut response: ExecutorOutcomeWireV1 =
+            serde_json::from_slice(&std::fs::read(&response_path).unwrap()).unwrap();
+        response.immutable_work_checkpoint = Some(ImmutableWorkCheckpointWireV1 {
+            repository_identity: digest("checkpoint-repository"),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            diff_identity: Some(digest("checkpoint-diff")),
+            content_manifest_identity: Some(digest("checkpoint-content-manifest")),
+        });
+        write_executor_response(&fixture.executor_program, &response);
+        let first = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let DocketExecutionResponseWireV1::GovernedRepairRequired { result, .. } = first else {
+            panic!("checkpoint-bearing scope halt must be sealed")
+        };
+        assert_eq!(
+            result
+                .checkpoint
+                .immutable_work_checkpoint
+                .as_ref()
+                .expect("checkpoint must survive sealing")
+                .tree,
+            "2".repeat(40)
+        );
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_repair_checkpoint_immutable_update;
+                 UPDATE governed_repair_checkpoint SET work_tree='3333333333333333333333333333333333333333';",
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            reconcile(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                Some(&fixture.custody.attempt),
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap_err(),
+            "governed-repair-executor-result-substitution"
+        );
     }
 
     #[test]

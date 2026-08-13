@@ -44,6 +44,7 @@ const MIGRATION_0006: &str = include_str!("../../migrations/0006_governed_loop_c
 const MIGRATION_0007: &str = include_str!("../../migrations/0007_governed_repair_custody.sql");
 const MIGRATION_0008: &str =
     include_str!("../../migrations/0008_governed_executor_config_binding.sql");
+const MIGRATION_0009: &str = include_str!("../../migrations/0009_governed_loop_refusal.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -168,6 +169,11 @@ impl SqliteStore {
         if has_executor_config_digest == 0 {
             conn.execute_batch(MIGRATION_0008).map_err(backend)?;
         }
+        // 0009 records a sealed, append-only refusal when an authenticated AG
+        // issuance cannot lawfully enter Docket custody. It is deliberately
+        // separate from the attempt table: no attempt or execution standing
+        // exists on this path.
+        conn.execute_batch(MIGRATION_0009).map_err(backend)?;
         Ok(())
     }
 
