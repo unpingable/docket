@@ -1140,7 +1140,9 @@ pub fn render_text(d: &AttemptDossier) -> String {
         match d.authorization.source {
             None => "unrecorded (grant predates authorization-source recording)",
             Some(AuthorizationSource::Local) => "local (operator authority; bootstrap path)",
-            Some(AuthorizationSource::Upstream) => "upstream (verified issuance)",
+            Some(AuthorizationSource::Upstream) => {
+                "upstream (historical verified issuance; V1 intake retired)"
+            }
         }
     );
     if let Some(i) = &d.authorization.issuance {

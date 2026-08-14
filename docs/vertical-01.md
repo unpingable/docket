@@ -40,7 +40,8 @@ Three offices, three questions, three answers that do not substitute for one ano
 10. The downstream office imported that dossier through its existing
     external-projection profile, and its registry was consulted through the normal
     claim path.
-
+This is a historical development record. R3 retired that issuance producer and
+Docket consequence intake; the record grants no current authority.
 ## What each office established — and did not
 
 **Upstream authorization established** that this exact proposal was admitted under a

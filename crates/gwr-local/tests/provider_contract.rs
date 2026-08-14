@@ -1,6 +1,9 @@
 //! Task 6 provider-contract tests: preparation labor varies independently of
 //! the governed lifecycle.
 
+#[path = "support/schema.rs"]
+mod sqlite_schema;
+
 use gwr_core::digest::Sha256Digest;
 use gwr_core::ids::*;
 use gwr_core::preparation::{PreparationEnd, PreparationRun, PreparationStatus};
@@ -260,7 +263,7 @@ fn provider_replacement_uses_another_run_id_and_no_core_changes() {
     ));
     // Provider identity appears nowhere in core records: the candidate knows
     // only its run, and the store schema carries no provider columns.
-    let names = fx.store.all_column_names().unwrap();
+    let names = sqlite_schema::all_column_names(&fx.dir.join("state.sqlite")).unwrap();
     assert!(names.iter().all(|c| !c.to_lowercase().contains("provider")));
 }
 

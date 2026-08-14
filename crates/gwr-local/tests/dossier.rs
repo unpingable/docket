@@ -8,6 +8,9 @@
 //! authority material appears on any surface, and malformed persisted records
 //! produce typed read errors rather than panics or invented defaults.
 
+#[path = "support/sqlite_mutation.rs"]
+mod sqlite_mutation;
+
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::evidence::Claim;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
@@ -634,9 +637,11 @@ fn malformed_persisted_records_produce_typed_read_errors() {
     // Unknown projection tag.
     let mut fx = fixture("corrupt-tag");
     drive_committed(&mut fx);
-    fx.store
-        .execute_raw_for_test("UPDATE attempt_projection SET state='bogus'")
-        .unwrap();
+    sqlite_mutation::execute_raw(
+        &fx.root.join("state.sqlite"),
+        "UPDATE attempt_projection SET state='bogus'",
+    )
+    .unwrap();
     match assemble(&mut fx.store, fx.att.attempt_id) {
         Err(DossierError::Store(StoreError::Corrupt(msg))) => {
             assert!(msg.contains("bogus"), "{msg}");
@@ -648,8 +653,7 @@ fn malformed_persisted_records_produce_typed_read_errors() {
     // Corrupt hex in a ledger identity column.
     let mut fx = fixture("corrupt-hex");
     drive_committed(&mut fx);
-    fx.store
-        .execute_raw_for_test("UPDATE dispatch SET id='zz'")
+    sqlite_mutation::execute_raw(&fx.root.join("state.sqlite"), "UPDATE dispatch SET id='zz'")
         .unwrap();
     match assemble(&mut fx.store, fx.att.attempt_id) {
         Err(DossierError::Store(StoreError::Corrupt(_))) => {}
@@ -660,9 +664,7 @@ fn malformed_persisted_records_produce_typed_read_errors() {
     // A terminal state whose ledger record is missing.
     let mut fx = fixture("missing-record");
     drive_committed(&mut fx);
-    fx.store
-        .execute_raw_for_test("DELETE FROM commitment")
-        .unwrap();
+    sqlite_mutation::execute_raw(&fx.root.join("state.sqlite"), "DELETE FROM commitment").unwrap();
     match assemble(&mut fx.store, fx.att.attempt_id) {
         Err(DossierError::MissingRecord {
             expected: "commitment",
@@ -674,9 +676,11 @@ fn malformed_persisted_records_produce_typed_read_errors() {
     // A partial reliance-refusal subject is corrupt, not defaulted.
     let mut fx = fixture("partial-subject");
     drive_committed(&mut fx);
-    fx.store
-        .execute_raw_for_test("UPDATE reliance_refusal SET consumer=NULL")
-        .unwrap();
+    sqlite_mutation::execute_raw(
+        &fx.root.join("state.sqlite"),
+        "UPDATE reliance_refusal SET consumer=NULL",
+    )
+    .unwrap();
     match assemble(&mut fx.store, fx.att.attempt_id) {
         Err(DossierError::Store(StoreError::Corrupt(msg))) => {
             assert!(msg.contains("subject"), "{msg}");

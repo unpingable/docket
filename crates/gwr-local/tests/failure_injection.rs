@@ -3,6 +3,9 @@
 //! honestly indeterminate. Broker crash cases use a real temporary Git
 //! repository and real process termination — no mocks.
 
+#[path = "support/commitment.rs"]
+mod commitment_fixture;
+
 use gwr_core::bridge::observation_to_review_queue as obs_bridge;
 use gwr_core::bridge::recovery_standing_to_resolution as rec_bridge;
 use gwr_core::digest::Sha256Digest;
@@ -982,9 +985,7 @@ fn tampered_journal_cannot_mint_a_commitment_for_another_attempts_commit() {
     std::fs::write(&journal_path, &original).unwrap();
     let dispatching_b = AttemptState::Prepared;
     let _ = dispatching_b;
-    fx.store
-        .record_commitment_for_test(&b_commitment)
-        .expect("record B's commitment");
+    commitment_fixture::record(&fx.db, &b_commitment).expect("record B's commitment");
     let fact2 = gwr_local::recover::produce_fact(
         &mut fx.store,
         fx.att.attempt_id,

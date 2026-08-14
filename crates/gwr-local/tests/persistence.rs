@@ -1,5 +1,8 @@
 //! Task 5 persistence tests: durable exact state without event sourcing.
 
+#[path = "support/schema.rs"]
+mod sqlite_schema;
+
 use gwr_core::bridge::{
     reservation_to_dispatch as rsv_bridge, standing_to_ratification as rat_bridge,
 };
@@ -163,8 +166,7 @@ fn pre_registry_database_migrates_with_repository_identity_unbound() {
         .unwrap();
     assert_eq!(legacy.repository_id, None);
     assert_eq!(legacy.repository.as_str(), "/old/checkout");
-    assert!(store
-        .all_column_names()
+    assert!(sqlite_schema::all_column_names(&db)
         .unwrap()
         .contains(&"work_request.repository_id".to_string()));
     std::fs::remove_file(&db).unwrap();
@@ -538,8 +540,9 @@ fn reservation_conflict_is_refused() {
 
 #[test]
 fn provider_specific_fields_do_not_appear_in_core_tables() {
-    let mut store = SqliteStore::open_in_memory().unwrap();
-    let names = store.all_column_names().unwrap();
+    let db = temp_db("provider-columns");
+    let _store = SqliteStore::open(&db).unwrap();
+    let names = sqlite_schema::all_column_names(&db).unwrap();
     assert!(!names.is_empty());
     for banned in ["provider", "codex", "claude", "session", "model"] {
         for col in &names {

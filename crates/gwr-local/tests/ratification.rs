@@ -1,6 +1,8 @@
 //! Task 7 ratification tests: exact authority, consumed once, refusals consume
 //! nothing.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gwr_core::bridge::standing_to_ratification as rat_bridge;
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::standing::{GrantState, StandingAct, StandingGrant, StandingScope};
@@ -14,7 +16,7 @@ use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocato
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::capabilities::StandingTokenCodec;
 use gwr_local::store::SqliteStore;
-use gwr_runtime::ports::store::Store;
+use gwr_runtime::ports::store::{Store, StoreError};
 use gwr_runtime::services::ratification::{ratify, RatifyError};
 
 fn attempt(byte: u8) -> PreparedAttempt {
@@ -94,6 +96,65 @@ fn happy_path_consumes_the_standing_use_exactly_once() {
     assert!(matches!(g.state(), GrantState::Consumed { .. }));
     let projected = f.store.get_attempt(f.att.attempt_id).unwrap();
     assert!(matches!(projected.state, AttemptState::Ratified { .. }));
+}
+
+#[test]
+fn historical_upstream_v1_grant_remains_readable_but_cannot_ratify() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "docket-r3-retired-upstream-standing-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("docket.sqlite");
+    let att = attempt(9);
+    let historical = grant(&att, StandingAct::Ratify, 4, 1000);
+    {
+        let mut store = SqliteStore::open(&database).unwrap();
+        store.admit_attempt(&att).unwrap();
+        store.create_standing_grant(&historical).unwrap();
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE standing_grant
+             SET source='upstream', issuance_id='historical-v1-issuance'
+             WHERE id=?1",
+            ["03".repeat(16)],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut store = SqliteStore::open(&database).unwrap();
+    assert_eq!(store.get_standing_grant(GRANT).unwrap(), historical);
+    let before = store.get_attempt(att.attempt_id).unwrap();
+    let mut ids = HashChainIds::new();
+    let result = ratify(
+        &mut store,
+        att.attempt_id,
+        GRANT,
+        ACTOR,
+        att.prepared_attempt_digest,
+        att.basis.clone(),
+        &FixedClock(ClockReading(50)),
+        &mut ids,
+    );
+    assert_eq!(
+        result,
+        Err(RatifyError::Store(
+            StoreError::LegacyUpstreamIssuanceRetired
+        ))
+    );
+    assert_eq!(store.get_attempt(att.attempt_id).unwrap(), before);
+    assert!(matches!(
+        store.get_standing_grant(GRANT).unwrap().state(),
+        GrantState::Available
+    ));
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

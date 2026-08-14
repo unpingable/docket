@@ -1,9 +1,10 @@
 //! Upstream authorization records.
 //!
-//! An upstream authorization office decides whether exact proposed work may
-//! receive authority. Docket does not re-decide that question: it verifies
-//! that an authenticated issuance names *this exact prepared attempt*, records
-//! the issuance as the basis, and then mints its own local standing.
+//! Historical upstream authorization records.
+//!
+//! R3 retired the V1 producer and consequence-bearing intake. These types keep
+//! previously stored rows decodable for dossier and audit display only. No
+//! current service can create one or mint standing from one.
 //!
 //! The types here are the shape of what Docket accepts and stores. None of
 //! them is authority:
@@ -98,7 +99,8 @@ pub struct UpstreamResidual {
     pub statement: String,
 }
 
-/// An accepted upstream issuance, exactly as Docket verified and stored it.
+/// A historical upstream issuance, exactly as an earlier Docket stored it.
+/// Reading this value grants no current standing or custody.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AcceptedIssuance {
     pub issuance_id: String,

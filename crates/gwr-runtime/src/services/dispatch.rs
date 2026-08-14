@@ -45,6 +45,10 @@ pub fn dispatch(
     ids: &mut dyn IdSource,
 ) -> Result<DispatchOutcome, DispatchError> {
     let projected = store.get_attempt(attempt_id)?;
+    // This check precedes both the new-dispatch path and crash/re-entry of an
+    // already persisted dispatch. A historical V1-derived attempt therefore
+    // cannot reach the broker merely because it had advanced before R3.
+    store.ensure_attempt_consequence_eligible(attempt_id)?;
 
     // Idempotency: one persisted DispatchId per attempt, ever. Same identity
     // inspects; a different identity for the same attempt is never minted.

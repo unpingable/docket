@@ -1,5 +1,7 @@
 //! Task 7 reservation tests: exclusive, one-use, expiring, attempt-bound.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use gwr_core::bridge::reservation_to_dispatch as rsv_bridge;
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
@@ -12,7 +14,9 @@ use gwr_core::refusal::ReservationRefusal;
 use gwr_core::work_request::{ClockReading, CommitHash, RefName, RepositoryLocator};
 use gwr_local::adapters::{FixedClock, HashChainIds};
 use gwr_local::store::SqliteStore;
-use gwr_runtime::ports::store::Store;
+use gwr_runtime::ports::effect_broker::{BrokerOutcome, EffectBroker};
+use gwr_runtime::ports::store::{Store, StoreError};
+use gwr_runtime::services::dispatch::{dispatch, DispatchError};
 use gwr_runtime::services::ratification::ratify;
 use gwr_runtime::services::reservation::{reserve, ReserveError};
 
@@ -250,4 +254,102 @@ fn malformed_reserve_requests_do_not_consume_unrelated_resources() {
     // The ref is free: after ratifying, reservation succeeds immediately.
     admit_and_ratify(&mut store, &mut ids, &att, 3);
     reserve(&mut store, att.attempt_id, 500, &clock, &mut ids).unwrap();
+}
+
+struct CountingBroker {
+    calls: usize,
+}
+
+impl EffectBroker for CountingBroker {
+    fn execute(&mut self, _envelope: &gwr_core::receipt::DispatchEnvelope) -> BrokerOutcome {
+        self.calls += 1;
+        BrokerOutcome::Refused {
+            ground: gwr_core::refusal::DispatchRefusalGround::ForbiddenPath,
+            journal_digest: Sha256Digest::of_bytes(b"must-not-run"),
+        }
+    }
+}
+
+#[test]
+fn already_dispatching_historical_v1_attempt_cannot_reenter_the_broker() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "docket-r3-retired-dispatch-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("docket.sqlite");
+    let att = attempt(9);
+    let mut ids = HashChainIds::new();
+    let mut store = SqliteStore::open(&database).unwrap();
+    let ratification = admit_and_ratify(&mut store, &mut ids, &att, 3);
+    let claim = reserve(
+        &mut store,
+        att.attempt_id,
+        500,
+        &FixedClock(ClockReading(20)),
+        &mut ids,
+    )
+    .unwrap();
+    let projected = store.get_attempt(att.attempt_id).unwrap();
+    let out = rsv_bridge::cross(rsv_bridge::Input {
+        version: rsv_bridge::VERSION,
+        claim: &claim,
+        ratification: &ratification,
+        attempt: &att,
+        existing_dispatch: None,
+        now: ClockReading(30),
+        new_dispatch: DispatchId::from_bytes([8; 16]),
+        new_use: ReservationUseId::from_bytes([9; 16]),
+    })
+    .unwrap();
+    let dispatching = projected
+        .state
+        .dispatch(out.reservation_ref.clone(), out.dispatch_ref.clone())
+        .unwrap();
+    store
+        .record_dispatch(
+            projected.version,
+            &out.envelope,
+            &dispatching,
+            &out.consumed_claim,
+        )
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE standing_grant SET source='upstream',
+             issuance_id='historical-v1-issuance' WHERE id=?1",
+            ["03".repeat(16)],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut store = SqliteStore::open(&database).unwrap();
+    let mut broker = CountingBroker { calls: 0 };
+    let result = dispatch(
+        &mut store,
+        att.attempt_id,
+        &mut broker,
+        &FixedClock(ClockReading(40)),
+        &mut ids,
+    );
+    assert_eq!(
+        result,
+        Err(DispatchError::Store(
+            StoreError::LegacyUpstreamIssuanceRetired
+        ))
+    );
+    assert_eq!(broker.calls, 0, "retired lineage cannot reach the broker");
+    assert_eq!(
+        store.get_attempt(att.attempt_id).unwrap().state,
+        dispatching
+    );
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
 }

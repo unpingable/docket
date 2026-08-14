@@ -19,6 +19,26 @@ command's exit code, not the test runner's.
 
 Never claim tests pass without running them.
 
+## AG/Docket governed-repair contract gate
+
+For any change to governed-repair issuance intake, checkpoint, scope, result,
+label, expiry, or canonical serialization, the ordinary four gates above are
+necessary but not sufficient. AG owns the versioned producer contract and
+Docket is its consequence-bearing consumer. Run AG's offline cross-repository
+gate against this checkout:
+
+```bash
+python3 /path/to/ag/scripts/run_governed_repair_r3_contract_gate.py \
+  --docket-root "$PWD"
+```
+
+This gate verifies the pinned corpus and exercises the actual AG producer and
+Docket consumer serializers and validators. It exits nonzero if either the
+corpus or implemented behavior drifts. Byte-identical copied corpus files by
+themselves do not establish conformance. The gate also pins the behavioral
+test census, so an empty Cargo filter caused by removing or renaming the
+consumer checks is a failure, not a pass.
+
 ## What a change to an invariant costs
 
 The thirty invariants in `docs/governed-runtime/invariants-v0.md` carry provenance tags:

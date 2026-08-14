@@ -6,6 +6,9 @@
 //! the runtime persisted; and every identifier failure is a typed refusal,
 //! never a silent selection.
 
+#[path = "support/sqlite_mutation.rs"]
+mod sqlite_mutation;
+
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::standing::{StandingAct, StandingGrant, StandingScope};
 use gwr_core::effect_spec::GitRefEffect;
@@ -609,9 +612,11 @@ fn no_secret_authority_material_on_new_surfaces() {
 fn malformed_persisted_records_produce_typed_errors_on_new_surfaces() {
     let mut fx = fixture("corrupt");
     drive_committed(&mut fx);
-    fx.store
-        .execute_raw_for_test("UPDATE commitment SET journal_digest='zz'")
-        .unwrap();
+    sqlite_mutation::execute_raw(
+        &fx.root.join("state.sqlite"),
+        "UPDATE commitment SET journal_digest='zz'",
+    )
+    .unwrap();
     let (ok, out) = docket(
         &fx.root,
         &["journal", "--attempt", "09090909090909090909090909090909"],
@@ -619,9 +624,11 @@ fn malformed_persisted_records_produce_typed_errors_on_new_surfaces() {
     assert!(!ok, "corrupt digest column must refuse: {out}");
     assert!(out.contains("Corrupt"), "{out}");
 
-    fx.store
-        .execute_raw_for_test("UPDATE attempt_projection SET state='bogus'")
-        .unwrap();
+    sqlite_mutation::execute_raw(
+        &fx.root.join("state.sqlite"),
+        "UPDATE attempt_projection SET state='bogus'",
+    )
+    .unwrap();
     let (ok, out) = docket(&fx.root, &["list"]);
     assert!(!ok, "corrupt projection must refuse: {out}");
     assert!(out.contains("Corrupt"), "{out}");

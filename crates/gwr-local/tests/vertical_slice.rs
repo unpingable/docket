@@ -1,6 +1,9 @@
 //! Task 9: the complete vertical slice — fake provider through reconciliation
 //! for one exact repository effect, driven through the docket CLI.
 
+#[path = "support/sqlite_mutation.rs"]
+mod sqlite_mutation;
+
 use gwr_core::digest::Sha256Digest;
 use gwr_core::domain::evidence::Claim;
 use gwr_core::ids::{AttemptId, ObservationId};
@@ -631,10 +634,12 @@ fn wrong_commit_observation_is_rejected() {
 
 #[test]
 fn legacy_attempt_subject_refuses_until_selected_explicit_migration() {
-    let mut f = committed_fixture("legacy-migration");
-    f.store
-        .execute_raw_for_test("UPDATE work_request SET repository_id=NULL")
-        .unwrap();
+    let f = committed_fixture("legacy-migration");
+    sqlite_mutation::execute_raw(
+        &f.repo.join(".gwr-state/state.sqlite"),
+        "UPDATE work_request SET repository_id=NULL",
+    )
+    .unwrap();
     let state = f.repo.join(".gwr-state");
 
     let refused = Command::new(env!("CARGO_BIN_EXE_docket"))

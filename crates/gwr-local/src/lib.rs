@@ -4,7 +4,6 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
-pub mod authz_intake;
 pub mod broker;
 pub mod campaign_export;
 pub mod capabilities;

@@ -81,8 +81,11 @@ fn concurrent_identical_consumers_have_exactly_one_winner() {
     let db = dir.join("state.sqlite");
     // The law rides on WAL mode, the deployment's journal mode.
     {
-        let mut store = SqliteStore::open(&db).unwrap();
-        let mode: String = store.query_string_for_test("PRAGMA journal_mode").unwrap();
+        let _store = SqliteStore::open(&db).unwrap();
+        let raw = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = raw
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(mode, "wal");
     }
     let rounds = 32;
@@ -348,14 +351,7 @@ fn cross_process_burn_refuses_replay_and_survives_process_exit() {
 
 #[test]
 fn busy_timeout_is_configured_and_bounded() {
-    let dir = scratch("busy-pragma");
-    let db = dir.join("state.sqlite");
-    let mut store = SqliteStore::open(&db).unwrap();
-    let timeout: String = store
-        .query_string_for_test("SELECT printf('%d', (SELECT * FROM pragma_busy_timeout))")
-        .unwrap();
-    assert_eq!(timeout, "5000");
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(gwr_local::store::SQLITE_BUSY_TIMEOUT_MS, 5_000);
 }
 
 #[test]

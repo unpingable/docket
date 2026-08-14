@@ -9,9 +9,10 @@ gwr-core = { path = "../gwr-core" }
 gwr-runtime = { path = "../gwr-runtime" }
 hmac = "0.12"
 libc = "0.2"
-# Wire-format adapters only: Ed25519 verification of upstream authorization
-# issuances (ring), and strict decoding of the upstream wire records (serde).
-# The store substrate stays serde-free and length-prefixed as before.
+# Wire-format adapters only: Ed25519 verification of canonical governed-loop
+# V2 issuances and externally verified execution-standing records (ring), plus
+# strict decoding of those wire records (serde). The Store substrate remains
+# explicit and length-prefixed rather than serde-derived.
 ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -43,6 +43,10 @@ pub enum StoreError {
     /// A caller attempted to persist or mutate the retired campaign-stage
     /// repair vocabulary. Historical rows remain readable, never writable.
     LegacyCampaignRepairRouteRetired,
+    /// A caller attempted to consume standing that was minted through the
+    /// retired upstream V1 issuance route. The row remains historical
+    /// evidence, but it can no longer authorize a consequence.
+    LegacyUpstreamIssuanceRetired,
     /// The caller asked to persist a state that is not a legal successor of the
     /// attempt's current state.
     IllegalTransition {
@@ -137,6 +141,11 @@ pub trait Store {
     // Attempts.
     fn admit_attempt(&mut self, attempt: &PreparedAttempt) -> Result<(), StoreError>;
     fn get_attempt(&mut self, id: AttemptId) -> Result<ProjectedAttempt, StoreError>;
+
+    /// Refuses consequence entry for an attempt whose ratification descended
+    /// from the retired upstream V1 issuance path. Historical rows remain
+    /// readable; this check grants no standing or authority.
+    fn ensure_attempt_consequence_eligible(&mut self, id: AttemptId) -> Result<(), StoreError>;
     fn find_attempt_dispatch(&mut self, id: AttemptId) -> Result<Option<DispatchId>, StoreError>;
     /// The attempt a persisted dispatch identity belongs to, if any. The
     /// schema guarantees at most one (`dispatch.id` is the primary key and
@@ -146,15 +155,11 @@ pub trait Store {
     /// mid-dispatch can present it to the broker again for inspection.
     fn get_dispatch_envelope(&mut self, id: AttemptId) -> Result<DispatchEnvelope, StoreError>;
 
-    // Standing. `create_standing_grant` records a locally-authorized grant;
-    // `create_upstream_standing_grant` records one justified by a verified
-    // upstream issuance. The issuance is the *basis*: it never becomes the
-    // grant, and one issuance can justify at most one grant.
+    // Standing. New grants are locally authorized or enter through the
+    // canonical governed-loop custody path. Historical upstream-V1 issuance
+    // records remain readable below, but no Store port can create one or mint
+    // standing from one.
     fn create_standing_grant(&mut self, grant: &StandingGrant) -> Result<(), StoreError>;
-    fn record_authz_issuance(
-        &mut self,
-        issuance: &gwr_core::authorization::AcceptedIssuance,
-    ) -> Result<(), StoreError>;
     fn get_authz_issuance(
         &mut self,
         issuance_id: &str,
@@ -164,11 +169,6 @@ pub trait Store {
         &mut self,
         attempt: AttemptId,
     ) -> Result<Option<gwr_core::authorization::AcceptedIssuance>, StoreError>;
-    fn create_upstream_standing_grant(
-        &mut self,
-        grant: &StandingGrant,
-        issuance_id: &str,
-    ) -> Result<(), StoreError>;
     /// The authorization source recorded for a grant. `None` means the grant
     /// predates source recording and reads as unrecorded — never as either
     /// source.

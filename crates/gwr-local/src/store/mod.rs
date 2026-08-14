@@ -237,75 +237,8 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Raw SQL escape hatch for boundary tests that need to corrupt persisted
-    /// records. Test support only.
-    pub fn execute_raw_for_test(&mut self, sql: &str) -> Result<usize, StoreError> {
-        self.conn.execute(sql, []).map_err(backend)
-    }
-
-    /// Raw single-string query for tests asserting deployment properties
-    /// (for example the journal mode the durability law rides on). Test
-    /// support only.
-    pub fn query_string_for_test(&mut self, sql: &str) -> Result<String, StoreError> {
-        self.conn.query_row(sql, [], |r| r.get(0)).map_err(backend)
-    }
-
     fn tx(&mut self) -> Result<Transaction<'_>, StoreError> {
         self.conn.transaction().map_err(backend)
-    }
-
-    /// Insert a commitment row directly. Test support only: it exists so a
-    /// suite can stage another attempt's committed effect without driving that
-    /// attempt's whole lifecycle. It writes no projection.
-    pub fn record_commitment_for_test(
-        &mut self,
-        c: &gwr_core::outcome::Commitment,
-    ) -> Result<(), StoreError> {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO commitment
-                 (attempt, dispatch, target_ref, previous_value, result_commit, journal_digest, at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    id16(c.attempt.as_bytes()),
-                    id16(c.dispatch.as_bytes()),
-                    c.target_ref.as_str(),
-                    c.previous_value.as_str(),
-                    c.result_commit.as_str(),
-                    c.journal_digest.to_hex(),
-                    c.committed_at.0 as i64
-                ],
-            )
-            .map_err(backend)?;
-        Ok(())
-    }
-
-    /// Column names across every table, for boundary tests.
-    pub fn all_column_names(&mut self) -> Result<Vec<String>, StoreError> {
-        let mut names = Vec::new();
-        let tables: Vec<String> = self
-            .conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-            .map_err(backend)?
-            .query_map([], |r| r.get(0))
-            .map_err(backend)?
-            .collect::<Result<_, _>>()
-            .map_err(backend)?;
-        for t in tables {
-            let mut stmt = self
-                .conn
-                .prepare(&format!("PRAGMA table_info({t})"))
-                .map_err(backend)?;
-            let cols: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(1))
-                .map_err(backend)?
-                .collect::<Result<_, _>>()
-                .map_err(backend)?;
-            for c in cols {
-                names.push(format!("{t}.{c}"));
-            }
-        }
-        Ok(names)
     }
 }
 
@@ -555,6 +488,7 @@ fn advance_projection(
     state: &AttemptState,
     at: ClockReading,
 ) -> Result<(), StoreError> {
+    refuse_retired_upstream_attempt(tx, attempt)?;
     let (tag, rat_id, rat_use, rsv_id, rsv_use, dsp, ground, res) = projection_columns(state);
 
     // The store validates the transition it is asked to persist. A persistence
@@ -628,12 +562,60 @@ fn advance_projection(
     Ok(())
 }
 
+/// Refuses every new consequence derived from a ratification whose standing
+/// came from the retired upstream V1 issuance path. Historical issuance,
+/// grant, use, ratification, and attempt rows remain readable, but no later
+/// reservation, dispatch, effect, recovery, reliance, or reconciliation can
+/// treat that lineage as current authority.
+fn refuse_retired_upstream_attempt(
+    connection: &Connection,
+    attempt: AttemptId,
+) -> Result<(), StoreError> {
+    let retired: i64 = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM attempt_projection p
+                 JOIN standing_use u ON u.id=p.rat_standing_use
+                 JOIN standing_grant g ON g.id=u.grant_id
+                 WHERE p.attempt=?1 AND g.source='upstream'
+             )",
+            params![id16(attempt.as_bytes())],
+            |row| row.get(0),
+        )
+        .map_err(backend)?;
+    if retired != 0 {
+        return Err(StoreError::LegacyUpstreamIssuanceRetired);
+    }
+    Ok(())
+}
+
 /// Consume a standing grant inside a transaction, inserting the use record.
 fn consume_standing(
     tx: &Transaction<'_>,
     grant: &StandingGrant,
     use_record: &StandingUse,
 ) -> Result<(), StoreError> {
+    let source: Option<Option<String>> = tx
+        .query_row(
+            "SELECT source FROM standing_grant WHERE id=?1",
+            params![id16(grant.id().as_bytes())],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(backend)?;
+    match source {
+        Some(Some(value)) if value == "upstream" => {
+            return Err(StoreError::LegacyUpstreamIssuanceRetired);
+        }
+        Some(Some(value)) if value != "local" => {
+            return Err(StoreError::Corrupt(format!(
+                "unknown standing authorization source {value:?}"
+            )));
+        }
+        Some(_) => {}
+        None => return Err(StoreError::NotFound),
+    }
     let changed = tx
         .execute(
             "UPDATE standing_projection SET consumed_by=?1, version=version+1
@@ -1443,6 +1425,10 @@ impl Store for SqliteStore {
             .ok_or(StoreError::NotFound)
     }
 
+    fn ensure_attempt_consequence_eligible(&mut self, id: AttemptId) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, id)
+    }
+
     fn create_standing_grant(&mut self, grant: &StandingGrant) -> Result<(), StoreError> {
         let tx = self.tx()?;
         let changed = tx
@@ -1516,6 +1502,7 @@ impl Store for SqliteStore {
         now: ClockReading,
     ) -> Result<(), StoreError> {
         let tx = self.tx()?;
+        refuse_retired_upstream_attempt(&tx, claim.attempt())?;
         // Exclusivity: any active, unexpired reservation on the same repository
         // and target ref conflicts. Conflict produces refusal, not waiting.
         let conflicts: i64 = tx
@@ -1838,6 +1825,7 @@ impl Store for SqliteStore {
     }
 
     fn record_recovery_fact(&mut self, fact: &RecoveryFact) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, fact.attempt)?;
         let (source_kind, source_detail) = source_tags(&fact.source);
         let changed = self
             .conn
@@ -1912,6 +1900,7 @@ impl Store for SqliteStore {
     }
 
     fn record_observation(&mut self, obs: &ObservationRecord) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, obs.attempt)?;
         let changed = self
             .conn
             .execute(
@@ -2039,6 +2028,7 @@ impl Store for SqliteStore {
     }
 
     fn record_reliance_admission(&mut self, adm: &ReviewQueueAdmission) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, adm.attempt)?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO reliance_admission (attempt, observation, result_commit, at)
@@ -2061,6 +2051,7 @@ impl Store for SqliteStore {
         subject: Option<&RelianceSubject>,
         at: ClockReading,
     ) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, attempt)?;
         let (kind, detail) = reliance_refusal_tags(refusal);
         let (observation, consumer, claim) = match subject {
             Some(s) => (
@@ -2089,6 +2080,7 @@ impl Store for SqliteStore {
     }
 
     fn create_residual_obligation(&mut self, ob: &ResidualObligation) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, ob.attempt)?;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO residual_obligation (id, attempt, kind, at)
@@ -2126,6 +2118,7 @@ impl Store for SqliteStore {
     }
 
     fn record_reconciliation(&mut self, rec: &Reconciliation) -> Result<(), StoreError> {
+        refuse_retired_upstream_attempt(&self.conn, rec.attempt)?;
         let retained: Vec<String> = rec
             .retained_obligations
             .iter()
@@ -2409,73 +2402,6 @@ impl Store for SqliteStore {
             .transpose()
     }
 
-    fn record_authz_issuance(&mut self, i: &AcceptedIssuance) -> Result<(), StoreError> {
-        let (kinds, statements): (Vec<String>, Vec<String>) = i
-            .premises
-            .iter()
-            .map(|p| (p.kind.clone(), p.statement.clone()))
-            .unzip();
-        // Residual items are stored as one length-prefixed list of five-field
-        // groups, in the upstream's own vocabulary — never mapped onto Docket's
-        // obligation kinds.
-        let mut residual_fields: Vec<String> = Vec::new();
-        for r in &i.residuals {
-            residual_fields.push(r.source_system.clone());
-            residual_fields.push(r.obligation_id.clone());
-            residual_fields.push(r.subject.clone());
-            residual_fields.push(r.kind.clone());
-            residual_fields.push(r.statement.clone());
-        }
-        let changed = self
-            .conn
-            .execute(
-                "INSERT OR IGNORE INTO authz_issuance
-                 (issuance_id, attempt, decision_id, issuer_principal, issuer_key_id,
-                  target_id, request_raw_sha256, request_upstream_digest, prepared_digest,
-                  requested_actor, issued_at, expires_at, premise_kinds, premise_statements,
-                  residual_status, residual_items, consumption_ledger, consumption_use_digest,
-                  body_b64, accepted_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-                params![
-                    i.issuance_id,
-                    id16(i.attempt.as_bytes()),
-                    i.decision_id,
-                    i.issuer_principal,
-                    i.issuer_key_id,
-                    i.target_id,
-                    i.request_raw_sha256,
-                    i.request_upstream_digest,
-                    i.prepared_digest.to_hex(),
-                    i.requested_actor,
-                    i.issued_at.0 as i64,
-                    i.expires_at.0 as i64,
-                    join_list(&kinds),
-                    join_list(&statements),
-                    i.residual_status.tag(),
-                    join_list(&residual_fields),
-                    i.consumption_ledger,
-                    i.consumption_use_digest,
-                    i.body_b64,
-                    i.accepted_at.0 as i64
-                ],
-            )
-            .map_err(backend)?;
-        if changed == 0 {
-            // An identity already present must name exactly the same accepted
-            // record; a different body under the same identity is substitution.
-            let existing = self.get_authz_issuance(&i.issuance_id)?;
-            match existing {
-                Some(e) if e.body_b64 == i.body_b64 && e.attempt == i.attempt => Ok(()),
-                Some(_) => Err(StoreError::ImmutableRebind),
-                None => Err(StoreError::Backend(
-                    "issuance insert reported no change but no row exists".into(),
-                )),
-            }
-        } else {
-            Ok(())
-        }
-    }
-
     fn get_authz_issuance(
         &mut self,
         issuance_id: &str,
@@ -2587,68 +2513,6 @@ impl Store for SqliteStore {
             Some(id) => self.get_authz_issuance(&id),
             None => Ok(None),
         }
-    }
-
-    fn create_upstream_standing_grant(
-        &mut self,
-        grant: &StandingGrant,
-        issuance_id: &str,
-    ) -> Result<(), StoreError> {
-        // One issuance justifies at most one grant, across attempts and
-        // repetitions. Checked explicitly so the refusal is legible rather than
-        // an ignored insert.
-        let existing_for_issuance: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM standing_grant WHERE issuance_id=?1",
-                params![issuance_id],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(backend)?;
-        if let Some(existing) = existing_for_issuance {
-            if existing != id16(grant.id().as_bytes()) {
-                return Err(StoreError::ImmutableRebind);
-            }
-            return Ok(());
-        }
-        let tx = self.tx()?;
-        let changed = tx
-            .execute(
-                "INSERT OR IGNORE INTO standing_grant
-                 (id, actor, act, repository, attempt_digest, expires_at, source, issuance_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,'upstream',?7)",
-                params![
-                    id16(grant.id().as_bytes()),
-                    id16(grant.scope().actor.as_bytes()),
-                    act_tag(grant.scope().act),
-                    grant.scope().repository.as_str(),
-                    grant.scope().attempt_digest.to_hex(),
-                    grant.expires_at().0 as i64,
-                    issuance_id
-                ],
-            )
-            .map_err(|e| {
-                if e.to_string().contains("UNIQUE") {
-                    StoreError::ImmutableRebind
-                } else {
-                    backend(e)
-                }
-            })?;
-        if changed == 0 {
-            drop(tx);
-            let existing = self.get_standing_grant(grant.id())?;
-            if existing.scope() != grant.scope() || existing.expires_at() != grant.expires_at() {
-                return Err(StoreError::ImmutableRebind);
-            }
-            return Ok(());
-        }
-        tx.execute(
-            "INSERT INTO standing_projection (grant_id, consumed_by, version) VALUES (?1, NULL, 0)",
-            params![id16(grant.id().as_bytes())],
-        )
-        .map_err(backend)?;
-        tx.commit().map_err(backend)
     }
 
     fn get_grant_authorization(

@@ -7,6 +7,9 @@
 //! — it is that a malformed invocation must not consume or strand a committed
 //! attempt. Nothing may be run and no record written before the refusal.
 
+#[path = "support/commitment.rs"]
+mod commitment_fixture;
+
 use gwr_core::digest::Sha256Digest;
 use gwr_core::effect_spec::GitRefEffect;
 use gwr_core::ids::*;
@@ -48,7 +51,8 @@ fn an_empty_observation_plan_refuses_cleanly_and_strands_nothing() {
     let root = std::env::temp_dir().join(format!("gwr-emptyplan-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let mut store = SqliteStore::open(&root.join("s.sqlite")).unwrap();
+    let db = root.join("s.sqlite");
+    let mut store = SqliteStore::open(&db).unwrap();
 
     let att = attempt_with(vec![]);
     store.admit_attempt(&att).unwrap();
@@ -63,7 +67,7 @@ fn an_empty_observation_plan_refuses_cleanly_and_strands_nothing() {
         journal_digest: Sha256Digest::of_bytes(b"j"),
         committed_at: ClockReading(2),
     };
-    store.record_commitment_for_test(&commitment).unwrap();
+    commitment_fixture::record(&db, &commitment).unwrap();
 
     let before = store.get_attempt(att.attempt_id).unwrap();
     let r = observe(
@@ -106,12 +110,14 @@ fn a_non_empty_plan_is_not_refused_for_being_empty() {
     let root = std::env::temp_dir().join(format!("gwr-nonemptyplan-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    let mut store = SqliteStore::open(&root.join("s.sqlite")).unwrap();
+    let db = root.join("s.sqlite");
+    let mut store = SqliteStore::open(&db).unwrap();
 
     let att = attempt_with(vec!["true".into()]);
     store.admit_attempt(&att).unwrap();
-    store
-        .record_commitment_for_test(&Commitment {
+    commitment_fixture::record(
+        &db,
+        &Commitment {
             attempt: att.attempt_id,
             dispatch: DispatchId::from_bytes([5; 16]),
             target_ref: RefName::new("refs/gwr/target"),
@@ -119,8 +125,9 @@ fn a_non_empty_plan_is_not_refused_for_being_empty() {
             result_commit: CommitHash::new("result"),
             journal_digest: Sha256Digest::of_bytes(b"j"),
             committed_at: ClockReading(2),
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
 
     // The repository does not exist, so this fails at worktree creation — an
     // I/O error, which is precisely *not* EmptyObservationPlan.
