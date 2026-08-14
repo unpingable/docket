@@ -18,6 +18,7 @@ use gwr_core::governed_repair::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 pub const SCOPE_EXPANSION_REQUIRED_SCHEMA_V1: &str =
     "docket.governed-repair.scope-expansion-required/v1";
@@ -83,7 +84,7 @@ pub struct GovernedRepairBindingWireV1 {
     pub original_scope: CanonicalEffectScopeWireV1,
     pub original_scope_digest: String,
     pub effect_journal_digest: String,
-    pub authorized_effects_occurred: bool,
+    pub reported_authorized_effects_occurred: bool,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub idempotency: String,
@@ -100,7 +101,10 @@ pub struct ScopeExpansionRequiredWireV1 {
     pub blocked_effect: BlockedEffectWireV1,
     pub reason: String,
     pub dependency_evidence: Vec<String>,
-    pub unauthorized_effect_not_performed: bool,
+    /// True only when the complete journal reported by the mediated executor
+    /// contains no effect outside issuance scope. It is not a claim of
+    /// physical non-occurrence beyond that reporting boundary.
+    pub no_unauthorized_effect_reported: bool,
     pub limitations: Vec<String>,
 }
 
@@ -116,12 +120,20 @@ pub struct ReadjudicationRequiredWireV1 {
     pub bounded_alternatives: Vec<String>,
     pub unresolved_facts: Vec<String>,
     pub adjudication_scope: CanonicalEffectScopeWireV1,
-    pub unauthorized_effect_not_performed: bool,
+    /// True only when the complete journal reported by the mediated executor
+    /// contains no effect outside issuance scope. It is not a claim of
+    /// physical non-occurrence beyond that reporting boundary.
+    pub no_unauthorized_effect_reported: bool,
     pub limitations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "requirement", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "requirement",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum SealedGovernedRepairRequirementWireV1 {
     ScopeExpansionRequired(ScopeExpansionRequiredWireV1),
     ReadjudicationRequired(ReadjudicationRequiredWireV1),
@@ -141,6 +153,11 @@ pub struct GovernedRepairCheckpointWireV1 {
     pub requirement_kind: String,
     pub requirement_identity: String,
     pub effect_journal_digest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::governed_loop::deserialize_present_some"
+    )]
     pub immutable_work_checkpoint: Option<ImmutableWorkCheckpointWireV1>,
     pub idempotency: String,
     pub created_at_unix_ms: u64,
@@ -153,8 +170,13 @@ pub struct ImmutableWorkCheckpointWireV1 {
     pub repository_identity: String,
     pub commit: String,
     pub tree: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::governed_loop::deserialize_present_some"
+    )]
     pub diff_identity: Option<String>,
-    pub content_manifest_identity: Option<String>,
+    pub content_manifest_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -196,14 +218,27 @@ pub(crate) fn seal_requirement(
         executor_binding,
         executor_receipt,
         draft,
-        journal,
+        journal: latest_journal,
         immutable_work_checkpoint,
         now_unix_ms,
     } = input;
     parse_digest(executor_receipt)?;
-    let executor_result =
-        executor_result_identity(executor_receipt, &draft, journal, immutable_work_checkpoint)?;
-    let effect_journal_digest = validate_effect_journal(&issuance.effect_scope, journal)?;
+    // An immediate transaction makes the cumulative-journal read, terminal
+    // checkpoint insert, and custody terminalization one indivisible Store
+    // decision. A late indeterminate observation can neither disappear from
+    // the seal nor append after it.
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("governed-repair-transaction:{error}"))?;
+    let journal =
+        cumulative_effect_journal_with(&tx, &issuance.issuance, &custody.attempt, latest_journal)?;
+    let executor_result = executor_result_identity(
+        executor_receipt,
+        &draft,
+        &journal,
+        immutable_work_checkpoint,
+    )?;
+    let effect_journal_digest = validate_effect_journal(&issuance.effect_scope, &journal)?;
     if let ExecutorGovernedRepairRequirementWireV1::ScopeExpansionRequired {
         blocked_effect, ..
     } = &draft
@@ -230,10 +265,10 @@ pub(crate) fn seal_requirement(
         executor_binding,
         executor_result: &executor_result,
         effect_journal_digest: &effect_journal_digest,
-        authorized_effects_occurred: !journal.is_empty(),
+        reported_authorized_effects_occurred: !journal.is_empty(),
         draft: &draft,
     })?;
-    verify_ag_scope_identity(&issuance.effect_scope, &issuance.effect_scope_digest)?;
+    validate_ag_effect_scope_identity(&issuance.effect_scope, &issuance.effect_scope_digest)?;
     let (requirement, wire) = convert_requirement(common, draft)?;
     let requirement_identity = qualified(
         requirement
@@ -281,7 +316,9 @@ pub(crate) fn seal_requirement(
         checkpoint,
         outcome,
     };
-    append_exact(connection, issuance, &result, journal)?;
+    append_exact(&tx, issuance, &result, &journal)?;
+    tx.commit()
+        .map_err(|error| format!("governed-repair-commit:{error}"))?;
     read_sealed_result(connection, &issuance.issuance)?
         .ok_or_else(|| "governed-repair-checkpoint-disappeared".to_owned())
 }
@@ -296,7 +333,7 @@ pub(crate) fn read_sealed_result(
                     requirement_kind,requirement_identity,campaign,occurrence,proposal,observation,
                     standing_resolution,admission_decision,spend,original_scope_digest,
                     effect_journal_digest,effect_journal_entries,work_repository_identity,work_commit,work_tree,
-                    work_diff_identity,work_content_manifest_identity,authorized_effects_occurred,
+                    work_diff_identity,work_content_manifest_identity,reported_authorized_effects_occurred,
                     idempotency,created_at,expires_at
              FROM governed_repair_checkpoint WHERE issuance=?1",
             [issuance],
@@ -360,7 +397,7 @@ pub(crate) fn read_sealed_result(
         work_tree,
         work_diff,
         work_manifest,
-        authorized_effects_occurred,
+        reported_authorized_effects_occurred,
         idempotency,
         created_at,
         expires_at,
@@ -368,6 +405,17 @@ pub(crate) fn read_sealed_result(
     else {
         return Ok(None);
     };
+    let no_unauthorized_effect_reported: i64 = connection
+        .query_row(
+            "SELECT no_unauthorized_effect_reported
+             FROM governed_repair_checkpoint WHERE issuance=?1",
+            [issuance],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("governed-repair-observation-read:{error}"))?;
+    if no_unauthorized_effect_reported != 1 {
+        return Err("governed-repair-observation-substitution".to_owned());
+    }
     let signed_body: String = connection
         .query_row(
             "SELECT signed_body_b64 FROM governed_loop_attempt WHERE issuance=?1",
@@ -376,8 +424,8 @@ pub(crate) fn read_sealed_result(
         )
         .map_err(|error| format!("governed-repair-issuance-read:{error}"))?;
     let issuance_body = decode_base64url(&signed_body)?;
-    let issuance_wire: AgIssuanceWireV2 = serde_json::from_slice(&issuance_body)
-        .map_err(|error| format!("governed-repair-issuance-json:{error}"))?;
+    let issuance_wire: AgIssuanceWireV2 =
+        crate::governed_loop::strict_json(&issuance_body, "governed-repair-issuance")?;
     let binding = GovernedRepairBindingWireV1 {
         campaign,
         occurrence,
@@ -394,7 +442,7 @@ pub(crate) fn read_sealed_result(
         original_scope: issuance_wire.effect_scope.clone(),
         original_scope_digest,
         effect_journal_digest: effect_journal_digest.clone(),
-        authorized_effects_occurred: authorized_effects_occurred == 1,
+        reported_authorized_effects_occurred: reported_authorized_effects_occurred == 1,
         created_at_unix_ms: to_u64(created_at)?,
         expires_at_unix_ms: to_u64(expires_at)?,
         idempotency: idempotency.clone(),
@@ -433,7 +481,7 @@ pub(crate) fn read_sealed_result(
                 Some(commit),
                 Some(tree),
                 diff_identity,
-                content_manifest_identity,
+                Some(content_manifest_identity),
             ) => Some(ImmutableWorkCheckpointWireV1 {
                 repository_identity,
                 commit,
@@ -490,7 +538,7 @@ struct CommonBindingInputV1<'a> {
     executor_binding: &'a str,
     executor_result: &'a str,
     effect_journal_digest: &'a str,
-    authorized_effects_occurred: bool,
+    reported_authorized_effects_occurred: bool,
     draft: &'a ExecutorGovernedRepairRequirementWireV1,
 }
 
@@ -502,7 +550,7 @@ fn common_binding(input: CommonBindingInputV1<'_>) -> Result<GovernedRepairBindi
         executor_binding,
         executor_result,
         effect_journal_digest,
-        authorized_effects_occurred,
+        reported_authorized_effects_occurred,
         draft,
     } = input;
     for value in [executor_binding, executor_result, custody_identity] {
@@ -540,7 +588,7 @@ fn common_binding(input: CommonBindingInputV1<'_>) -> Result<GovernedRepairBindi
         original_scope: issuance.effect_scope.clone(),
         original_scope_digest: issuance.effect_scope_digest.clone(),
         effect_journal_digest: effect_journal_digest.to_owned(),
-        authorized_effects_occurred,
+        reported_authorized_effects_occurred,
         created_at_unix_ms: created,
         expires_at_unix_ms: expires,
         idempotency: idempotency.clone(),
@@ -562,7 +610,7 @@ fn convert_requirement(
             limitations,
             ..
         } => {
-            verify_ag_scope_identity(&requested_delta, &requested_delta_digest)?;
+            validate_ag_effect_scope_identity(&requested_delta, &requested_delta_digest)?;
             let core_delta = to_core_delta(&requested_delta);
             let core = ScopeExpansionRequiredV1 {
                 binding: core_binding,
@@ -576,7 +624,7 @@ fn convert_requirement(
                 },
                 reason: parse_digest(&reason)?,
                 dependency_evidence: parse_digests(&dependency_evidence)?,
-                unauthorized_effect_not_performed: true,
+                no_unauthorized_effect_reported: true,
                 limitations: parse_digests(&limitations)?,
             };
             let wire = ScopeExpansionRequiredWireV1 {
@@ -588,7 +636,7 @@ fn convert_requirement(
                 blocked_effect,
                 reason,
                 dependency_evidence,
-                unauthorized_effect_not_performed: true,
+                no_unauthorized_effect_reported: true,
                 limitations,
             };
             (
@@ -614,7 +662,7 @@ fn convert_requirement(
                 bounded_alternatives: parse_digests(&bounded_alternatives)?,
                 unresolved_facts: parse_digests(&unresolved_facts)?,
                 adjudication_scope: to_core_scope(&adjudication_scope),
-                unauthorized_effect_not_performed: true,
+                no_unauthorized_effect_reported: true,
                 limitations: parse_digests(&limitations)?,
             };
             let wire = ReadjudicationRequiredWireV1 {
@@ -627,7 +675,7 @@ fn convert_requirement(
                 bounded_alternatives,
                 unresolved_facts,
                 adjudication_scope,
-                unauthorized_effect_not_performed: true,
+                no_unauthorized_effect_reported: true,
                 limitations,
             };
             (
@@ -639,15 +687,12 @@ fn convert_requirement(
 }
 
 fn append_exact(
-    connection: &mut Connection,
+    tx: &Transaction<'_>,
     issuance: &AgIssuanceWireV2,
     result: &StoreSealedGovernedRepairResultV1,
     journal: &[EffectJournalEntryWireV1],
 ) -> Result<(), String> {
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("governed-repair-transaction:{error}"))?;
-    if let Some(existing) = read_sealed_result(&tx, &issuance.issuance)? {
+    if let Some(existing) = read_sealed_result(tx, &issuance.issuance)? {
         return if existing == *result {
             Ok(())
         } else {
@@ -671,7 +716,7 @@ fn append_exact(
           requirement_kind,requirement_identity,campaign,occurrence,proposal,observation,
           standing_resolution,admission_decision,spend,original_scope_digest,effect_journal_digest,effect_journal_entries,
           work_repository_identity,work_commit,work_tree,work_diff_identity,work_content_manifest_identity,
-          authorized_effects_occurred,unauthorized_effect_not_performed,idempotency,created_at,expires_at)
+          reported_authorized_effects_occurred,no_unauthorized_effect_reported,idempotency,created_at,expires_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
                  ?19,?20,?21,?22,?23,?24,?25,?26,1,?27,?28,?29)",
         params![result.checkpoint.checkpoint, result.sealed_result, result.checkpoint.issuance,
@@ -686,8 +731,8 @@ fn append_exact(
             result.checkpoint.immutable_work_checkpoint.as_ref().map(|value| &value.commit),
             result.checkpoint.immutable_work_checkpoint.as_ref().map(|value| &value.tree),
             result.checkpoint.immutable_work_checkpoint.as_ref().and_then(|value| value.diff_identity.as_ref()),
-            result.checkpoint.immutable_work_checkpoint.as_ref().and_then(|value| value.content_manifest_identity.as_ref()),
-            i64::from(binding.authorized_effects_occurred), binding.idempotency,
+            result.checkpoint.immutable_work_checkpoint.as_ref().map(|value| &value.content_manifest_identity),
+            i64::from(binding.reported_authorized_effects_occurred), binding.idempotency,
             to_i64(binding.created_at_unix_ms)?, to_i64(binding.expires_at_unix_ms)?],
     ).map_err(|error| format!("governed-repair-checkpoint-write:{error}"))?;
     match &result.outcome {
@@ -725,8 +770,7 @@ fn append_exact(
             .map_err(|error| format!("governed-repair-readjudication-write:{error}"))?;
         }
     }
-    tx.commit()
-        .map_err(|error| format!("governed-repair-commit:{error}"))
+    Ok(())
 }
 
 fn outcome_binding(
@@ -755,7 +799,7 @@ fn to_core_binding(value: &GovernedRepairBindingWireV1) -> Result<GovernedRepair
         original_scope: to_core_scope(&value.original_scope),
         original_scope_digest: parse_digest(&value.original_scope_digest)?,
         effect_journal_digest: parse_digest(&value.effect_journal_digest)?,
-        authorized_effects_occurred: value.authorized_effects_occurred,
+        reported_authorized_effects_occurred: value.reported_authorized_effects_occurred,
         created_at_unix_ms: value.created_at_unix_ms,
         expires_at_unix_ms: value.expires_at_unix_ms,
         idempotency: parse_digest(&value.idempotency)?,
@@ -881,7 +925,7 @@ fn read_scope(
                             },
                             reason,
                             dependency_evidence: split_list(&evidence)?,
-                            unauthorized_effect_not_performed: true,
+                            no_unauthorized_effect_reported: true,
                             limitations: split_list(&limitations)?,
                         },
                     ),
@@ -928,7 +972,7 @@ fn read_readjudication(
                             bounded_alternatives: split_list(&alternatives)?,
                             unresolved_facts: split_list(&facts)?,
                             adjudication_scope: decode_scope(&scope)?,
-                            unauthorized_effect_not_performed: true,
+                            no_unauthorized_effect_reported: true,
                             limitations: split_list(&limitations)?,
                         },
                     ),
@@ -937,12 +981,15 @@ fn read_readjudication(
         )
 }
 
-fn validate_read_result(
+pub(crate) fn validate_read_result(
     result: &StoreSealedGovernedRepairResultV1,
     issuance: &AgIssuanceWireV2,
     journal: &[EffectJournalEntryWireV1],
 ) -> Result<(), String> {
-    verify_ag_scope_identity(&issuance.effect_scope, &issuance.effect_scope_digest)?;
+    validate_ag_effect_scope_identity(&issuance.effect_scope, &issuance.effect_scope_digest)?;
+    if let SealedGovernedRepairRequirementWireV1::ScopeExpansionRequired(value) = &result.outcome {
+        validate_ag_effect_scope_identity(&value.requested_delta, &value.requested_delta_digest)?;
+    }
     let binding = outcome_binding(&result.outcome);
     if result.schema != SEALED_GOVERNED_REPAIR_RESULT_SCHEMA_V1
         || result.checkpoint.schema != GOVERNED_REPAIR_CHECKPOINT_SCHEMA_V1
@@ -979,7 +1026,7 @@ fn validate_read_result(
     }
     if validate_effect_journal(&issuance.effect_scope, journal)?
         != result.checkpoint.effect_journal_digest
-        || binding.authorized_effects_occurred == journal.is_empty()
+        || binding.reported_authorized_effects_occurred == journal.is_empty()
     {
         return Err("governed-repair-stored-journal-substitution".to_owned());
     }
@@ -1036,7 +1083,7 @@ fn wire_to_core_requirement(
                 },
                 reason: parse_digest(&value.reason)?,
                 dependency_evidence: parse_digests(&value.dependency_evidence)?,
-                unauthorized_effect_not_performed: value.unauthorized_effect_not_performed,
+                no_unauthorized_effect_reported: value.no_unauthorized_effect_reported,
                 limitations: parse_digests(&value.limitations)?,
             })
         }
@@ -1049,7 +1096,7 @@ fn wire_to_core_requirement(
                 bounded_alternatives: parse_digests(&value.bounded_alternatives)?,
                 unresolved_facts: parse_digests(&value.unresolved_facts)?,
                 adjudication_scope: to_core_scope(&value.adjudication_scope),
-                unauthorized_effect_not_performed: value.unauthorized_effect_not_performed,
+                no_unauthorized_effect_reported: value.no_unauthorized_effect_reported,
                 limitations: parse_digests(&value.limitations)?,
             })
         }
@@ -1161,7 +1208,7 @@ fn executor_result_identity(
             limitations,
             ..
         } => {
-            verify_ag_scope_identity(requested_delta, requested_delta_digest)?;
+            validate_ag_effect_scope_identity(requested_delta, requested_delta_digest)?;
             let mut value = transcript
                 .text_field("requested_delta", requested_delta_digest)
                 .text_field("blocked_effect_class", &blocked_effect.effect_class)
@@ -1290,10 +1337,7 @@ fn work_checkpoint_transcript(
         .text_field("work_commit", &work.commit)
         .text_field("work_tree", &work.tree)
         .text_field("work_diff", work.diff_identity.as_deref().unwrap_or(""))
-        .text_field(
-            "work_content_manifest",
-            work.content_manifest_identity.as_deref().unwrap_or(""),
-        )
+        .text_field("work_content_manifest", &work.content_manifest_identity)
 }
 
 fn validate_effect_journal_unscoped(
@@ -1315,14 +1359,38 @@ fn validate_effect_journal_unscoped(
 fn ag_jcs_identity<T: Serialize + ?Sized>(domain: &str, value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value)
         .map_err(|error| format!("governed-repair-canonical:{error}"))?;
+    validate_safe_json_value(&value)?;
     let bytes =
-        serde_json::to_vec(&value).map_err(|error| format!("governed-repair-canonical:{error}"))?;
+        serde_jcs::to_vec(&value).map_err(|error| format!("governed-repair-canonical:{error}"))?;
     Ok(hash_domain(domain, &bytes))
 }
-fn verify_ag_scope_identity(
+
+fn validate_safe_json_value(value: &serde_json::Value) -> Result<(), String> {
+    match value {
+        serde_json::Value::Number(number) => {
+            const LIMIT: u64 = 9_007_199_254_740_991;
+            if number.as_u64().is_some_and(|value| value <= LIMIT)
+                || number
+                    .as_i64()
+                    .is_some_and(|value| value >= -(LIMIT as i64) && value <= LIMIT as i64)
+            {
+                Ok(())
+            } else {
+                Err("governed-repair-number-outside-jcs-safe-integer-domain".to_owned())
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().try_for_each(validate_safe_json_value),
+        serde_json::Value::Object(values) => values.values().try_for_each(validate_safe_json_value),
+        _ => Ok(()),
+    }
+}
+pub(crate) fn validate_ag_effect_scope_identity(
     value: &CanonicalEffectScopeWireV1,
     expected: &str,
 ) -> Result<(), String> {
+    to_core_scope(value)
+        .validate()
+        .map_err(|refusal| format!("governed-repair-effect-scope:{refusal:?}"))?;
     if ag_jcs_identity("ag.governed-loop.canonical-effect-scope/v1", value)? != expected {
         return Err("governed-repair-effect-scope-identity".to_owned());
     }
@@ -1361,6 +1429,145 @@ pub(crate) struct OrdinaryExecutorResultInputV1<'a> {
     pub scope: &'a CanonicalEffectScopeWireV1,
     pub entries: &'a [EffectJournalEntryWireV1],
     pub recorded_at: u64,
+}
+
+/// Backfills the R2 cumulative journal columns from the immutable pre-R2
+/// observation order. This is evidence migration only; it creates no custody,
+/// standing, or executor result.
+pub(crate) fn backfill_cumulative_executor_journals(connection: &Connection) -> Result<(), String> {
+    let rows: Vec<(i64, String, String)> = connection
+        .prepare(
+            "SELECT sequence,issuance,effect_journal_entries
+             FROM governed_executor_result ORDER BY sequence",
+        )
+        .map_err(|error| format!("governed-cumulative-migration-read:{error}"))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|error| format!("governed-cumulative-migration-read:{error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("governed-cumulative-migration-read:{error}"))?;
+    let mut cumulative: BTreeMap<String, Vec<EffectJournalEntryWireV1>> = BTreeMap::new();
+    for (sequence, issuance, encoded) in rows {
+        let entries = decode_journal(&encoded)?;
+        let aggregate = cumulative.entry(issuance).or_default();
+        merge_effect_journal(aggregate, &entries)?;
+        let aggregate_encoded = encode_journal(aggregate);
+        let aggregate_digest = validate_effect_journal_unscoped(aggregate)?;
+        connection
+            .execute(
+                "UPDATE governed_executor_result
+                 SET cumulative_effect_journal_digest=?1,
+                     cumulative_effect_journal_entries=?2
+                 WHERE sequence=?3",
+                params![aggregate_digest, aggregate_encoded, sequence],
+            )
+            .map_err(|error| format!("governed-cumulative-migration-write:{error}"))?;
+    }
+    // A pre-R2 terminal governed-repair result cannot be rewritten safely:
+    // its journal participates in executor-result, requirement, checkpoint,
+    // and sealed-result identities. Verify that any prior ordinary effects
+    // were already included in the terminal journal; otherwise fail the whole
+    // migration transaction instead of opening a store with false lineage.
+    let terminal_rows: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT issuance,effect_journal_entries
+             FROM governed_repair_checkpoint ORDER BY issuance",
+        )
+        .map_err(|error| format!("governed-cumulative-migration-terminal-read:{error}"))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| format!("governed-cumulative-migration-terminal-read:{error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("governed-cumulative-migration-terminal-read:{error}"))?;
+    for (issuance, terminal_encoded) in terminal_rows {
+        let terminal = decode_journal(&terminal_encoded)?;
+        let mut complete = cumulative.get(&issuance).cloned().unwrap_or_default();
+        merge_effect_journal(&mut complete, &terminal)?;
+        if complete != terminal {
+            return Err("governed-cumulative-migration-terminal-journal-incomplete".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn prior_cumulative_effect_journal(
+    connection: &Connection,
+    issuance: &str,
+    attempt: &str,
+) -> Result<Vec<EffectJournalEntryWireV1>, String> {
+    let encoded: Option<String> = connection
+        .query_row(
+            "SELECT cumulative_effect_journal_entries
+             FROM governed_executor_result
+             WHERE issuance=?1 AND attempt=?2 ORDER BY sequence DESC LIMIT 1",
+            params![issuance, attempt],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("governed-cumulative-journal-read:{error}"))?;
+    encoded.map_or_else(|| Ok(Vec::new()), |value| decode_journal(&value))
+}
+
+pub(crate) fn cumulative_effect_journal_with(
+    connection: &Connection,
+    issuance: &str,
+    attempt: &str,
+    entries: &[EffectJournalEntryWireV1],
+) -> Result<Vec<EffectJournalEntryWireV1>, String> {
+    let mut cumulative = prior_cumulative_effect_journal(connection, issuance, attempt)?;
+    merge_effect_journal(&mut cumulative, entries)?;
+    Ok(cumulative)
+}
+
+/// Returns the exact cumulative journal identity at the latest durable
+/// executor-observation cut. The stored entries are revalidated rather than
+/// trusting the digest column in isolation.
+pub(crate) fn latest_cumulative_effect_journal_identity(
+    connection: &Connection,
+    issuance: &str,
+    attempt: &str,
+    scope: &CanonicalEffectScopeWireV1,
+) -> Result<Option<String>, String> {
+    let stored: Option<(String, String)> = connection
+        .query_row(
+            "SELECT cumulative_effect_journal_digest,cumulative_effect_journal_entries
+             FROM governed_executor_result
+             WHERE issuance=?1 AND attempt=?2 ORDER BY sequence DESC LIMIT 1",
+            params![issuance, attempt],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("governed-cumulative-journal-identity-read:{error}"))?;
+    stored
+        .map(|(identity, encoded)| {
+            let entries = decode_journal(&encoded)?;
+            if validate_effect_journal(scope, &entries)? != identity {
+                return Err("governed-executor-cumulative-journal-substitution".to_owned());
+            }
+            Ok(identity)
+        })
+        .transpose()
+}
+
+/// Extends one occurrence's ordered cumulative journal. A later observation
+/// may repeat an already reported exact effect without inventing a second
+/// occurrence, but reusing an effect identity with different coordinates is a
+/// replay contradiction and fails closed.
+fn merge_effect_journal(
+    cumulative: &mut Vec<EffectJournalEntryWireV1>,
+    entries: &[EffectJournalEntryWireV1],
+) -> Result<(), String> {
+    for entry in entries {
+        if let Some(existing) = cumulative
+            .iter()
+            .find(|existing| existing.effect_identity == entry.effect_identity)
+        {
+            if existing != entry {
+                return Err("governed-executor-effect-identity-collision".to_owned());
+            }
+            continue;
+        }
+        cumulative.push(entry.clone());
+    }
+    Ok(())
 }
 
 pub(crate) fn append_ordinary_executor_result(
@@ -1405,11 +1612,28 @@ pub(crate) fn append_ordinary_executor_result(
             Err("governed-executor-result-replay-collision".to_owned())
         };
     }
+    let (status, checkpoint_exists): (String, i64) = tx
+        .query_row(
+            "SELECT status,
+                    EXISTS(SELECT 1 FROM governed_repair_checkpoint WHERE issuance=?1)
+             FROM governed_loop_attempt WHERE issuance=?1 AND attempt=?2",
+            params![issuance, attempt],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("governed-executor-result-terminal-read:{error}"))?;
+    if !matches!(status.as_str(), "accepted" | "indeterminate") || checkpoint_exists != 0 {
+        return Err("governed-executor-result-after-terminal".to_owned());
+    }
+    let cumulative = cumulative_effect_journal_with(tx, issuance, attempt, entries)?;
+    let cumulative_journal = validate_effect_journal(scope, &cumulative)?;
+    let cumulative_encoded = encode_journal(&cumulative);
     tx.execute(
         "INSERT INTO governed_executor_result
-         (issuance,attempt,result_identity,outcome,receipt,effect_journal_digest,effect_journal_entries,recorded_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![issuance, attempt, identity, outcome, receipt, journal, encoded, to_i64(recorded_at)?],
+         (issuance,attempt,result_identity,outcome,receipt,effect_journal_digest,effect_journal_entries,
+          cumulative_effect_journal_digest,cumulative_effect_journal_entries,recorded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![issuance, attempt, identity, outcome, receipt, journal, encoded,
+            cumulative_journal, cumulative_encoded, to_i64(recorded_at)?],
     )
     .map_err(|error| format!("governed-executor-result-write:{error}"))?;
     Ok(false)
@@ -1422,9 +1646,10 @@ pub(crate) fn validate_ordinary_executor_result(
     status: &str,
     scope: &CanonicalEffectScopeWireV1,
 ) -> Result<(), String> {
-    let rows: Vec<(String, String, String, String, String)> = connection
+    let rows: Vec<(String, String, String, String, String, String, String)> = connection
         .prepare(
-            "SELECT result_identity,outcome,receipt,effect_journal_digest,effect_journal_entries
+            "SELECT result_identity,outcome,receipt,effect_journal_digest,effect_journal_entries,
+                    cumulative_effect_journal_digest,cumulative_effect_journal_entries
              FROM governed_executor_result WHERE issuance=?1 AND attempt=?2 ORDER BY sequence",
         )
         .map_err(|error| format!("governed-executor-result-read:{error}"))?
@@ -1435,6 +1660,8 @@ pub(crate) fn validate_ordinary_executor_result(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
             ))
         })
         .map_err(|error| format!("governed-executor-result-read:{error}"))?
@@ -1450,7 +1677,17 @@ pub(crate) fn validate_ordinary_executor_result(
     if rows.is_empty() {
         return Err("governed-executor-result-missing".to_owned());
     }
-    for (identity, outcome, receipt, journal_identity, encoded) in &rows {
+    let mut cumulative = Vec::new();
+    for (
+        identity,
+        outcome,
+        receipt,
+        journal_identity,
+        encoded,
+        cumulative_identity,
+        cumulative_encoded,
+    ) in &rows
+    {
         let entries = decode_journal(encoded)?;
         if validate_effect_journal(scope, &entries)? != *journal_identity {
             return Err("governed-executor-journal-substitution".to_owned());
@@ -1468,6 +1705,12 @@ pub(crate) fn validate_ordinary_executor_result(
             || !matches!(outcome.as_str(), "success" | "failure" | "indeterminate")
         {
             return Err("governed-executor-result-substitution".to_owned());
+        }
+        merge_effect_journal(&mut cumulative, &entries)?;
+        if decode_journal(cumulative_encoded)? != cumulative
+            || validate_effect_journal(scope, &cumulative)? != *cumulative_identity
+        {
+            return Err("governed-executor-cumulative-journal-substitution".to_owned());
         }
     }
     let final_outcome = &rows
@@ -1503,9 +1746,7 @@ fn validate_work_checkpoint(value: &ImmutableWorkCheckpointWireV1) -> Result<(),
     if let Some(identity) = &value.diff_identity {
         parse_digest(identity)?;
     }
-    if let Some(identity) = &value.content_manifest_identity {
-        parse_digest(identity)?;
-    }
+    parse_digest(&value.content_manifest_identity)?;
     Ok(())
 }
 fn hash_domain(domain: &str, payload: &[u8]) -> String {
@@ -1645,6 +1886,13 @@ fn decode_journal(value: &str) -> Result<Vec<EffectJournalEntryWireV1>, String> 
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn decode_journal_for_test(
+    value: &str,
+) -> Result<Vec<EffectJournalEntryWireV1>, String> {
+    decode_journal(value)
+}
+
 fn decode_base64url(value: &str) -> Result<Vec<u8>, String> {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut acc = 0_u32;
@@ -1668,8 +1916,99 @@ fn decode_base64url(value: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 fn to_i64(value: u64) -> Result<i64, String> {
+    if value > 9_007_199_254_740_991 {
+        return Err("governed-repair-time-outside-jcs-safe-integer-domain".to_owned());
+    }
     i64::try_from(value).map_err(|_| "governed-repair-time-range".to_owned())
 }
 fn to_u64(value: i64) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| "governed-repair-time-corrupt".to_owned())
+    let value = u64::try_from(value).map_err(|_| "governed-repair-time-corrupt".to_owned())?;
+    if value > 9_007_199_254_740_991 {
+        return Err("governed-repair-time-outside-jcs-safe-integer-domain".to_owned());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn checkpoint(work: Option<ImmutableWorkCheckpointWireV1>) -> GovernedRepairCheckpointWireV1 {
+        GovernedRepairCheckpointWireV1 {
+            schema: GOVERNED_REPAIR_CHECKPOINT_SCHEMA_V1.to_owned(),
+            checkpoint: digest('1'),
+            issuance: digest('2'),
+            custody: digest('3'),
+            attempt: digest('4'),
+            executor_binding: digest('5'),
+            executor_result: digest('6'),
+            executor_receipt: digest('7'),
+            requirement_kind: "scope_expansion_required".to_owned(),
+            requirement_identity: digest('8'),
+            effect_journal_digest: digest('9'),
+            immutable_work_checkpoint: work,
+            idempotency: digest('a'),
+            created_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+        }
+    }
+
+    #[test]
+    fn work_checkpoint_optionals_are_omitted_and_explicit_null_refuses() {
+        let absent = serde_json::to_value(checkpoint(None)).unwrap();
+        assert!(!absent
+            .as_object()
+            .unwrap()
+            .contains_key("immutable_work_checkpoint"));
+        let mut explicit_null = absent;
+        explicit_null["immutable_work_checkpoint"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<GovernedRepairCheckpointWireV1>(explicit_null).is_err());
+
+        let present = checkpoint(Some(ImmutableWorkCheckpointWireV1 {
+            repository_identity: digest('b'),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            diff_identity: None,
+            content_manifest_identity: digest('c'),
+        }));
+        let mut value = serde_json::to_value(&present).unwrap();
+        let work = value["immutable_work_checkpoint"].as_object().unwrap();
+        assert!(!work.contains_key("diff_identity"));
+        assert!(work.contains_key("content_manifest_identity"));
+        value["immutable_work_checkpoint"]["diff_identity"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<GovernedRepairCheckpointWireV1>(value).is_err());
+
+        let mut missing_manifest = serde_json::to_value(present).unwrap();
+        missing_manifest["immutable_work_checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_manifest_identity");
+        assert!(
+            serde_json::from_value::<GovernedRepairCheckpointWireV1>(missing_manifest).is_err()
+        );
+    }
+
+    #[test]
+    fn persisted_governed_repair_times_use_the_jcs_safe_integer_domain() {
+        assert_eq!(
+            to_i64(9_007_199_254_740_991).unwrap(),
+            9_007_199_254_740_991
+        );
+        assert_eq!(
+            to_i64(9_007_199_254_740_992).unwrap_err(),
+            "governed-repair-time-outside-jcs-safe-integer-domain"
+        );
+        assert_eq!(
+            to_u64(9_007_199_254_740_991).unwrap(),
+            9_007_199_254_740_991
+        );
+        assert_eq!(
+            to_u64(9_007_199_254_740_992).unwrap_err(),
+            "governed-repair-time-outside-jcs-safe-integer-domain"
+        );
+    }
 }

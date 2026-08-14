@@ -13,8 +13,11 @@ use crate::governed_repair::{
 };
 use gwr_core::digest::{Sha256Digest, Transcript};
 use ring::signature::{UnparsedPublicKey, ED25519};
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{
+    de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use sha2::{Digest as _, Sha256};
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
@@ -47,6 +50,17 @@ const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXECUTOR_CONFIG_BYTES: u64 = 512 * 1024 * 1024;
 static NEXT_EXECUTOR_SNAPSHOT: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn deserialize_present_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)?.map_or_else(
+        || Err(serde::de::Error::custom("explicit null is not canonical")),
+        |value| Ok(Some(value)),
+    )
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutorBindingV1 {
@@ -117,7 +131,18 @@ pub struct GovernedRepairCheckpointEvidenceWireV1 {
     pub repository: String,
     pub commit: String,
     pub tree: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub diff_identity: Option<String>,
     pub content_manifest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub docket_checkpoint: Option<String>,
 }
 
@@ -156,12 +181,62 @@ pub struct AgIssuanceWireV2 {
     pub subject: String,
     pub effect_scope: CanonicalEffectScopeWireV1,
     pub effect_scope_digest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub governed_repair_checkpoint: Option<GovernedRepairCheckpointEvidenceWireV1>,
     pub observation: String,
     pub standing_resolution: String,
     pub admission_decision: AdmissionDecisionWireV1,
     pub mandate: String,
     pub spend: String,
+}
+
+#[derive(Serialize)]
+struct AgIssuanceIdentityBasisV2<'a> {
+    key: &'a OccurrenceKeyWireV1,
+    program: &'a str,
+    proposal: &'a str,
+    work_schema: &'a str,
+    work: &'a str,
+    nonclaims: &'a [String],
+    expires_at_unix_ms: u64,
+    subject: &'a str,
+    effect_scope: &'a CanonicalEffectScopeWireV1,
+    effect_scope_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    governed_repair_checkpoint: Option<&'a GovernedRepairCheckpointEvidenceWireV1>,
+    observation: &'a str,
+    standing_resolution: &'a str,
+    admission_decision: &'a AdmissionDecisionWireV1,
+    mandate: &'a str,
+    spend: &'a str,
+}
+
+fn ag_issuance_identity(issuance: &AgIssuanceWireV2) -> Result<String, String> {
+    let basis = AgIssuanceIdentityBasisV2 {
+        key: &issuance.key,
+        program: &issuance.program,
+        proposal: &issuance.proposal,
+        work_schema: &issuance.work_schema,
+        work: &issuance.work,
+        nonclaims: &issuance.nonclaims,
+        expires_at_unix_ms: issuance.expires_at_unix_ms,
+        subject: &issuance.subject,
+        effect_scope: &issuance.effect_scope,
+        effect_scope_digest: &issuance.effect_scope_digest,
+        governed_repair_checkpoint: issuance.governed_repair_checkpoint.as_ref(),
+        observation: &issuance.observation,
+        standing_resolution: &issuance.standing_resolution,
+        admission_decision: &issuance.admission_decision,
+        mandate: &issuance.mandate,
+        spend: &issuance.spend,
+    };
+    let canonical =
+        serde_jcs::to_vec(&basis).map_err(|error| format!("governed-issuance-basis:{error}"))?;
+    Ok(hash_domain("ag.governed-loop.issuance/v2", &canonical))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -302,7 +377,17 @@ pub struct ExecutorOutcomeWireV1 {
     pub receipt: String,
     pub outcome: ExecutorOutcomeClassWireV1,
     pub effect_journal: Vec<EffectJournalEntryWireV1>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub immutable_work_checkpoint: Option<ImmutableWorkCheckpointWireV1>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub governed_repair: Option<ExecutorGovernedRepairRequirementWireV1>,
 }
 
@@ -346,7 +431,12 @@ pub struct DocketIssuanceRefusalWireV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "record", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum DocketExecutionResponseWireV1 {
     Custody(DocketCustodyWireV1),
     Refused(DocketIssuanceRefusalWireV1),
@@ -366,7 +456,29 @@ pub struct DocketSettlementWireV1 {
     pub executor_marker: String,
     pub receipt: String,
     pub outcome: KnownOutcomeWireV1,
+    pub cumulative_effect_journal_identity: String,
     pub settled_at_unix_ms: u64,
+}
+
+/// Derives the settlement identity from every canonical settlement field
+/// except the identity itself. Keeping this as a remove-one-field operation
+/// makes a later wire-field addition fail closed instead of silently falling
+/// outside the identity basis.
+fn docket_settlement_identity(settlement: &DocketSettlementWireV1) -> Result<String, String> {
+    let mut body = serde_json::to_value(settlement)
+        .map_err(|error| format!("governed-settlement-canonical-value:{error}"))?;
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| "governed-settlement-canonical-shape".to_owned())?;
+    if object.remove("settlement").is_none() {
+        return Err("governed-settlement-identity-field-missing".to_owned());
+    }
+    let canonical = serde_jcs::to_vec(&body)
+        .map_err(|error| format!("governed-settlement-canonical:{error}"))?;
+    Ok(hash_domain(
+        "docket.governed-loop.settlement/v1",
+        &canonical,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -467,7 +579,7 @@ fn authenticate_signed_issuance(
     trust_bytes: &[u8],
 ) -> Result<(SignedIssuanceEnvelopeWireV1, AgIssuanceWireV2, Vec<u8>), String> {
     let envelope: SignedIssuanceEnvelopeWireV1 = strict_json(envelope_bytes, "issuance-envelope")?;
-    let canonical_envelope = serde_json::to_vec(
+    let canonical_envelope = serde_jcs::to_vec(
         &serde_json::to_value(&envelope)
             .map_err(|error| format!("issuance-envelope-canonical-value:{error}"))?,
     )
@@ -501,7 +613,20 @@ fn authenticate_signed_issuance(
         .map_err(|_| "governed-issuance-signature-invalid".to_owned())?;
     let issuance: AgIssuanceWireV2 = strict_json(&body, "issuance-body")?;
     let canonical_value: serde_json::Value = strict_json(&body, "issuance-canonical-value")?;
-    let canonical = serde_json::to_vec(&canonical_value)
+    if canonical_value
+        .get("governed_repair_checkpoint")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|checkpoint| {
+            ["diff_identity", "docket_checkpoint"].iter().any(|field| {
+                checkpoint
+                    .get(*field)
+                    .is_some_and(serde_json::Value::is_null)
+            })
+        })
+    {
+        return Err("governed-checkpoint-null-diff-noncanonical".to_owned());
+    }
+    let canonical = serde_jcs::to_vec(&canonical_value)
         .map_err(|error| format!("issuance-canonical:{error}"))?;
     if canonical != body {
         return Err("governed-issuance-body-not-canonical".to_owned());
@@ -759,12 +884,13 @@ pub fn accept_with_checkpoint_verifier(
 
 /// Reconciles one already-custodied issuance.  The executor command receives
 /// the explicit `reconcile` operation; this path never calls `execute`.
-pub fn reconcile(
+pub fn reconcile_with_checkpoint_verifier(
     database: &Path,
     issuance: &str,
     expected_attempt: Option<&str>,
     executor: &Path,
     executor_config: &Path,
+    checkpoint_verifier: Option<&Path>,
 ) -> Result<DocketReconciliationWireV1, String> {
     require_digest(issuance, "issuance")?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
@@ -777,19 +903,34 @@ pub fn reconcile(
         }
         return Ok(DocketReconciliationWireV1::NotAccepted);
     };
+    if expected_attempt.is_some_and(|expected| expected != record.custody.attempt) {
+        return Err("governed-reconciliation-attempt-substitution".to_owned());
+    }
     if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
+        // A sealed result is durable evidence, not inherited checkpoint
+        // correspondence. Re-emission after process re-entry must freshly
+        // verify the exact starting checkpoint before returning the result.
+        // Refusal invokes no executor and leaves custody/result bytes intact.
+        verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
         require_result_custody(&result, &record.custody)?;
         return Ok(DocketReconciliationWireV1::GovernedRepairRequired {
             custody: record.custody,
             result: Box::new(result),
         });
     }
-    if expected_attempt.is_some_and(|expected| expected != record.custody.attempt) {
-        return Err("governed-reconciliation-attempt-substitution".to_owned());
-    }
     if record.status == "settled" {
+        // A known settlement remains terminal evidence, not inherited
+        // checkpoint correspondence. Successor settlement replay therefore
+        // observes the same fresh verifier boundary as governed-result replay.
+        verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
         return response(record);
     }
+
+    // A starting checkpoint is evidence, never inherited authority. Every
+    // process entry that may call the executor freshly verifies the exact
+    // immutable bytes before mechanics. A refusal therefore advances neither
+    // custody nor executor state and makes zero executor calls.
+    verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
 
     let expected_binding = ExecutorBindingV1 {
         identity: record.executor_binding.clone(),
@@ -832,6 +973,25 @@ pub fn reconcile(
         .get(issuance)?
         .ok_or_else(|| "governed-custody-disappeared".to_owned())?;
     response(record)
+}
+
+/// Reconciles an issuance that has no immutable starting checkpoint. Callers
+/// handling successor work must use [`reconcile_with_checkpoint_verifier`].
+pub fn reconcile(
+    database: &Path,
+    issuance: &str,
+    expected_attempt: Option<&str>,
+    executor: &Path,
+    executor_config: &Path,
+) -> Result<DocketReconciliationWireV1, String> {
+    reconcile_with_checkpoint_verifier(
+        database,
+        issuance,
+        expected_attempt,
+        executor,
+        executor_config,
+        None,
+    )
 }
 
 fn response(record: CustodyRecordV1) -> Result<DocketReconciliationWireV1, String> {
@@ -1028,6 +1188,165 @@ fn refusal_class_from_tag(value: &str) -> Result<DocketIssuanceRefusalClassWireV
         "instrument_substitution" => Ok(DocketIssuanceRefusalClassWireV1::InstrumentSubstitution),
         _ => Err("governed-refusal-class-corrupt".to_owned()),
     }
+}
+
+struct SettlementMigrationRowV1 {
+    issuance: String,
+    attempt: String,
+    executor_marker: String,
+    legacy_settlement: String,
+    receipt: String,
+    outcome: String,
+    settled_at: i64,
+    signed_body_b64: String,
+}
+
+#[derive(Serialize)]
+struct LegacyR1DocketSettlementWireV1<'a> {
+    schema: &'a str,
+    settlement: &'a str,
+    issuance: &'a str,
+    attempt: &'a str,
+    executor_marker: &'a str,
+    receipt: &'a str,
+    outcome: KnownOutcomeWireV1,
+    settled_at_unix_ms: u64,
+}
+
+/// Adds the settlement-level cumulative-journal binding to rejected-R1
+/// development rows. Cumulative executor journals must already be backfilled.
+/// A row whose terminal executor observation cannot prove the exact stored
+/// receipt/outcome is refused rather than assigned a synthetic identity.
+pub(crate) fn backfill_settlement_journal_identities(
+    connection: &Connection,
+) -> Result<(), String> {
+    let rows: Vec<SettlementMigrationRowV1> = connection
+        .prepare(
+            "SELECT issuance,attempt,executor_marker,settlement,receipt,outcome,settled_at,
+                    signed_body_b64
+             FROM governed_loop_attempt WHERE status='settled' ORDER BY issuance",
+        )
+        .map_err(|error| format!("governed-settlement-migration-read:{error}"))?
+        .query_map([], |row| {
+            Ok(SettlementMigrationRowV1 {
+                issuance: row.get(0)?,
+                attempt: row.get(1)?,
+                executor_marker: row.get(2)?,
+                legacy_settlement: row.get(3)?,
+                receipt: row.get(4)?,
+                outcome: row.get(5)?,
+                settled_at: row.get(6)?,
+                signed_body_b64: row.get(7)?,
+            })
+        })
+        .map_err(|error| format!("governed-settlement-migration-read:{error}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("governed-settlement-migration-read:{error}"))?;
+
+    for row in rows {
+        require_digest(&row.legacy_settlement, "legacy settlement")?;
+        require_digest(&row.receipt, "legacy settlement receipt")?;
+        let body = b64_decode(&row.signed_body_b64)
+            .map_err(|error| format!("governed-settlement-migration-body:{error}"))?;
+        let issuance: AgIssuanceWireV2 = strict_json(&body, "settlement-migration-issuance")?;
+        if issuance.issuance != row.issuance {
+            return Err("governed-settlement-migration-issuance-substitution".to_owned());
+        }
+        governed_repair::validate_ordinary_executor_result(
+            connection,
+            &row.issuance,
+            &row.attempt,
+            "settled",
+            &issuance.effect_scope,
+        )?;
+        let terminal: Option<(String, String)> = connection
+            .query_row(
+                "SELECT outcome,receipt FROM governed_executor_result
+                 WHERE issuance=?1 AND attempt=?2 ORDER BY sequence DESC LIMIT 1",
+                params![row.issuance, row.attempt],
+                |terminal| Ok((terminal.get(0)?, terminal.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("governed-settlement-migration-terminal-read:{error}"))?;
+        if terminal != Some((row.outcome.clone(), row.receipt.clone()))
+            || !matches!(row.outcome.as_str(), "success" | "failure")
+        {
+            return Err("governed-settlement-migration-terminal-incomplete".to_owned());
+        }
+        let expected_legacy = hash_domain(
+            "docket.governed-loop.settlement/v1",
+            format!(
+                "{}:{}:{}:{}",
+                row.issuance, row.attempt, row.receipt, row.outcome
+            )
+            .as_bytes(),
+        );
+        if row.legacy_settlement != expected_legacy {
+            return Err("governed-settlement-migration-legacy-identity".to_owned());
+        }
+        let cumulative_effect_journal_identity =
+            governed_repair::latest_cumulative_effect_journal_identity(
+                connection,
+                &row.issuance,
+                &row.attempt,
+                &issuance.effect_scope,
+            )?
+            .ok_or_else(|| "governed-settlement-migration-journal-missing".to_owned())?;
+        let settled_at_unix_ms = u64::try_from(row.settled_at)
+            .ok()
+            .filter(|value| *value <= MAX_JCS_SAFE_INTEGER)
+            .ok_or_else(|| "governed-settlement-migration-time".to_owned())?;
+        let legacy_outcome = match row.outcome.as_str() {
+            "success" => KnownOutcomeWireV1::Success,
+            "failure" => KnownOutcomeWireV1::Failure,
+            _ => unreachable!(),
+        };
+        let legacy_r1_settlement_jcs = String::from_utf8(
+            serde_jcs::to_vec(&LegacyR1DocketSettlementWireV1 {
+                schema: SETTLEMENT_SCHEMA_V1,
+                settlement: &row.legacy_settlement,
+                issuance: &row.issuance,
+                attempt: &row.attempt,
+                executor_marker: &row.executor_marker,
+                receipt: &row.receipt,
+                outcome: legacy_outcome,
+                settled_at_unix_ms,
+            })
+            .map_err(|error| format!("governed-settlement-migration-legacy-jcs:{error}"))?,
+        )
+        .map_err(|error| format!("governed-settlement-migration-legacy-jcs:{error}"))?;
+        let mut settlement = DocketSettlementWireV1 {
+            schema: SETTLEMENT_SCHEMA_V1.to_owned(),
+            settlement: String::new(),
+            issuance: row.issuance.clone(),
+            attempt: row.attempt.clone(),
+            executor_marker: row.executor_marker,
+            receipt: row.receipt,
+            outcome: legacy_outcome,
+            cumulative_effect_journal_identity: cumulative_effect_journal_identity.clone(),
+            settled_at_unix_ms,
+        };
+        settlement.settlement = docket_settlement_identity(&settlement)?;
+        let changed = connection
+            .execute(
+                "UPDATE governed_loop_attempt
+                 SET settlement=?1,settlement_cumulative_effect_journal_identity=?2,
+                     legacy_r1_settlement_identity=?3,legacy_r1_settlement_jcs=?4
+                 WHERE issuance=?5 AND status='settled'",
+                params![
+                    settlement.settlement,
+                    cumulative_effect_journal_identity,
+                    row.legacy_settlement,
+                    legacy_r1_settlement_jcs,
+                    row.issuance
+                ],
+            )
+            .map_err(|error| format!("governed-settlement-migration-write:{error}"))?;
+        if changed != 1 {
+            return Err("governed-settlement-migration-row-race".to_owned());
+        }
+    }
+    Ok(())
 }
 
 struct GovernedCustodyStoreV1 {
@@ -1250,7 +1569,8 @@ impl GovernedCustodyStoreV1 {
                         observation,ag_standing_resolution,mandate,ag_spend,execution_standing,
                         standing_currentness,attempt,executor_marker,executor_binding,
                         executor_program_digest,executor_config_digest,executor_plan,accepted_at,status,
-                        settlement,receipt,outcome,settled_at,reconciliation,indeterminate_evidence
+                        settlement,receipt,outcome,settled_at,reconciliation,indeterminate_evidence,
+                        settlement_cumulative_effect_journal_identity
                  FROM governed_loop_attempt WHERE issuance=?1",
                 [issuance],
                 |row| {
@@ -1262,10 +1582,11 @@ impl GovernedCustodyStoreV1 {
                     let settled_at: Option<i64> = row.get(30)?;
                     let reconciliation: Option<String> = row.get(31)?;
                     let evidence: Option<String> = row.get(32)?;
+                    let settlement_journal: Option<String> = row.get(33)?;
                     let signed_body_b64: String = row.get(0)?;
                     let body = b64_decode(&signed_body_b64).map_err(|error| sql_decode(&error))?;
-                    let body_record: AgIssuanceWireV2 = serde_json::from_slice(&body)
-                        .map_err(|error| sql_decode(&format!("governed issuance body: {error}")))?;
+                    let body_record: AgIssuanceWireV2 =
+                        strict_json(&body, "stored-issuance-body").map_err(|error| sql_decode(&error))?;
                     let issuance_record = AgIssuanceWireV2 {
                         schema: AG_ISSUANCE_SCHEMA_V2.to_owned(),
                         issuance: issuance.to_owned(),
@@ -1299,8 +1620,20 @@ impl GovernedCustodyStoreV1 {
                         executor_marker: row.get(20)?,
                         accepted_at_unix_ms: accepted_at,
                     };
-                    let known = match (&settlement_ref, &receipt, &outcome, settled_at) {
-                        (Some(settlement), Some(receipt), Some(outcome), Some(at)) => {
+                    let known = match (
+                        &settlement_ref,
+                        &receipt,
+                        &outcome,
+                        settled_at,
+                        &settlement_journal,
+                    ) {
+                        (
+                            Some(settlement),
+                            Some(receipt),
+                            Some(outcome),
+                            Some(at),
+                            Some(cumulative_effect_journal_identity),
+                        ) => {
                             Some(DocketSettlementWireV1 {
                                 schema: SETTLEMENT_SCHEMA_V1.to_owned(),
                                 settlement: settlement.clone(),
@@ -1313,10 +1646,12 @@ impl GovernedCustodyStoreV1 {
                                     "failure" => KnownOutcomeWireV1::Failure,
                                     _ => return Err(sql_decode("governed outcome")),
                                 },
+                                cumulative_effect_journal_identity:
+                                    cumulative_effect_journal_identity.clone(),
                                 settled_at_unix_ms: read_u64(at, 30)?,
                             })
                         }
-                        (None, None, None, None) => None,
+                        (None, None, None, None, None) => None,
                         _ => return Err(sql_decode("partial governed settlement")),
                     };
                     let indeterminate = match (reconciliation, evidence) {
@@ -1363,6 +1698,38 @@ impl GovernedCustodyStoreV1 {
                     &record.status,
                     &record.issuance.effect_scope,
                 )?;
+                if let Some(settlement) = &record.settlement {
+                    let latest = governed_repair::latest_cumulative_effect_journal_identity(
+                        &self.connection,
+                        &record.issuance.issuance,
+                        &record.custody.attempt,
+                        &record.issuance.effect_scope,
+                    )?
+                    .ok_or_else(|| "governed-stored-settlement-journal-missing".to_owned())?;
+                    if latest != settlement.cumulative_effect_journal_identity {
+                        return Err("governed-stored-settlement-journal-substitution".to_owned());
+                    }
+                    let terminal: Option<(String, String)> = self
+                        .connection
+                        .query_row(
+                            "SELECT outcome,receipt FROM governed_executor_result
+                             WHERE issuance=?1 AND attempt=?2
+                             ORDER BY sequence DESC LIMIT 1",
+                            params![record.issuance.issuance, record.custody.attempt],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("governed-stored-settlement-terminal-read:{error}")
+                        })?;
+                    let expected_outcome = match settlement.outcome {
+                        KnownOutcomeWireV1::Success => "success",
+                        KnownOutcomeWireV1::Failure => "failure",
+                    };
+                    if terminal != Some((expected_outcome.to_owned(), settlement.receipt.clone())) {
+                        return Err("governed-stored-settlement-terminal-substitution".to_owned());
+                    }
+                }
                 Ok(record)
             })
             .transpose()
@@ -1414,6 +1781,11 @@ impl GovernedCustodyStoreV1 {
                         draft: outcome
                             .governed_repair
                             .ok_or_else(|| "governed-repair-requirement-missing".to_owned())?,
+                        // The sealer opens an immediate transaction and joins
+                        // these latest reported effects to the durable prior
+                        // journal inside that same transaction.  Reading the
+                        // cumulative journal here would leave a late-observer
+                        // race between the read and terminal seal.
                         journal: &outcome.effect_journal,
                         immutable_work_checkpoint: outcome.immutable_work_checkpoint.as_ref(),
                         now_unix_ms: at,
@@ -1444,14 +1816,9 @@ impl GovernedCustodyStoreV1 {
                     ExecutorOutcomeClassWireV1::ScopeExpansionRequired
                     | ExecutorOutcomeClassWireV1::ReadjudicationRequired => unreachable!(),
                 };
-                let settlement = hash_domain(
-                    "docket.governed-loop.settlement/v1",
-                    format!("{issuance}:{}:{}:{known}", custody.attempt, outcome.receipt)
-                        .as_bytes(),
-                );
                 let tx = self
                     .connection
-                    .transaction()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| format!("governed-settlement-transaction:{error}"))?;
                 let exact_replay = governed_repair::append_ordinary_executor_result(
                     &tx,
@@ -1465,21 +1832,70 @@ impl GovernedCustodyStoreV1 {
                         recorded_at: at,
                     },
                 )?;
+                // Settlement is derived only after the executor observation
+                // has extended the cumulative journal in this same immediate
+                // transaction. The settlement artifact therefore names the
+                // complete effect history at its exact terminal cut.
+                let cumulative_effect_journal_identity =
+                    governed_repair::latest_cumulative_effect_journal_identity(
+                        &tx,
+                        issuance,
+                        &custody.attempt,
+                        &record.issuance.effect_scope,
+                    )?
+                    .ok_or_else(|| "governed-settlement-journal-missing".to_owned())?;
+                if exact_replay && record.status == "settled" {
+                    let existing = record
+                        .settlement
+                        .as_ref()
+                        .ok_or_else(|| "governed-stored-settlement-missing".to_owned())?;
+                    if existing.receipt != outcome.receipt
+                        || existing.outcome
+                            != match known {
+                                "success" => KnownOutcomeWireV1::Success,
+                                "failure" => KnownOutcomeWireV1::Failure,
+                                _ => unreachable!(),
+                            }
+                        || existing.cumulative_effect_journal_identity
+                            != cumulative_effect_journal_identity
+                    {
+                        return Err("governed-settlement-exact-replay-collision".to_owned());
+                    }
+                    return Ok(());
+                }
+                let mut settlement = DocketSettlementWireV1 {
+                    schema: SETTLEMENT_SCHEMA_V1.to_owned(),
+                    settlement: String::new(),
+                    issuance: issuance.to_owned(),
+                    attempt: custody.attempt.clone(),
+                    executor_marker: custody.executor_marker.clone(),
+                    receipt: outcome.receipt.clone(),
+                    outcome: match known {
+                        "success" => KnownOutcomeWireV1::Success,
+                        "failure" => KnownOutcomeWireV1::Failure,
+                        _ => unreachable!(),
+                    },
+                    cumulative_effect_journal_identity: cumulative_effect_journal_identity.clone(),
+                    settled_at_unix_ms: at,
+                };
+                settlement.settlement = docket_settlement_identity(&settlement)?;
                 let changed = tx
                     .execute(
                         "UPDATE governed_loop_attempt
-                         SET status='settled',settlement=?1,receipt=?2,outcome=?3,settled_at=?4
-                         WHERE issuance=?5 AND attempt=?6 AND executor_marker=?7
+                         SET status='settled',settlement=?1,receipt=?2,outcome=?3,settled_at=?4,
+                             settlement_cumulative_effect_journal_identity=?5
+                         WHERE issuance=?6 AND attempt=?7 AND executor_marker=?8
                            AND status IN ('accepted','indeterminate')
                            AND NOT EXISTS (
                              SELECT 1 FROM governed_repair_checkpoint
                              WHERE governed_repair_checkpoint.issuance=governed_loop_attempt.issuance
                            )",
                         params![
-                            settlement,
+                            settlement.settlement,
                             outcome.receipt,
                             known,
                             u64_to_i64(at)?,
+                            cumulative_effect_journal_identity,
                             issuance,
                             custody.attempt,
                             custody.executor_marker
@@ -1585,7 +2001,14 @@ impl GovernedCustodyStoreV1 {
                     |row| row.get(0),
                 )
                 .map_err(|error| format!("governed-indeterminate-status-read:{error}"))?;
-            return if status == "indeterminate" {
+            let checkpoint_exists: i64 = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM governed_repair_checkpoint WHERE issuance=?1)",
+                    [issuance],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("governed-indeterminate-terminal-read:{error}"))?;
+            return if status == "indeterminate" && checkpoint_exists == 0 {
                 // Multiple evidence observations may be appended while the
                 // attempt remains unknown; none causes another execution.
                 tx.commit()
@@ -1613,7 +2036,7 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
         .verify(&signed, &signature)
         .map_err(|_| "governed-stored-issuance-signature-invalid".to_owned())?;
     let parsed: AgIssuanceWireV2 = strict_json(&body, "stored-issuance-body")?;
-    let canonical = serde_json::to_vec(
+    let canonical = serde_jcs::to_vec(
         &serde_json::to_value(&parsed)
             .map_err(|error| format!("stored-issuance-canonical-value:{error}"))?,
     )
@@ -1678,19 +2101,13 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
                 return Err("governed-stored-settlement-substitution".to_owned());
             }
             require_digest(&settlement.receipt, "stored settlement receipt")?;
-            let outcome = match settlement.outcome {
-                KnownOutcomeWireV1::Success => "success",
-                KnownOutcomeWireV1::Failure => "failure",
-            };
-            let expected = hash_domain(
-                "docket.governed-loop.settlement/v1",
-                format!(
-                    "{}:{}:{}:{outcome}",
-                    record.issuance.issuance, record.custody.attempt, settlement.receipt
-                )
-                .as_bytes(),
-            );
-            if settlement.settlement != expected {
+            require_digest(
+                &settlement.cumulative_effect_journal_identity,
+                "stored settlement cumulative journal",
+            )?;
+            if settlement.settled_at_unix_ms > MAX_JCS_SAFE_INTEGER
+                || settlement.settlement != docket_settlement_identity(settlement)?
+            {
                 return Err("governed-stored-settlement-identity".to_owned());
             }
             if let Some(indeterminate) = &record.indeterminate {
@@ -1786,13 +2203,12 @@ fn validate_issuance(issuance: &AgIssuanceWireV2) -> Result<(), String> {
     {
         return Err("governed-admission-decision-binding".to_owned());
     }
+    governed_repair::validate_ag_effect_scope_identity(
+        &issuance.effect_scope,
+        &issuance.effect_scope_digest,
+    )?;
     require_uuid(&issuance.key.occurrence)?;
-    if issuance.work_schema.is_empty()
-        || issuance.work_schema.len() > 128
-        || !issuance.work_schema.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
-        })
-    {
+    if !is_canonical_wire_label(&issuance.work_schema) {
         return Err("governed-issuance-work-schema".to_owned());
     }
     if issuance.expires_at_unix_ms == 0
@@ -1809,34 +2225,28 @@ fn validate_issuance(issuance: &AgIssuanceWireV2) -> Result<(), String> {
         }
         previous_nonclaim = Some(nonclaim);
     }
-    let basis = serde_json::json!({
-        "key": {
-            "campaign": issuance.key.campaign,
-            "occurrence": issuance.key.occurrence,
-        },
-        "mandate": issuance.mandate,
-        "observation": issuance.observation,
-        "admission_decision": issuance.admission_decision,
-        "program": issuance.program,
-        "proposal": issuance.proposal,
-        "effect_scope": issuance.effect_scope,
-        "effect_scope_digest": issuance.effect_scope_digest,
-        "governed_repair_checkpoint": issuance.governed_repair_checkpoint,
-        "spend": issuance.spend,
-        "standing_resolution": issuance.standing_resolution,
-        "subject": issuance.subject,
-        "work": issuance.work,
-        "work_schema": issuance.work_schema,
-        "nonclaims": issuance.nonclaims,
-        "expires_at_unix_ms": issuance.expires_at_unix_ms,
-    });
-    let canonical =
-        serde_json::to_vec(&basis).map_err(|error| format!("governed-issuance-basis:{error}"))?;
-    let expected = hash_domain("ag.governed-loop.issuance/v2", &canonical);
+    let expected = ag_issuance_identity(issuance)?;
     if expected != issuance.issuance {
         return Err("governed-issuance-identity-mismatch".to_owned());
     }
     Ok(())
+}
+
+fn is_canonical_wire_label(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let mut prior_separator = true;
+    for byte in value.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            prior_separator = false;
+        } else if matches!(byte, b'-' | b'.' | b'_' | b'/' | b':') && !prior_separator {
+            prior_separator = true;
+        } else {
+            return false;
+        }
+    }
+    !prior_separator
 }
 
 fn validate_fresh_issuance(issuance: &AgIssuanceWireV2, now_unix_ms: u64) -> Result<(), String> {
@@ -2000,6 +2410,9 @@ fn validate_checkpoint_evidence(
 ) -> Result<(), String> {
     require_digest(&checkpoint.repository, "checkpoint repository")?;
     require_digest(&checkpoint.content_manifest, "checkpoint content manifest")?;
+    if let Some(value) = &checkpoint.diff_identity {
+        require_digest(value, "checkpoint diff")?;
+    }
     if let Some(value) = &checkpoint.docket_checkpoint {
         require_digest(value, "prior Docket checkpoint")?;
     }
@@ -2018,8 +2431,130 @@ fn validate_checkpoint_evidence(
     Ok(())
 }
 
-fn strict_json<T: DeserializeOwned>(bytes: &[u8], label: &str) -> Result<T, String> {
-    serde_json::from_slice(bytes).map_err(|error| format!("{label}-json:{error}"))
+/// Parses consequence-bearing Docket JSON with recursive duplicate-member,
+/// safe-integer, and typed unknown-field refusal.
+pub fn strict_json<T: DeserializeOwned>(bytes: &[u8], label: &str) -> Result<T, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let StrictJsonValue(value) = StrictJsonValue::deserialize(&mut deserializer)
+        .map_err(|error| format!("{label}-json:{error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("{label}-json:{error}"))?;
+    validate_safe_json_numbers(&value).map_err(|error| format!("{label}-json:{error}"))?;
+    serde_json::from_value(value).map_err(|error| format!("{label}-json:{error}"))
+}
+
+/// JSON value decoded with duplicate-member refusal at every object depth.
+/// `serde_json::Value` alone is insufficient because its map decoder keeps the
+/// last duplicate member, which could turn altered signed bytes into a typed
+/// record with ambiguous source meaning.
+struct StrictJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonValueVisitor)
+    }
+}
+
+struct StrictJsonValueVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonValueVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|number| StrictJsonValue(serde_json::Value::Number(number)))
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(StrictJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(StrictJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object member: {key}"
+                )));
+            }
+            let StrictJsonValue(value) = map.next_value()?;
+            values.insert(key, value);
+        }
+        Ok(StrictJsonValue(serde_json::Value::Object(values)))
+    }
+}
+
+fn validate_safe_json_numbers(value: &serde_json::Value) -> Result<(), &'static str> {
+    match value {
+        serde_json::Value::Number(number) => {
+            if number
+                .as_u64()
+                .is_some_and(|value| value <= MAX_JCS_SAFE_INTEGER)
+                || number.as_i64().is_some_and(|value| {
+                    value >= -(MAX_JCS_SAFE_INTEGER as i64) && value <= MAX_JCS_SAFE_INTEGER as i64
+                })
+            {
+                Ok(())
+            } else {
+                Err("number-outside-jcs-safe-integer-domain")
+            }
+        }
+        serde_json::Value::Array(values) => values.iter().try_for_each(validate_safe_json_numbers),
+        serde_json::Value::Object(values) => {
+            values.values().try_for_each(validate_safe_json_numbers)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn prepare_executor(
@@ -2374,11 +2909,21 @@ fn now_unix_ms() -> Result<u64, String> {
 }
 
 fn u64_to_i64(value: u64) -> Result<i64, String> {
+    if value > MAX_JCS_SAFE_INTEGER {
+        return Err("governed-clock-outside-jcs-safe-integer-domain".to_owned());
+    }
     i64::try_from(value).map_err(|_| "governed-clock-out-of-range".to_owned())
 }
 
 fn read_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
-    u64::try_from(value).map_err(|_| sql_decode(&format!("negative u64 column {column}")))
+    let value =
+        u64::try_from(value).map_err(|_| sql_decode(&format!("negative u64 column {column}")))?;
+    if value > MAX_JCS_SAFE_INTEGER {
+        return Err(sql_decode(&format!(
+            "unsafe JSON integer in u64 column {column}"
+        )));
+    }
+    Ok(value)
 }
 
 fn sql_decode(detail: &str) -> rusqlite::Error {
@@ -2390,14 +2935,203 @@ fn sql_decode(detail: &str) -> rusqlite::Error {
 }
 
 #[cfg(test)]
+#[path = "governed_wire_conformance_tests.rs"]
+mod governed_wire_conformance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governed_repair::validate_effect_journal_for_issuance as effect_journal_identity;
     use crate::store::SqliteStore;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    const R2_CONTRACT: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/contract.v1.json");
+    const R2_MANIFEST: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/manifest.v1.json");
+    const R2_LABELS: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/labels.v1.json");
+    const R2_SCOPES: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/scopes.v1.json");
+    const R2_WIRE_HOSTILES: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/wire-hostiles.v1.json");
+    const R2_WIRE_VECTORS: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/wire-vectors.v1.json");
+
+    fn raw_sha256(bytes: &[u8]) -> String {
+        format!("sha256:{}", lower_hex(&Sha256::digest(bytes)))
+    }
+
+    fn assert_pinned_canonical_corpus(bytes: &[u8], expected: &str) {
+        assert_eq!(raw_sha256(bytes), expected);
+        let (canonical, newline) = bytes.split_at(bytes.len() - 1);
+        assert_eq!(newline, b"\n");
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(serde_jcs::to_vec(&value).unwrap(), canonical);
+    }
+
+    #[test]
+    fn r2_shared_contract_corpus_has_exact_pinned_bytes() {
+        assert_pinned_canonical_corpus(
+            R2_MANIFEST,
+            "sha256:b71a2e7a9a606c7209f95522c20c2ae221c99a5dbebc6a6eba3d303b738b97ae",
+        );
+        assert_pinned_canonical_corpus(
+            R2_CONTRACT,
+            "sha256:d3fc470761d8550f733e2528f0a2589e93717bd120e9b1ffbae687942168458b",
+        );
+        assert_pinned_canonical_corpus(
+            R2_LABELS,
+            "sha256:47a2a8d97e700c0296044d5bb7d795e51b609860875062aaa633ced7498215b6",
+        );
+        assert_pinned_canonical_corpus(
+            R2_SCOPES,
+            "sha256:905e9b96ba81a2dcc072f243b3bb1b8a02381377b2cebf61e98eaff033c3abaa",
+        );
+        assert_pinned_canonical_corpus(
+            R2_WIRE_HOSTILES,
+            "sha256:9862a1e38bb9db11cd39aebe04b3bd8ffaed7d315b67becc1e164176a20858b9",
+        );
+        assert_pinned_canonical_corpus(
+            R2_WIRE_VECTORS,
+            "sha256:ff75b856fd1a3076809d26f40d987b114046226aa15e7eeeb46db3388f36ea90",
+        );
+    }
+
+    #[test]
+    fn r2_docket_validator_consumes_shared_label_corpus() {
+        let corpus: serde_json::Value = serde_json::from_slice(R2_LABELS).unwrap();
+        let scope_for = |effect_class: &str, resource: &str| CanonicalEffectScopeWireV1 {
+            schema: "ag.governed-loop.canonical-effect-scope/v1".to_owned(),
+            effect_class: effect_class.to_owned(),
+            resources: vec![CanonicalEffectResourceWireV1 {
+                resource: resource.to_owned(),
+                path: "bounded/path".to_owned(),
+                operations: vec![CanonicalEffectOperationWireV1::Read],
+            }],
+        };
+        let validate = |scope: &CanonicalEffectScopeWireV1| {
+            let identity = hash_domain(
+                "ag.governed-loop.canonical-effect-scope/v1",
+                &serde_jcs::to_vec(scope).unwrap(),
+            );
+            governed_repair::validate_ag_effect_scope_identity(scope, &identity)
+        };
+
+        for value in corpus["accepted"].as_array().unwrap() {
+            let value = value.as_str().unwrap();
+            assert!(
+                validate(&scope_for(value, "repository")).is_ok(),
+                "shared accepted label refused: {value:?}"
+            );
+            let mut issuance = fixture(ExecutorOutcomeClassWireV1::Success)
+                .issuance
+                .clone();
+            issuance.work_schema = value.to_owned();
+            refresh_issuance_identity(&mut issuance);
+            assert!(
+                validate_issuance(&issuance).is_ok(),
+                "shared accepted work-schema label refused: {value:?}"
+            );
+        }
+        for value in corpus["rejected"].as_array().unwrap() {
+            let value = value.as_str().unwrap();
+            assert!(
+                validate(&scope_for(value, "repository")).is_err(),
+                "shared rejected label accepted: {value:?}"
+            );
+            let mut issuance = fixture(ExecutorOutcomeClassWireV1::Success)
+                .issuance
+                .clone();
+            issuance.work_schema = value.to_owned();
+            refresh_issuance_identity(&mut issuance);
+            assert!(
+                validate_issuance(&issuance).is_err(),
+                "shared rejected work-schema label accepted: {value:?}"
+            );
+        }
+        for value in corpus["effect_class_accepted_resource_rejected"]
+            .as_array()
+            .unwrap()
+        {
+            let value = value.as_str().unwrap();
+            assert!(validate(&scope_for(value, "repository")).is_ok());
+            assert!(
+                validate(&scope_for("repository-read/v1", value)).is_err(),
+                "mutable-ref resource unexpectedly accepted: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn r2_docket_scope_identity_matches_shared_corpus() {
+        let corpus: serde_json::Value = serde_json::from_slice(R2_SCOPES).unwrap();
+        for vector in corpus["vectors"].as_array().unwrap() {
+            let scope: CanonicalEffectScopeWireV1 =
+                serde_json::from_value(vector["value"].clone()).unwrap();
+            let canonical = serde_jcs::to_vec(&scope).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&canonical).unwrap(),
+                vector["canonical"]
+            );
+            let identity = vector["identity"].as_str().unwrap();
+            assert_eq!(
+                hash_domain("ag.governed-loop.canonical-effect-scope/v1", &canonical),
+                identity
+            );
+            governed_repair::validate_ag_effect_scope_identity(&scope, identity).unwrap();
+        }
+    }
+
+    #[test]
+    fn r2_checkpoint_optionals_are_omitted_and_explicit_null_refuses() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let absent = serde_jcs::to_vec(&fixture.issuance).unwrap();
+        let absent_value: serde_json::Value = serde_json::from_slice(&absent).unwrap();
+        assert!(!absent_value
+            .as_object()
+            .unwrap()
+            .contains_key("governed_repair_checkpoint"));
+
+        let mut issuance = fixture.issuance.clone();
+        issuance.governed_repair_checkpoint = Some(GovernedRepairCheckpointEvidenceWireV1 {
+            repository: digest("checkpoint-repository"),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            diff_identity: None,
+            content_manifest: digest("checkpoint-manifest"),
+            docket_checkpoint: None,
+        });
+        let encoded = serde_jcs::to_vec(&issuance).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        let checkpoint = value["governed_repair_checkpoint"].as_object().unwrap();
+        assert!(!checkpoint.contains_key("diff_identity"));
+        assert!(!checkpoint.contains_key("docket_checkpoint"));
+        assert!(checkpoint.contains_key("content_manifest"));
+
+        let mut explicit_null = value.clone();
+        explicit_null["governed_repair_checkpoint"]["diff_identity"] = serde_json::Value::Null;
+        assert!(strict_json::<AgIssuanceWireV2>(
+            &serde_jcs::to_vec(&explicit_null).unwrap(),
+            "explicit-null"
+        )
+        .is_err());
+
+        let mut missing_manifest = value;
+        missing_manifest["governed_repair_checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content_manifest");
+        assert!(strict_json::<AgIssuanceWireV2>(
+            &serde_jcs::to_vec(&missing_manifest).unwrap(),
+            "missing-manifest"
+        )
+        .is_err());
+    }
 
     #[test]
     fn issuance_refusal_identity_matches_frozen_cross_repository_vector() {
@@ -2465,7 +3199,7 @@ mod tests {
         };
         let effect_scope_digest = hash_domain(
             "ag.governed-loop.canonical-effect-scope/v1",
-            &serde_json::to_vec(&serde_json::to_value(&effect_scope).unwrap()).unwrap(),
+            &serde_jcs::to_vec(&effect_scope).unwrap(),
         );
         let mut issuance = AgIssuanceWireV2 {
             schema: AG_ISSUANCE_SCHEMA_V2.to_owned(),
@@ -2502,7 +3236,7 @@ mod tests {
             spend: digest("ag-spend"),
         };
         refresh_issuance_identity(&mut issuance);
-        let body = serde_json::to_vec(&serde_json::to_value(&issuance).unwrap()).unwrap();
+        let body = serde_jcs::to_vec(&issuance).unwrap();
         let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
         let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
         let mut signed = SIGNATURE_PREFIX_V2.to_vec();
@@ -2554,7 +3288,7 @@ mod tests {
             scope: issuance.effect_scope_digest.clone(),
             status: ExecutionStandingStatusV1::Current,
             resolved_at_unix_ms: 0,
-            expires_at_unix_ms: i64::MAX as u64,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
         };
         let standing_program = root.join("standing-resolver");
         write_static_program(
@@ -2583,35 +3317,11 @@ mod tests {
     }
 
     fn canonical_json<T: Serialize>(value: &T) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::to_value(value).unwrap()).unwrap()
+        serde_jcs::to_vec(value).unwrap()
     }
 
     fn refresh_issuance_identity(issuance: &mut AgIssuanceWireV2) {
-        let basis = serde_json::json!({
-            "key": {
-                "campaign": issuance.key.campaign,
-                "occurrence": issuance.key.occurrence,
-            },
-            "mandate": issuance.mandate,
-            "observation": issuance.observation,
-            "program": issuance.program,
-            "proposal": issuance.proposal,
-            "effect_scope": issuance.effect_scope,
-            "effect_scope_digest": issuance.effect_scope_digest,
-            "governed_repair_checkpoint": issuance.governed_repair_checkpoint,
-            "admission_decision": issuance.admission_decision,
-            "spend": issuance.spend,
-            "standing_resolution": issuance.standing_resolution,
-            "subject": issuance.subject,
-            "work": issuance.work,
-            "work_schema": issuance.work_schema,
-            "nonclaims": issuance.nonclaims,
-            "expires_at_unix_ms": issuance.expires_at_unix_ms,
-        });
-        issuance.issuance = hash_domain(
-            "ag.governed-loop.issuance/v2",
-            &serde_json::to_vec(&basis).unwrap(),
-        );
+        issuance.issuance = ag_issuance_identity(issuance).unwrap();
     }
 
     fn signed_envelope(fixture: &Fixture, issuance: &AgIssuanceWireV2) -> Vec<u8> {
@@ -2762,6 +3472,444 @@ mod tests {
             .unwrap(),
             first
         );
+    }
+
+    #[test]
+    fn pre_r2_executor_rows_reopen_with_deterministic_cumulative_journal() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 DROP TRIGGER governed_executor_result_cumulative_required_insert;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN no_unauthorized_effect_reported
+                   TO unauthorized_effect_not_performed;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN reported_authorized_effects_occurred
+                   TO authorized_effects_occurred;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_digest;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_entries;",
+            )
+            .unwrap();
+        drop(connection);
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let migrated: (String, String) = connection
+            .query_row(
+                "SELECT cumulative_effect_journal_digest,
+                        cumulative_effect_journal_entries
+                 FROM governed_executor_result",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!migrated.0.is_empty());
+        assert_eq!(migrated.1, "");
+        let narrowed_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_repair_checkpoint')
+                 WHERE name='no_unauthorized_effect_reported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(narrowed_column, 1);
+    }
+
+    #[test]
+    fn rejected_r1_settlement_is_preserved_and_reprojected_with_cumulative_journal() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        let (receipt, outcome): (String, String) = connection
+            .query_row(
+                "SELECT receipt,outcome FROM governed_loop_attempt",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let legacy = hash_domain(
+            "docket.governed-loop.settlement/v1",
+            format!(
+                "{}:{}:{}:{}",
+                fixture.issuance.issuance, fixture.custody.attempt, receipt, outcome
+            )
+            .as_bytes(),
+        );
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_loop_settlement_immutable_update;
+                 DROP TRIGGER governed_loop_settlement_journal_required_insert;
+                 DROP TRIGGER governed_loop_settlement_journal_required_update;
+                 DROP TRIGGER governed_executor_result_immutable_update;
+                 DROP TRIGGER governed_executor_result_cumulative_required_insert;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN no_unauthorized_effect_reported
+                   TO unauthorized_effect_not_performed;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN reported_authorized_effects_occurred
+                   TO authorized_effects_occurred;",
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE governed_loop_attempt SET settlement=?1", [&legacy])
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE governed_loop_attempt
+                   DROP COLUMN settlement_cumulative_effect_journal_identity;
+                 ALTER TABLE governed_loop_attempt
+                   DROP COLUMN legacy_r1_settlement_identity;
+                 ALTER TABLE governed_loop_attempt
+                   DROP COLUMN legacy_r1_settlement_jcs;",
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_digest;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_entries;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let (active, journal, retained_identity, retained_jcs): (String, String, String, String) =
+            connection
+                .query_row(
+                    "SELECT settlement,settlement_cumulative_effect_journal_identity,
+                            legacy_r1_settlement_identity,legacy_r1_settlement_jcs
+                     FROM governed_loop_attempt",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert_ne!(active, legacy);
+        assert_eq!(retained_identity, legacy);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&retained_jcs).unwrap()["settlement"],
+            legacy
+        );
+        assert_eq!(
+            journal,
+            governed_repair::latest_cumulative_effect_journal_identity(
+                &connection,
+                &fixture.issuance.issuance,
+                &fixture.custody.attempt,
+                &fixture.issuance.effect_scope,
+            )
+            .unwrap()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn rejected_r1_settlement_backfill_refuses_false_legacy_identity_atomically() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let false_legacy = digest("false-r1-settlement");
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_loop_settlement_immutable_update;
+                 DROP TRIGGER governed_loop_settlement_journal_required_insert;
+                 DROP TRIGGER governed_loop_settlement_journal_required_update;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE governed_loop_attempt SET settlement=?1",
+                [&false_legacy],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE governed_loop_attempt
+                   DROP COLUMN settlement_cumulative_effect_journal_identity;
+                 ALTER TABLE governed_loop_attempt
+                   DROP COLUMN legacy_r1_settlement_identity;
+                 ALTER TABLE governed_loop_attempt
+                   DROP COLUMN legacy_r1_settlement_jcs;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match SqliteStore::open(&fixture.database) {
+            Ok(_) => panic!("false rejected-R1 settlement unexpectedly migrated"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(error.contains("governed-settlement-migration-legacy-identity"));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let columns: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='settlement_cumulative_effect_journal_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let retained: String = connection
+            .query_row("SELECT settlement FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(columns, 0);
+        assert_eq!(retained, false_legacy);
+    }
+
+    #[test]
+    fn failed_r2_backfill_rolls_back_and_clean_retry_succeeds() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 DROP TRIGGER governed_executor_result_cumulative_required_insert;
+                 UPDATE governed_executor_result SET effect_journal_entries='not-an-encoding';
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN no_unauthorized_effect_reported
+                   TO unauthorized_effect_not_performed;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN reported_authorized_effects_occurred
+                   TO authorized_effects_occurred;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_digest;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_entries;",
+            )
+            .unwrap();
+        drop(connection);
+        assert!(SqliteStore::open(&fixture.database).is_err());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let schema: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM pragma_table_info('governed_executor_result')
+                    WHERE name='cumulative_effect_journal_digest'),
+                   (SELECT COUNT(*) FROM pragma_table_info('governed_repair_checkpoint')
+                    WHERE name='unauthorized_effect_not_performed')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(schema, (0, 1));
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 UPDATE governed_executor_result SET effect_journal_entries='';",
+            )
+            .unwrap();
+        drop(connection);
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let migrated: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_executor_result')
+                 WHERE name='cumulative_effect_journal_digest'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, 1);
+    }
+
+    #[test]
+    fn r2_migration_refuses_pre_r2_terminal_that_omits_prior_reported_effects() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let prior = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("pre-r2-prior-effect"),
+        };
+        let mut first: ExecutorOutcomeWireV1 = serde_json::from_slice(
+            &std::fs::read(fixture.executor_program.with_extension("response")).unwrap(),
+        )
+        .unwrap();
+        first.effect_journal = vec![prior];
+        write_executor_response(&fixture.executor_program, &first);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        assert!(matches!(
+            reconcile(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                Some(&fixture.custody.attempt),
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            DocketReconciliationWireV1::GovernedRepairRequired { .. }
+        ));
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 DROP TRIGGER governed_executor_result_cumulative_required_insert;
+                 DROP TRIGGER governed_repair_checkpoint_immutable_update;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN no_unauthorized_effect_reported
+                   TO unauthorized_effect_not_performed;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN reported_authorized_effects_occurred
+                   TO authorized_effects_occurred;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_digest;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_entries;",
+            )
+            .unwrap();
+        let empty_digest = effect_journal_identity(&fixture.issuance.effect_scope, &[]).unwrap();
+        connection
+            .execute(
+                "UPDATE governed_repair_checkpoint
+                 SET effect_journal_entries='',effect_journal_digest=?1",
+                [&empty_digest],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match SqliteStore::open(&fixture.database) {
+            Ok(_) => panic!("incomplete historical terminal unexpectedly migrated"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(error.contains("governed-cumulative-migration-terminal-journal-incomplete"));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let rolled_back: (i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM pragma_table_info('governed_executor_result')
+                    WHERE name='cumulative_effect_journal_digest'),
+                   (SELECT COUNT(*) FROM pragma_table_info('governed_repair_checkpoint')
+                    WHERE name='authorized_effects_occurred')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rolled_back, (0, 1));
+    }
+
+    #[test]
+    fn r2_migration_preserves_pre_r2_terminal_that_already_contains_prior_effects() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let prior = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("pre-r2-complete-prior-effect"),
+        };
+        let mut first: ExecutorOutcomeWireV1 = serde_json::from_slice(
+            &std::fs::read(fixture.executor_program.with_extension("response")).unwrap(),
+        )
+        .unwrap();
+        first.effect_journal = vec![prior];
+        write_executor_response(&fixture.executor_program, &first);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        assert!(matches!(
+            reconcile(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                Some(&fixture.custody.attempt),
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap(),
+            DocketReconciliationWireV1::GovernedRepairRequired { .. }
+        ));
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 DROP TRIGGER governed_executor_result_cumulative_required_insert;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN no_unauthorized_effect_reported
+                   TO unauthorized_effect_not_performed;
+                 ALTER TABLE governed_repair_checkpoint
+                   RENAME COLUMN reported_authorized_effects_occurred
+                   TO authorized_effects_occurred;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_digest;
+                 ALTER TABLE governed_executor_result
+                   DROP COLUMN cumulative_effect_journal_entries;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let reopened = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let reported: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT reported_authorized_effects_occurred
+                 FROM governed_repair_checkpoint",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reported, 1);
+        assert!(governed_repair::read_sealed_result(
+            &reopened.connection,
+            &fixture.issuance.issuance
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
@@ -2955,7 +4103,7 @@ mod tests {
             scope: digest("wrong-scope"),
             status: ExecutionStandingStatusV1::Current,
             resolved_at_unix_ms: 0,
-            expires_at_unix_ms: i64::MAX as u64,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
         };
         write_static_program(
             &fixture.standing_program,
@@ -3000,7 +4148,7 @@ mod tests {
     fn standing_transport_or_process_failure_remains_retryable_and_unrecorded() {
         let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
         write_refusing_program(&fixture.standing_program);
-        assert!(accept(
+        let error = accept(
             &fixture.database,
             &fixture.envelope,
             &fixture.trust,
@@ -3008,8 +4156,11 @@ mod tests {
             &fixture.executor_program,
             &fixture.root.join("executor-config"),
         )
-        .unwrap_err()
-        .starts_with("process-refused:"));
+        .unwrap_err();
+        assert!(
+            error.starts_with("process-refused:") || error.starts_with("process-stdin:"),
+            "{error}"
+        );
         let connection = Connection::open(&fixture.database).unwrap();
         let refusals: i64 = connection
             .query_row(
@@ -3029,6 +4180,7 @@ mod tests {
             repository: digest("checkpoint-repository"),
             commit: "1".repeat(40),
             tree: "2".repeat(40),
+            diff_identity: None,
             content_manifest: digest("checkpoint-manifest"),
             docket_checkpoint: None,
         });
@@ -3042,7 +4194,7 @@ mod tests {
             checkpoint: issuance.governed_repair_checkpoint.clone().unwrap(),
             status: CheckpointVerificationStatusWireV1::Mismatch,
             verified_at_unix_ms: 0,
-            expires_at_unix_ms: i64::MAX as u64,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
         };
         write_static_program(&verifier, &serde_json::to_string(&result).unwrap());
         let response = accept_with_checkpoint_verifier(
@@ -3298,7 +4450,7 @@ mod tests {
             scope: substituted.issuance.effect_scope_digest.clone(),
             status: ExecutionStandingStatusV1::Current,
             resolved_at_unix_ms: 0,
-            expires_at_unix_ms: i64::MAX as u64,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
         };
         write_static_program(
             &substituted.standing_program,
@@ -3499,6 +4651,14 @@ mod tests {
                 "settlement",
                 "UPDATE governed_loop_attempt SET receipt='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
             ),
+            (
+                "settlement time under unchanged identity",
+                "UPDATE governed_loop_attempt SET settled_at=settled_at+1",
+            ),
+            (
+                "settlement cumulative journal under unchanged identity",
+                "UPDATE governed_loop_attempt SET settlement_cumulative_effect_journal_identity='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'",
+            ),
         ] {
             let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
             accept(
@@ -3511,6 +4671,9 @@ mod tests {
             )
             .unwrap();
             let connection = Connection::open(&fixture.database).unwrap();
+            connection
+                .execute_batch("DROP TRIGGER governed_loop_settlement_immutable_update;")
+                .unwrap();
             connection.execute(statement, []).unwrap();
             drop(connection);
             assert!(
@@ -3539,7 +4702,7 @@ mod tests {
             commit: "1".repeat(40),
             tree: "2".repeat(40),
             diff_identity: Some(digest("checkpoint-diff")),
-            content_manifest_identity: Some(digest("checkpoint-content-manifest")),
+            content_manifest_identity: digest("checkpoint-content-manifest"),
         });
         write_executor_response(&fixture.executor_program, &response);
         let first = accept(
@@ -3797,6 +4960,14 @@ mod tests {
                 "governed_repair_scope_immutable_update",
                 "UPDATE governed_repair_scope_expansion SET reason='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
             ),
+            (
+                "governed_repair_scope_immutable_update",
+                "UPDATE governed_repair_scope_expansion SET requested_delta_digest='sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+            ),
+            (
+                "governed_repair_checkpoint_immutable_update",
+                "PRAGMA ignore_check_constraints=ON; UPDATE governed_repair_checkpoint SET no_unauthorized_effect_reported=0",
+            ),
         ] {
             let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
             write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
@@ -3836,6 +5007,7 @@ mod tests {
             repository: digest("repository"),
             commit: "1".repeat(40),
             tree: "2".repeat(40),
+            diff_identity: None,
             content_manifest: digest("manifest"),
             docket_checkpoint: None,
         });
@@ -4046,6 +5218,688 @@ mod tests {
     }
 
     #[test]
+    fn altered_scope_identity_refuses_before_standing_or_custody() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut issuance = fixture.issuance.clone();
+        issuance.effect_scope_digest = digest("substituted-scope-identity");
+        refresh_issuance_identity(&mut issuance);
+        let envelope = signed_envelope(&fixture, &issuance);
+        let response = accept(
+            &fixture.database,
+            &envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            DocketExecutionResponseWireV1::Refused(DocketIssuanceRefusalWireV1 {
+                refusal_class: DocketIssuanceRefusalClassWireV1::IssuanceInvalid,
+                ..
+            })
+        ));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let attempts: i64 = connection
+            .query_row("SELECT COUNT(*) FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn reconcile_reverifies_checkpoint_before_any_executor_or_state_advance() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let mut issuance = fixture.issuance.clone();
+        issuance.governed_repair_checkpoint = Some(GovernedRepairCheckpointEvidenceWireV1 {
+            repository: digest("checkpoint-repository"),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            diff_identity: Some(digest("checkpoint-diff")),
+            content_manifest: digest("checkpoint-manifest"),
+            docket_checkpoint: None,
+        });
+        refresh_issuance_identity(&mut issuance);
+        let attempt =
+            digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance).unwrap();
+        let custody = DocketCustodyWireV1 {
+            schema: CUSTODY_SCHEMA_V1.to_owned(),
+            issuance: issuance.issuance.clone(),
+            ag_spend: issuance.spend.clone(),
+            execution_standing: digest("successor-execution-standing"),
+            standing_currentness: digest("successor-standing-currentness"),
+            attempt: attempt.clone(),
+            executor_marker: hash_domain(
+                "docket.governed-loop.executor-marker/v1",
+                attempt.as_bytes(),
+            ),
+            accepted_at_unix_ms: 0,
+        };
+        write_static_program(
+            &fixture.standing_program,
+            &serde_json::to_string(&ExecutionStandingResolutionV1 {
+                schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
+                resolution: digest("successor-standing-resolution"),
+                currentness: custody.standing_currentness.clone(),
+                execution_standing: custody.execution_standing.clone(),
+                issuance: issuance.issuance.clone(),
+                campaign: issuance.key.campaign.clone(),
+                occurrence: issuance.key.occurrence.clone(),
+                subject: issuance.subject.clone(),
+                scope: issuance.effect_scope_digest.clone(),
+                status: ExecutionStandingStatusV1::Current,
+                resolved_at_unix_ms: 0,
+                expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
+            })
+            .unwrap(),
+        );
+        write_executor(
+            &fixture.executor_program,
+            &custody,
+            ExecutorOutcomeClassWireV1::Indeterminate,
+            &digest("successor-indeterminate"),
+        );
+        let envelope = signed_envelope(&fixture, &issuance);
+        let verifier = fixture.root.join("checkpoint-verifier");
+        let mut verification = CheckpointVerificationResultWireV1 {
+            schema: "docket.governed-repair.checkpoint-verification/v1".to_owned(),
+            verification: digest("checkpoint-verification"),
+            issuance: issuance.issuance.clone(),
+            checkpoint: issuance.governed_repair_checkpoint.clone().unwrap(),
+            status: CheckpointVerificationStatusWireV1::Current,
+            verified_at_unix_ms: 0,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
+        };
+        write_static_program(&verifier, &serde_json::to_string(&verification).unwrap());
+        accept_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            Some(&verifier),
+        )
+        .unwrap();
+        let before: (String, i64) = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT status,(SELECT COUNT(*) FROM governed_executor_result)
+                 FROM governed_loop_attempt",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        verification.status = CheckpointVerificationStatusWireV1::Mismatch;
+        write_static_program(&verifier, &serde_json::to_string(&verification).unwrap());
+        write_refusing_program(&fixture.executor_program);
+        assert_eq!(
+            reconcile_with_checkpoint_verifier(
+                &fixture.database,
+                &issuance.issuance,
+                Some(&custody.attempt),
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                Some(&verifier),
+            )
+            .unwrap_err(),
+            "governed-checkpoint-verification-mismatch"
+        );
+        let after: (String, i64) = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT status,(SELECT COUNT(*) FROM governed_executor_result)
+                 FROM governed_loop_attempt",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn sealed_successor_result_requires_fresh_checkpoint_before_reemission() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        let mut issuance = fixture.issuance.clone();
+        issuance.governed_repair_checkpoint = Some(GovernedRepairCheckpointEvidenceWireV1 {
+            repository: digest("sealed-successor-repository"),
+            commit: "1".repeat(40),
+            tree: "2".repeat(40),
+            diff_identity: None,
+            content_manifest: digest("sealed-successor-manifest"),
+            docket_checkpoint: None,
+        });
+        refresh_issuance_identity(&mut issuance);
+        let attempt =
+            digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance).unwrap();
+        let custody = DocketCustodyWireV1 {
+            schema: CUSTODY_SCHEMA_V1.to_owned(),
+            issuance: issuance.issuance.clone(),
+            ag_spend: issuance.spend.clone(),
+            execution_standing: digest("sealed-successor-execution-standing"),
+            standing_currentness: digest("sealed-successor-standing-currentness"),
+            attempt: attempt.clone(),
+            executor_marker: hash_domain(
+                "docket.governed-loop.executor-marker/v1",
+                attempt.as_bytes(),
+            ),
+            accepted_at_unix_ms: 0,
+        };
+        write_static_program(
+            &fixture.standing_program,
+            &serde_json::to_string(&ExecutionStandingResolutionV1 {
+                schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
+                resolution: digest("sealed-successor-standing-resolution"),
+                currentness: custody.standing_currentness.clone(),
+                execution_standing: custody.execution_standing.clone(),
+                issuance: issuance.issuance.clone(),
+                campaign: issuance.key.campaign.clone(),
+                occurrence: issuance.key.occurrence.clone(),
+                subject: issuance.subject.clone(),
+                scope: issuance.effect_scope_digest.clone(),
+                status: ExecutionStandingStatusV1::Current,
+                resolved_at_unix_ms: 0,
+                expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
+            })
+            .unwrap(),
+        );
+        write_scope_expansion_executor(&fixture.executor_program, &custody);
+        let envelope = signed_envelope(&fixture, &issuance);
+        let verifier = fixture.root.join("sealed-checkpoint-verifier");
+        let mut verification = CheckpointVerificationResultWireV1 {
+            schema: "docket.governed-repair.checkpoint-verification/v1".to_owned(),
+            verification: digest("sealed-checkpoint-verification"),
+            issuance: issuance.issuance.clone(),
+            checkpoint: issuance.governed_repair_checkpoint.clone().unwrap(),
+            status: CheckpointVerificationStatusWireV1::Current,
+            verified_at_unix_ms: 0,
+            expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
+        };
+        write_static_program(&verifier, &serde_json::to_string(&verification).unwrap());
+        assert!(matches!(
+            accept_with_checkpoint_verifier(
+                &fixture.database,
+                &envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                Some(&verifier),
+            )
+            .unwrap(),
+            DocketExecutionResponseWireV1::GovernedRepairRequired { .. }
+        ));
+        let before: (i64, i64) = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM governed_repair_checkpoint),
+                        (SELECT COUNT(*) FROM governed_executor_result)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        verification.status = CheckpointVerificationStatusWireV1::Mismatch;
+        write_static_program(&verifier, &serde_json::to_string(&verification).unwrap());
+        let forbidden_executor = fixture.root.join("sealed-result-must-not-invoke-executor");
+        let forbidden_counter = forbidden_executor.with_extension("invocations");
+        write_counting_refusing_program(&forbidden_executor, &forbidden_counter);
+        assert_eq!(
+            reconcile_with_checkpoint_verifier(
+                &fixture.database,
+                &issuance.issuance,
+                Some(&custody.attempt),
+                &forbidden_executor,
+                &fixture.root.join("executor-config"),
+                Some(&verifier),
+            )
+            .unwrap_err(),
+            "governed-checkpoint-verification-mismatch"
+        );
+        assert!(!forbidden_counter.exists());
+        let after: (i64, i64) = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM governed_repair_checkpoint),
+                        (SELECT COUNT(*) FROM governed_executor_result)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn indeterminate_then_terminal_preserves_one_cumulative_ordered_journal() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let first_entry = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("first-effect"),
+        };
+        let second_entry = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("second-effect"),
+        };
+        let mut first: ExecutorOutcomeWireV1 = serde_json::from_slice(
+            &std::fs::read(fixture.executor_program.with_extension("response")).unwrap(),
+        )
+        .unwrap();
+        first.effect_journal = vec![first_entry.clone()];
+        write_executor_response(&fixture.executor_program, &first);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_executor(
+            &fixture.executor_program,
+            &fixture.custody,
+            ExecutorOutcomeClassWireV1::Failure,
+            &digest("terminal-receipt"),
+        );
+        let mut terminal: ExecutorOutcomeWireV1 = serde_json::from_slice(
+            &std::fs::read(fixture.executor_program.with_extension("response")).unwrap(),
+        )
+        .unwrap();
+        terminal.effect_journal = vec![second_entry.clone()];
+        write_executor_response(&fixture.executor_program, &terminal);
+        let reconciliation = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            Some(&fixture.custody.attempt),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let expected =
+            effect_journal_identity(&fixture.issuance.effect_scope, &[first_entry, second_entry])
+                .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        let stored: String = connection
+            .query_row(
+                "SELECT cumulative_effect_journal_digest
+                 FROM governed_executor_result ORDER BY sequence DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected);
+        let DocketReconciliationWireV1::Settled { settlement, .. } = &reconciliation else {
+            panic!("known terminal result must emit exact settlement")
+        };
+        assert_eq!(settlement.cumulative_effect_journal_identity, expected);
+        assert_eq!(
+            settlement.settlement,
+            docket_settlement_identity(settlement).unwrap()
+        );
+        governed_repair::validate_ordinary_executor_result(
+            &connection,
+            &fixture.issuance.issuance,
+            &fixture.custody.attempt,
+            "settled",
+            &fixture.issuance.effect_scope,
+        )
+        .unwrap();
+        drop(connection);
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_executor_result_immutable_update;
+                 UPDATE governed_executor_result
+                 SET cumulative_effect_journal_digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                 WHERE sequence=(SELECT MAX(sequence) FROM governed_executor_result);",
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            reconcile(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                Some(&fixture.custody.attempt),
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap_err(),
+            "governed-executor-cumulative-journal-substitution"
+        );
+    }
+
+    #[test]
+    fn cumulative_journal_is_idempotent_and_effect_identity_is_non_substitutable() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let entry = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("one-exact-effect"),
+        };
+        let two_coordinate_scope = CanonicalEffectScopeWireV1 {
+            schema: "ag.governed-loop.canonical-effect-scope/v1".to_owned(),
+            effect_class: "repository-write/v1".to_owned(),
+            resources: vec![
+                CanonicalEffectResourceWireV1 {
+                    resource: "repository".to_owned(),
+                    path: "crates/nq-store/src/lib.rs".to_owned(),
+                    operations: vec![CanonicalEffectOperationWireV1::Modify],
+                },
+                CanonicalEffectResourceWireV1 {
+                    resource: "repository".to_owned(),
+                    path: "neighboring/path".to_owned(),
+                    operations: vec![CanonicalEffectOperationWireV1::Modify],
+                },
+            ],
+        };
+        let mut connection = Connection::open(&fixture.database).unwrap();
+
+        let append = |tx: &rusqlite::Transaction<'_>,
+                      receipt: &str,
+                      entries: &[EffectJournalEntryWireV1]| {
+            governed_repair::append_ordinary_executor_result(
+                tx,
+                governed_repair::OrdinaryExecutorResultInputV1 {
+                    issuance: &fixture.issuance.issuance,
+                    attempt: &fixture.custody.attempt,
+                    outcome: "indeterminate",
+                    receipt,
+                    scope: &two_coordinate_scope,
+                    entries,
+                    recorded_at: 1,
+                },
+            )
+        };
+
+        let first_receipt = digest("first-distinct-observation");
+        let tx = connection.transaction().unwrap();
+        assert!(!append(&tx, &first_receipt, std::slice::from_ref(&entry)).unwrap());
+        // Exact receipt and exact bytes are idempotent and append no row.
+        assert!(append(&tx, &first_receipt, std::slice::from_ref(&entry)).unwrap());
+        tx.commit().unwrap();
+
+        let second_receipt = digest("second-distinct-observation");
+        let tx = connection.transaction().unwrap();
+        assert!(!append(&tx, &second_receipt, std::slice::from_ref(&entry)).unwrap());
+        tx.commit().unwrap();
+        let rows_and_latest_digest: (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT cumulative_effect_journal_digest
+                         FROM governed_executor_result ORDER BY sequence DESC LIMIT 1)
+                 FROM governed_executor_result",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        // One fixture row plus two distinct observations; the repeated exact
+        // effect appears once in the occurrence's cumulative sequence.
+        assert_eq!(rows_and_latest_digest.0, 3);
+        assert_eq!(
+            rows_and_latest_digest.1,
+            effect_journal_identity(&two_coordinate_scope, std::slice::from_ref(&entry)).unwrap()
+        );
+
+        let changed = EffectJournalEntryWireV1 {
+            path: "neighboring/path".to_owned(),
+            ..entry
+        };
+        let tx = connection.transaction().unwrap();
+        assert_eq!(
+            append(&tx, &digest("third-conflicting-observation"), &[changed]).unwrap_err(),
+            "governed-executor-effect-identity-collision"
+        );
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM governed_executor_result", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn terminal_seal_and_late_indeterminate_observation_are_one_atomic_journal_cut() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+
+        let late_effect = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("concurrent-late-effect"),
+        };
+        let late = ExecutorOutcomeWireV1 {
+            attempt: fixture.custody.attempt.clone(),
+            marker: fixture.custody.executor_marker.clone(),
+            receipt: digest("concurrent-late-receipt"),
+            outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+            effect_journal: vec![late_effect.clone()],
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        };
+        let delta = CanonicalEffectScopeWireV1 {
+            schema: "ag.governed-loop.canonical-effect-scope/v1".to_owned(),
+            effect_class: "repository-write/v1".to_owned(),
+            resources: vec![CanonicalEffectResourceWireV1 {
+                resource: "repository".to_owned(),
+                path: "crates/nq-store/src/new.rs".to_owned(),
+                operations: vec![CanonicalEffectOperationWireV1::Modify],
+            }],
+        };
+        let terminal = ExecutorOutcomeWireV1 {
+            attempt: fixture.custody.attempt.clone(),
+            marker: fixture.custody.executor_marker.clone(),
+            receipt: digest("concurrent-terminal-receipt"),
+            outcome: ExecutorOutcomeClassWireV1::ScopeExpansionRequired,
+            effect_journal: vec![],
+            immutable_work_checkpoint: None,
+            governed_repair: Some(
+                ExecutorGovernedRepairRequirementWireV1::ScopeExpansionRequired {
+                    requested_delta_digest: hash_domain(
+                        "ag.governed-loop.canonical-effect-scope/v1",
+                        &serde_jcs::to_vec(&delta).unwrap(),
+                    ),
+                    requested_delta: delta,
+                    blocked_effect: governed_repair::BlockedEffectWireV1 {
+                        effect_class: "repository-write/v1".to_owned(),
+                        resource: "repository".to_owned(),
+                        path: "crates/nq-store/src/new.rs".to_owned(),
+                        operation: CanonicalEffectOperationWireV1::Modify,
+                    },
+                    reason: digest("concurrent-scope-reason"),
+                    dependency_evidence: vec![digest("concurrent-dependency")],
+                    created_at_unix_ms: 0,
+                    expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
+                    idempotency: digest("concurrent-idempotency"),
+                    limitations: vec![digest("concurrent-limitation")],
+                },
+            ),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let spawn = |outcome: ExecutorOutcomeWireV1| {
+            let database = fixture.database.clone();
+            let issuance = fixture.issuance.issuance.clone();
+            let custody = fixture.custody.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut store = GovernedCustodyStoreV1::open(&database).unwrap();
+                barrier.wait();
+                store.record_executor_outcome(&issuance, &custody, outcome, 100)
+            })
+        };
+        let late_thread = spawn(late.clone());
+        let terminal_thread = spawn(terminal);
+        barrier.wait();
+        let late_result = late_thread.join().unwrap();
+        terminal_thread.join().unwrap().unwrap();
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        let sealed_entries: String = connection
+            .query_row(
+                "SELECT effect_journal_entries FROM governed_repair_checkpoint",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let sealed_entries = governed_repair::decode_journal_for_test(&sealed_entries).unwrap();
+        assert_eq!(sealed_entries.contains(&late_effect), late_result.is_ok());
+        drop(connection);
+
+        // A new observation after the terminal checkpoint is neither appended
+        // nor mistaken for an idempotent replay, including after reopen.
+        let before: i64 = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM governed_executor_result", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut reopened = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let mut changed = late;
+        changed.receipt = digest("after-terminal-new-receipt");
+        assert_eq!(
+            reopened
+                .record_executor_outcome(
+                    &fixture.issuance.issuance,
+                    &fixture.custody,
+                    changed,
+                    101,
+                )
+                .unwrap_err(),
+            "governed-executor-result-after-terminal"
+        );
+        let after: i64 = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM governed_executor_result", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn strict_json_rejects_recursive_unsafe_numbers_and_nested_unknown_fields() {
+        assert!(strict_json::<serde_json::Value>(
+            br#"{"outer":{"unsafe":9007199254740992}}"#,
+            "unsafe"
+        )
+        .unwrap_err()
+        .contains("number-outside-jcs-safe-integer-domain"));
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        let response: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.executor_program.with_extension("response")).unwrap(),
+        )
+        .unwrap();
+        let mut response = response;
+        response["governed_repair"]["unexpected_nested_field"] = serde_json::Value::Bool(true);
+        assert!(strict_json::<ExecutorOutcomeWireV1>(
+            &serde_json::to_vec(&response).unwrap(),
+            "nested"
+        )
+        .is_err());
+        assert!(strict_json::<serde_json::Value>(
+            br#"{"requested_delta":{"effect_class":"one","effect_class":"two"}}"#,
+            "nested-duplicate"
+        )
+        .unwrap_err()
+        .contains("duplicate JSON object member: effect_class"));
+        assert!(strict_json::<serde_json::Value>(
+            br#"{"checkpoint":{"diff_identity":null,"diff_identity":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+            "null-valid-duplicate"
+        )
+        .unwrap_err()
+        .contains("duplicate JSON object member: diff_identity"));
+
+        let plain = ExecutorOutcomeWireV1 {
+            attempt: digest("canonical-outcome-attempt"),
+            marker: digest("canonical-outcome-marker"),
+            receipt: digest("canonical-outcome-receipt"),
+            outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+            effect_journal: vec![],
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        };
+        let canonical = serde_jcs::to_vec(&plain).unwrap();
+        let canonical_value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+        assert!(!canonical_value
+            .as_object()
+            .unwrap()
+            .contains_key("immutable_work_checkpoint"));
+        assert!(!canonical_value
+            .as_object()
+            .unwrap()
+            .contains_key("governed_repair"));
+        for field in ["immutable_work_checkpoint", "governed_repair"] {
+            let mut explicit_null = canonical_value.clone();
+            explicit_null[field] = serde_json::Value::Null;
+            assert!(strict_json::<ExecutorOutcomeWireV1>(
+                &serde_jcs::to_vec(&explicit_null).unwrap(),
+                "executor-outcome-explicit-null"
+            )
+            .unwrap_err()
+            .contains("explicit null is not canonical"));
+        }
+    }
+
+    #[test]
+    fn docket_persistence_rejects_times_outside_jcs_safe_integer_domain() {
+        assert_eq!(
+            u64_to_i64(MAX_JCS_SAFE_INTEGER).unwrap(),
+            9_007_199_254_740_991
+        );
+        assert_eq!(
+            u64_to_i64(MAX_JCS_SAFE_INTEGER + 1).unwrap_err(),
+            "governed-clock-outside-jcs-safe-integer-domain"
+        );
+        assert!(read_u64(9_007_199_254_740_991, 0).is_ok());
+        assert!(read_u64(9_007_199_254_740_992, 0).is_err());
+    }
+
+    #[test]
+    fn sealed_requirement_uses_honest_executor_report_observation_label() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::ScopeExpansionRequired);
+        write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+        let response = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(response).unwrap();
+        let text = serde_json::to_string(&encoded).unwrap();
+        assert!(text.contains("no_unauthorized_effect_reported"));
+        assert!(!text.contains("unauthorized_effect_not_performed"));
+    }
+
+    #[test]
     fn ag_custody_reference_matches_frozen_cross_repository_vector() {
         let value = DocketCustodyWireV1 {
             schema: CUSTODY_SCHEMA_V1.to_owned(),
@@ -4115,7 +5969,7 @@ mod tests {
         };
         let delta_digest = hash_domain(
             "ag.governed-loop.canonical-effect-scope/v1",
-            &serde_json::to_vec(&serde_json::to_value(&delta).unwrap()).unwrap(),
+            &serde_jcs::to_vec(&delta).unwrap(),
         );
         let response = ExecutorOutcomeWireV1 {
             attempt: custody.attempt.clone(),
@@ -4137,7 +5991,7 @@ mod tests {
                     reason: digest("scope-reason"),
                     dependency_evidence: vec![digest("scope-dependency")],
                     created_at_unix_ms: 0,
-                    expires_at_unix_ms: i64::MAX as u64,
+                    expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
                     idempotency: digest("scope-idempotency"),
                     limitations: vec![digest("scope-limitation")],
                 },
@@ -4171,7 +6025,7 @@ mod tests {
                         }],
                     },
                     created_at_unix_ms: 0,
-                    expires_at_unix_ms: i64::MAX as u64,
+                    expires_at_unix_ms: MAX_JCS_SAFE_INTEGER,
                     idempotency: digest("readjudication-idempotency"),
                     limitations: vec![digest("readjudication-limitation")],
                 },
@@ -4202,6 +6056,18 @@ mod tests {
 
     fn write_refusing_program(path: &Path) {
         std::fs::write(path, "#!/bin/sh\nexit 77\n").unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_counting_refusing_program(path: &Path, counter: &Path) {
+        let counter = counter.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\nprintf x >> '{counter}'\nexit 77\n"),
+        )
+        .unwrap();
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).unwrap();

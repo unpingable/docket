@@ -71,7 +71,10 @@ pub struct GovernedRepairBindingV1 {
     pub original_scope: CanonicalEffectScopeV1,
     pub original_scope_digest: Sha256Digest,
     pub effect_journal_digest: Sha256Digest,
-    pub authorized_effects_occurred: bool,
+    /// Whether Docket observed one or more executor-reported effects in the
+    /// cumulative journal. This is not a claim that Docket physically
+    /// mediated every effect.
+    pub reported_authorized_effects_occurred: bool,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub idempotency: Sha256Digest,
@@ -85,7 +88,10 @@ pub struct ScopeExpansionRequiredV1 {
     pub blocked_effect: BlockedEffectV1,
     pub reason: Sha256Digest,
     pub dependency_evidence: Vec<Sha256Digest>,
-    pub unauthorized_effect_not_performed: bool,
+    /// Docket observed no unauthorized effect in the complete executor journal
+    /// presented at this custody boundary. This is not a physical
+    /// non-occurrence proof outside the mediated executor contract.
+    pub no_unauthorized_effect_reported: bool,
     pub limitations: Vec<Sha256Digest>,
 }
 
@@ -98,7 +104,10 @@ pub struct ReadjudicationRequiredV1 {
     pub bounded_alternatives: Vec<Sha256Digest>,
     pub unresolved_facts: Vec<Sha256Digest>,
     pub adjudication_scope: CanonicalEffectScopeV1,
-    pub unauthorized_effect_not_performed: bool,
+    /// Docket observed no unauthorized effect in the complete executor journal
+    /// presented at this custody boundary. This is not a physical
+    /// non-occurrence proof outside the mediated executor contract.
+    pub no_unauthorized_effect_reported: bool,
     pub limitations: Vec<Sha256Digest>,
 }
 
@@ -128,14 +137,16 @@ pub enum GovernedRepairRefusal {
 impl CanonicalEffectScopeV1 {
     pub fn validate(&self) -> Result<(), GovernedRepairRefusal> {
         if self.schema != CANONICAL_EFFECT_SCOPE_SCHEMA_V1
-            || self.effect_class.is_empty()
+            || !is_bounded_label(&self.effect_class)
             || self.resources.is_empty()
         {
             return Err(GovernedRepairRefusal::EmptyField);
         }
         let mut prior: Option<(&str, &str)> = None;
         for item in &self.resources {
-            if !is_exact_label(&item.resource) || item.path.is_empty() || item.operations.is_empty()
+            if !is_exact_resource_label(&item.resource)
+                || item.path.is_empty()
+                || item.operations.is_empty()
             {
                 return Err(GovernedRepairRefusal::EmptyField);
             }
@@ -236,7 +247,7 @@ impl GovernedRepairRequirementV1 {
                 if value.dependency_evidence.is_empty() || value.limitations.is_empty() {
                     return Err(GovernedRepairRefusal::EmptyCollection);
                 }
-                if !value.unauthorized_effect_not_performed {
+                if !value.no_unauthorized_effect_reported {
                     return Err(GovernedRepairRefusal::UnauthorizedEffectObserved);
                 }
                 require_canonical_digests(&value.dependency_evidence)?;
@@ -254,6 +265,10 @@ impl GovernedRepairRequirementV1 {
                 .field(
                     "dependency_evidence",
                     &digest_list(&value.dependency_evidence),
+                )
+                .text_field(
+                    "no_unauthorized_effect_reported",
+                    bool_tag(value.no_unauthorized_effect_reported),
                 )
                 .field("limitations", &digest_list(&value.limitations))
             }
@@ -276,7 +291,7 @@ impl GovernedRepairRequirementV1 {
                 {
                     return Err(GovernedRepairRefusal::EmptyCollection);
                 }
-                if !value.unauthorized_effect_not_performed {
+                if !value.no_unauthorized_effect_reported {
                     return Err(GovernedRepairRefusal::UnauthorizedEffectObserved);
                 }
                 require_canonical_digests(&value.evidence_census)?;
@@ -296,6 +311,10 @@ impl GovernedRepairRequirementV1 {
                     .field(
                         "adjudication_scope",
                         value.adjudication_scope.identity()?.as_bytes(),
+                    )
+                    .text_field(
+                        "no_unauthorized_effect_reported",
+                        bool_tag(value.no_unauthorized_effect_reported),
                     )
                     .field("limitations", &digest_list(&value.limitations))
             }
@@ -324,8 +343,8 @@ fn requirement_transcript(domain: &'static str, binding: &GovernedRepairBindingV
         .field("original_scope", binding.original_scope_digest.as_bytes())
         .field("effect_journal", binding.effect_journal_digest.as_bytes())
         .text_field(
-            "authorized_effects_occurred",
-            if binding.authorized_effects_occurred {
+            "reported_authorized_effects_occurred",
+            if binding.reported_authorized_effects_occurred {
                 "true"
             } else {
                 "false"
@@ -348,6 +367,14 @@ fn digest_list(values: &[Sha256Digest]) -> [u8; 32] {
         transcript = transcript.field("item", value.as_bytes());
     }
     *transcript.finalize().as_bytes()
+}
+
+const fn bool_tag(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
 }
 
 fn strictly_sorted<T: Copy + Ord>(mut values: impl Iterator<Item = T>) -> bool {
@@ -385,12 +412,25 @@ fn is_exact_relative_path(path: &str) -> bool {
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
 
-fn is_exact_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 128
-        && label.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
-        })
+fn is_bounded_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 128 {
+        return false;
+    }
+    let mut prior_separator = true;
+    for byte in label.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            prior_separator = false;
+        } else if matches!(byte, b'-' | b'.' | b'_' | b'/' | b':') && !prior_separator {
+            prior_separator = true;
+        } else {
+            return false;
+        }
+    }
+    !prior_separator
+}
+
+fn is_exact_resource_label(label: &str) -> bool {
+    is_bounded_label(label)
         && !["branch", "head", "ref"]
             .iter()
             .any(|word| label.to_ascii_lowercase().contains(word))
@@ -435,7 +475,7 @@ mod tests {
             original_scope,
             original_scope_digest,
             effect_journal_digest: digest(13),
-            authorized_effects_occurred: true,
+            reported_authorized_effects_occurred: true,
             created_at_unix_ms: 10,
             expires_at_unix_ms: 100,
             idempotency: digest(14),
@@ -465,10 +505,29 @@ mod tests {
             },
             reason: digest(18),
             dependency_evidence: vec![digest(15)],
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
             limitations: vec![digest(19)],
         });
         assert!(requirement.validate(20).is_ok());
+        let GovernedRepairRequirementV1::ScopeExpansion(mut altered) = requirement else {
+            unreachable!()
+        };
+        altered.no_unauthorized_effect_reported = false;
+        assert_eq!(
+            GovernedRepairRequirementV1::ScopeExpansion(altered).validate(20),
+            Err(GovernedRepairRefusal::UnauthorizedEffectObserved)
+        );
+    }
+
+    #[test]
+    fn reported_nonoccurrence_observation_is_an_identity_coordinate() {
+        let yes = Transcript::new("docket.test.requirement-observation/v1")
+            .text_field("no_unauthorized_effect_reported", bool_tag(true))
+            .finalize();
+        let no = Transcript::new("docket.test.requirement-observation/v1")
+            .text_field("no_unauthorized_effect_reported", bool_tag(false))
+            .finalize();
+        assert_ne!(yes, no);
     }
 
     #[test]
@@ -486,7 +545,7 @@ mod tests {
             },
             reason: digest(18),
             dependency_evidence: vec![digest(15)],
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
             limitations: vec![digest(19)],
         });
         assert_eq!(
@@ -503,7 +562,7 @@ mod tests {
                 bounded_alternatives: vec![digest(21)],
                 unresolved_facts: vec![digest(22)],
                 adjudication_scope: scope(),
-                unauthorized_effect_not_performed: true,
+                no_unauthorized_effect_reported: true,
                 limitations: vec![digest(23)],
             });
         assert_eq!(
@@ -538,7 +597,7 @@ mod tests {
             },
             reason: digest(18),
             dependency_evidence: vec![digest(15)],
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
             limitations: vec![digest(19)],
         });
         assert_eq!(
@@ -559,6 +618,21 @@ mod tests {
         let mut value = scope();
         value.resources[0].path = "docs/design notes/契約.md".to_owned();
         assert!(value.validate().is_ok());
+
+        for label in [
+            "Uppercase",
+            "unicode-契約",
+            "contains space",
+            "leading-.separator",
+            "trailing-",
+            "double--separator",
+        ] {
+            value.effect_class = label.to_owned();
+            assert_eq!(value.validate(), Err(GovernedRepairRefusal::EmptyField));
+        }
+        value.effect_class = "branch/head/ref-effect".to_owned();
+        assert!(value.validate().is_ok());
+        value.effect_class = "repository-write/v1".to_owned();
 
         for path in [
             "/absolute",

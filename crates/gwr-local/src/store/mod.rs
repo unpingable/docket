@@ -45,6 +45,9 @@ const MIGRATION_0007: &str = include_str!("../../migrations/0007_governed_repair
 const MIGRATION_0008: &str =
     include_str!("../../migrations/0008_governed_executor_config_binding.sql");
 const MIGRATION_0009: &str = include_str!("../../migrations/0009_governed_loop_refusal.sql");
+const MIGRATION_0010: &str = include_str!("../../migrations/0010_governed_repair_r2.sql");
+const MIGRATION_0011: &str =
+    include_str!("../../migrations/0011_governed_settlement_journal_binding.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -174,6 +177,63 @@ impl SqliteStore {
         // separate from the attempt table: no attempt or execution standing
         // exists on this path.
         conn.execute_batch(MIGRATION_0009).map_err(backend)?;
+        // 0010 narrows an overstrong executor-observation label and adds an
+        // exact cumulative journal chain across indeterminate and terminal
+        // executor observations. Historical rows are deterministically
+        // backfilled from their existing append order; no authority is
+        // inferred and the immutable trigger is restored before open returns.
+        let has_cumulative_journal: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_executor_result')
+                 WHERE name='cumulative_effect_journal_digest'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        // 0011 closes the ordinary-settlement identity over the exact
+        // cumulative executor journal.  Run 0010 and 0011 in one additive
+        // transaction when opening a rejected-R1 development store so journal
+        // backfill necessarily precedes settlement identity recomputation.
+        // The independent checks also safely complete an interrupted R2
+        // development migration that already has 0010 but not 0011.
+        let has_settlement_journal: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='settlement_cumulative_effect_journal_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let has_legacy_settlement: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='legacy_r1_settlement_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let has_legacy_settlement_jcs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='legacy_r1_settlement_jcs'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        if has_settlement_journal != has_legacy_settlement
+            || has_settlement_journal != has_legacy_settlement_jcs
+        {
+            return Err(StoreError::Corrupt(
+                "partial governed settlement journal migration".to_owned(),
+            ));
+        }
+        if has_cumulative_journal == 0 || has_settlement_journal == 0 {
+            migrate_governed_repair_r2(
+                conn,
+                has_cumulative_journal != 0,
+                has_settlement_journal != 0,
+            )?;
+        }
         Ok(())
     }
 
@@ -247,6 +307,62 @@ impl SqliteStore {
         }
         Ok(names)
     }
+}
+
+fn migrate_governed_repair_r2(
+    conn: &Connection,
+    has_cumulative_journal: bool,
+    has_settlement_journal: bool,
+) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let result = (|| {
+        if !has_cumulative_journal {
+            conn.execute_batch(MIGRATION_0010).map_err(backend)?;
+            crate::governed_repair::backfill_cumulative_executor_journals(conn)
+                .map_err(StoreError::Corrupt)?;
+        }
+        if !has_settlement_journal {
+            conn.execute_batch(MIGRATION_0011).map_err(backend)?;
+            crate::governed_loop::backfill_settlement_journal_identities(conn)
+                .map_err(StoreError::Corrupt)?;
+            conn.execute_batch(
+                "CREATE TRIGGER governed_loop_settlement_immutable_update
+                 BEFORE UPDATE OF settlement,receipt,outcome,settled_at,
+                                  settlement_cumulative_effect_journal_identity,
+                                  legacy_r1_settlement_identity,legacy_r1_settlement_jcs
+                 ON governed_loop_attempt
+                 WHEN OLD.status='settled' AND (
+                   NEW.settlement IS NOT OLD.settlement
+                   OR NEW.receipt IS NOT OLD.receipt
+                   OR NEW.outcome IS NOT OLD.outcome
+                   OR NEW.settled_at IS NOT OLD.settled_at
+                   OR NEW.settlement_cumulative_effect_journal_identity
+                      IS NOT OLD.settlement_cumulative_effect_journal_identity
+                   OR NEW.legacy_r1_settlement_identity
+                      IS NOT OLD.legacy_r1_settlement_identity
+                   OR NEW.legacy_r1_settlement_jcs
+                      IS NOT OLD.legacy_r1_settlement_jcs
+                 ) BEGIN
+                   SELECT RAISE(ABORT, 'governed settlement is immutable');
+                 END;",
+            )
+            .map_err(backend)?;
+        }
+        if !has_cumulative_journal {
+            conn.execute_batch(
+                "CREATE TRIGGER governed_executor_result_immutable_update
+                 BEFORE UPDATE ON governed_executor_result BEGIN
+                   SELECT RAISE(ABORT, 'governed executor result is immutable');
+                 END;",
+            )
+            .map_err(backend)?;
+        }
+        conn.execute_batch("COMMIT").map_err(backend)
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 /// Serialize the projection columns for an attempt state.

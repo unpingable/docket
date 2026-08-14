@@ -395,14 +395,17 @@ fn run(args: &[String]) -> Result<(), String> {
                 issuance: String,
             }
             let st = State::open(args)?;
-            let request: Request = serde_json::from_slice(&read_stdin_bounded()?)
+            let request: Request = governed_loop::strict_json(&read_stdin_bounded()?, "governed reconciliation request")
                 .map_err(|error| format!("governed reconciliation request: {error}"))?;
-            let response = governed_loop::reconcile(
+            let response = governed_loop::reconcile_with_checkpoint_verifier(
                 &st.dir.join("state.sqlite"),
                 &request.issuance,
                 None,
                 &PathBuf::from(need(args, "--executor")?),
                 &PathBuf::from(need(args, "--executor-config")?),
+                flag(args, "--checkpoint-verifier")
+                    .map(PathBuf::from)
+                    .as_deref(),
             )?;
             println!(
                 "{}",
@@ -419,14 +422,17 @@ fn run(args: &[String]) -> Result<(), String> {
                 attempt: String,
             }
             let st = State::open(args)?;
-            let request: Request = serde_json::from_slice(&read_stdin_bounded()?)
+            let request: Request = governed_loop::strict_json(&read_stdin_bounded()?, "governed reconciliation request")
                 .map_err(|error| format!("governed reconciliation request: {error}"))?;
-            let response = governed_loop::reconcile(
+            let response = governed_loop::reconcile_with_checkpoint_verifier(
                 &st.dir.join("state.sqlite"),
                 &request.issuance,
                 Some(&request.attempt),
                 &PathBuf::from(need(args, "--executor")?),
                 &PathBuf::from(need(args, "--executor-config")?),
+                flag(args, "--checkpoint-verifier")
+                    .map(PathBuf::from)
+                    .as_deref(),
             )?;
             println!(
                 "{}",

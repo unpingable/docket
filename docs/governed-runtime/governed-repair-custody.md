@@ -9,15 +9,24 @@ standing, a repair permit, or authority to continue the consumed occurrence.
 The canonical intake is AG signed-issuance v2. Docket requires one canonical
 outer envelope spelling, authenticates its exact canonical body bytes,
 consumes independently resolved execution standing, persists one attempt
-before invoking mechanics, and checks every reported effect against the
-immutable canonical scope. The signed issuance also repeats the proposal's
+before invoking mechanics, recomputes the embedded RFC 8785 scope identity,
+and checks every reported effect against the immutable canonical scope. The
+same recomputation is performed before standing resolution, at result seal,
+and on durable read. The signed issuance also repeats the proposal's
 canonical nonclaim identities and absolute expiry. Nonclaims are opaque bound
 identities here; Docket does not interpret their NQ or AG meaning. The expiry
 must fit the RFC 8785 safe-integer domain. Docket refuses new custody at or
 after that deadline while still permitting exact read-only retrieval of
 an already durable custody/result. Ordinary settlements, indeterminate
 observations, and governed-repair outcomes all retain exact effect-journal
-evidence. An out-of-scope reported effect refuses before settlement.
+evidence. Indeterminate observations and a later terminal observation form
+one durable, ordered cumulative journal; no terminal result discards an
+earlier reported effect. An out-of-scope reported effect refuses before
+settlement. A known settlement carries that complete cumulative-journal
+identity, and its own identity is derived from the complete canonical
+settlement body excluding only the identity field. Schema, issuance, attempt,
+executor marker, receipt, outcome, cumulative journal, and settlement time are
+therefore non-substitutable on restart or replay.
 
 There are two closed governed-repair outcomes:
 
@@ -30,7 +39,10 @@ There are two closed governed-repair outcomes:
 
 The executor output is evidence only. Docket validates it against the exact
 issuance, custody, attempt, executor binding, effect journal, optional immutable
-work checkpoint, time window, and idempotency identity. Docket then derives
+work checkpoint, time window, and idempotency identity. A work checkpoint has
+an optional exact dirty-diff identity but always has an exact content-manifest
+identity. Absent optional identities are omitted on the AG wire; explicit
+`null` is noncanonical. Docket then derives
 explicit transcript identities for the requirement, checkpoint, and sealed
 result and appends all scalar/closed data atomically. Exact replay returns the
 same result; changed content collides and refuses. Immutable-table triggers and
@@ -40,7 +52,30 @@ authority from stored bytes.
 An optional successor-work checkpoint in an AG issuance is likewise evidence,
 not authority. A configured verifier must freshly establish its exact
 repository/commit/tree/content-manifest correspondence at intake and again on
-re-entry. Future-dated or expired verification refuses.
+every re-entry that could invoke the executor, including reconciliation.
+Future-dated or expired verification refuses before an executor call or state
+advance.
+
+The sealed field `no_unauthorized_effect_reported` has deliberately narrow
+semantics: Docket validated the complete effect journal presented by its
+mediated executor boundary and found no entry outside issuance scope. It does
+not prove physical non-occurrence outside that reporting boundary. Executor
+journal completeness and physical containment remain explicit operational and
+qualification premises; Docket does not manufacture a stronger receipt.
+
+Likewise, `reported_authorized_effects_occurred` means only that the cumulative
+executor-reported journal is nonempty. It is not a claim about unreported or
+physically mediated effects. Terminal sealing takes an immediate Store
+transaction before reading that cumulative journal; a later indeterminate
+observation cannot append after the terminal cut.
+
+The additive R2 settlement migration first completes the cumulative executor
+journal backfill, verifies each rejected-R1 terminal receipt/outcome and legacy
+settlement identity, retains that legacy identity and its deterministic
+canonical wire bytes as historical development evidence, and only then derives
+the active complete-body settlement projection. An incomplete or contradictory
+historical row rolls the whole migration back. Settled projection columns are
+immutable after that cut.
 
 An authenticated, canonical issuance that fails a permanent pre-custody law
 does not disappear into an untyped command error. Docket seals an immutable
