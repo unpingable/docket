@@ -58,6 +58,86 @@ thread_local! {
     static ABORT_ROUND_COMPLETION_BEFORE_ROUND_ROW: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CustodyReadPauseV1 {
+    issuance: String,
+    reader: std::thread::ThreadId,
+    observed: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static CUSTODY_READ_PAUSE: std::sync::Mutex<Option<CustodyReadPauseV1>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static PROCESS_CUSTODY_READ_MATCHES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn pause_after_custody_base_row(issuance: &str) {
+    let pause = CUSTODY_READ_PAUSE
+        .lock()
+        .expect("custody-read pause lock")
+        .clone();
+    if let Some(pause) = pause {
+        if pause.issuance == issuance && pause.reader == std::thread::current().id() {
+            pause.observed.wait();
+            pause.resume.wait();
+        }
+    }
+
+    // A process-level test re-executes this crate's cfg(test) unit-test
+    // binary.  These variables and this seam do not exist in an ordinary
+    // library or `docket` binary build.  The ordinal lets that test pass the
+    // Store-open census read, then stop the duplicate reconciliation caller
+    // only after its consequence-classifying snapshot has read the attempt
+    // base row.
+    let Some(expected_issuance) = std::env::var_os("DOCKET_TEST_CUSTODY_READ_ISSUANCE") else {
+        return;
+    };
+    if expected_issuance != std::ffi::OsStr::new(issuance) {
+        return;
+    }
+    let target_ordinal = std::env::var("DOCKET_TEST_CUSTODY_READ_ORDINAL")
+        .expect("process custody-read ordinal")
+        .parse::<u64>()
+        .expect("numeric process custody-read ordinal");
+    let ordinal = PROCESS_CUSTODY_READ_MATCHES.fetch_add(1, Ordering::SeqCst) + 1;
+    if ordinal != target_ordinal {
+        return;
+    }
+    let observed = PathBuf::from(
+        std::env::var_os("DOCKET_TEST_CUSTODY_READ_OBSERVED")
+            .expect("process custody-read observed path"),
+    );
+    let resume = PathBuf::from(
+        std::env::var_os("DOCKET_TEST_CUSTODY_READ_RESUME")
+            .expect("process custody-read resume path"),
+    );
+    let mut signal = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&observed)
+        .expect("create process custody-read observed signal");
+    signal
+        .write_all(b"snapshot-pinned\n")
+        .expect("write process custody-read observed signal");
+    signal
+        .sync_all()
+        .expect("sync process custody-read observed signal");
+    drop(signal);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !resume.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out awaiting process custody-read resume signal"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-standing-request/v1";
 pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
@@ -1109,16 +1189,13 @@ pub fn accept_with_checkpoint_verifier(
         require_same_refusal_envelope(&existing, &envelope, &issuance)?;
         return Ok(DocketExecutionResponseWireV1::Refused(existing.refusal));
     }
-    if let Some(existing) = store.get(&issuance.issuance)? {
+    if let Some((existing, sealed_result)) = store.get_with_sealed_result(&issuance.issuance)? {
         require_same_envelope(&existing, &envelope, &issuance)?;
         // Starting-checkpoint correspondence is process-local evidence.  It
         // must be freshly re-established before an old custody record is
         // returned after restart/re-entry.
         verify_starting_checkpoint(&issuance, checkpoint_verifier, now_unix_ms()?)?;
-        if let Some(result) =
-            governed_repair::read_sealed_result(&store.connection, &issuance.issuance)?
-        {
-            require_result_custody(&result, &existing.custody)?;
+        if let Some(result) = sealed_result {
             return Ok(DocketExecutionResponseWireV1::GovernedRepairRequired {
                 custody: existing.custody,
                 result: Box::new(result),
@@ -1305,15 +1382,14 @@ pub fn observe_issuance_with_checkpoint_verifier(
 ) -> Result<DocketReconciliationWireV1, String> {
     require_digest(issuance, "issuance")?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
-    let Some(record) = store.get(issuance)? else {
+    let Some((record, sealed_result)) = store.get_with_sealed_result(issuance)? else {
         if let Some(refusal) = store.get_refusal(issuance)? {
             return Ok(DocketReconciliationWireV1::Refused(refusal.refusal));
         }
         return Ok(DocketReconciliationWireV1::NotAccepted);
     };
     verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
-    if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
-        require_result_custody(&result, &record.custody)?;
+    if let Some(result) = sealed_result {
         return Ok(DocketReconciliationWireV1::GovernedRepairRequired {
             custody: record.custody,
             result: Box::new(result),
@@ -1339,15 +1415,14 @@ pub fn reconcile_signed_round_with_checkpoint_verifier(
     let (envelope, request) =
         verify_signed_reconciliation_round_request(envelope_bytes, trust_bytes)?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
-    if let Some(mut existing) = store.read_reconciliation_round(&request.request)? {
+    if let Some((mut existing, record)) =
+        store.read_reconciliation_round_with_custody(&request.request)?
+    {
         if existing.signed_body_b64 != envelope.body_b64
             || existing.authentication != envelope.authentication
         {
             return Err("governed-reconciliation-request-replay-collision".to_owned());
         }
-        let record = store
-            .get(&request.issuance)?
-            .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
         if existing.authentication.issuer_principal != record.authentication.issuer_principal
             || existing.authentication.signer_key_id != record.authentication.signer_key_id
             || existing.authentication.signer_public_key != record.authentication.signer_public_key
@@ -1359,7 +1434,7 @@ pub fn reconcile_signed_round_with_checkpoint_verifier(
         // unresolved. If the independently running initial dispatch advanced
         // the exact attempt after this round claimed, resolve the round from
         // that durable monotone result without another executor call.
-        if store.resolve_claimed_round_from_durable_source(&existing, &record, now_unix_ms()?)? {
+        if store.resolve_claimed_round_from_durable_source(&existing, now_unix_ms()?)? {
             existing = store
                 .read_reconciliation_round(&request.request)?
                 .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
@@ -1455,7 +1530,7 @@ fn reconcile_with_checkpoint_verifier(
 ) -> Result<DocketReconciliationWireV1, String> {
     require_digest(issuance, "issuance")?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
-    let Some(mut record) = store.get(issuance)? else {
+    let Some((mut record, sealed_result)) = store.get_with_sealed_result(issuance)? else {
         if let Some(refusal) = store.get_refusal(issuance)? {
             if expected_attempt.is_some() {
                 return Err("governed-refusal-has-no-attempt".to_owned());
@@ -1467,13 +1542,12 @@ fn reconcile_with_checkpoint_verifier(
     if expected_attempt.is_some_and(|expected| expected != record.custody.attempt) {
         return Err("governed-reconciliation-attempt-substitution".to_owned());
     }
-    if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
+    if let Some(result) = sealed_result {
         // A sealed result is durable evidence, not inherited checkpoint
         // correspondence. Re-emission after process re-entry must freshly
         // verify the exact starting checkpoint before returning the result.
         // Refusal invokes no executor and leaves custody/result bytes intact.
         verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
-        require_result_custody(&result, &record.custody)?;
         return Ok(DocketReconciliationWireV1::GovernedRepairRequired {
             custody: record.custody,
             result: Box::new(result),
@@ -1523,16 +1597,16 @@ fn reconcile_with_checkpoint_verifier(
         )?,
         Err(_) => {}
     }
-    if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
-        require_result_custody(&result, &record.custody)?;
+    let (current, sealed_result) = store
+        .get_with_sealed_result(issuance)?
+        .ok_or_else(|| "governed-custody-disappeared".to_owned())?;
+    if let Some(result) = sealed_result {
         return Ok(DocketReconciliationWireV1::GovernedRepairRequired {
-            custody: record.custody,
+            custody: current.custody,
             result: Box::new(result),
         });
     }
-    record = store
-        .get(issuance)?
-        .ok_or_else(|| "governed-custody-disappeared".to_owned())?;
+    record = current;
     response_from_record(record)
 }
 
@@ -2002,8 +2076,11 @@ impl GovernedCustodyStoreV1 {
             .pragma_update(None, "busy_timeout", 5_000_u32)
             .map_err(|error| format!("governed-custody-busy-timeout:{error}"))?;
         let mut store = Self { connection };
-        let requests = store
+        let transaction = store
             .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-reconciliation-round-census-transaction:{error}"))?;
+        let requests = transaction
             .prepare("SELECT request FROM governed_reconciliation_round ORDER BY rowid")
             .map_err(|error| format!("governed-reconciliation-round-census:{error}"))?
             .query_map([], |row| row.get::<_, String>(0))
@@ -2011,19 +2088,20 @@ impl GovernedCustodyStoreV1 {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("governed-reconciliation-round-census:{error}"))?;
         for request in requests {
-            store
-                .read_reconciliation_round(&request)?
+            Self::read_reconciliation_round_at(&transaction, &request)?
                 .ok_or_else(|| "governed-reconciliation-round-census-gap".to_owned())?;
         }
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-round-census-commit:{error}"))?;
         Ok(store)
     }
 
-    fn read_reconciliation_round(
-        &mut self,
+    fn read_reconciliation_round_at(
+        connection: &Connection,
         request: &str,
     ) -> Result<Option<ReconciliationRoundRecordV1>, String> {
-        let row = self
-            .connection
+        let row = connection
             .query_row(
                 "SELECT round,issuance,attempt,caller_state_digest,idempotency,
                         predecessor_round,predecessor_reconciliation,source_cut,
@@ -2172,8 +2250,7 @@ impl GovernedCustodyStoreV1 {
         UnparsedPublicKey::new(&ED25519, public_key)
             .verify(&signed, &signature_bytes)
             .map_err(|_| "governed-stored-reconciliation-round-signature-invalid".to_owned())?;
-        let custody_record = self
-            .get(&reservation.issuance)?
+        let custody_record = Self::get_at(connection, &reservation.issuance)?
             .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
         if issuer_principal != custody_record.authentication.issuer_principal
             || signer_key_id != custody_record.authentication.signer_key_id
@@ -2182,7 +2259,7 @@ impl GovernedCustodyStoreV1 {
             return Err("governed-reconciliation-issuance-issuer-substitution".to_owned());
         }
         Self::validate_reconciliation_source_cut(
-            &self.connection,
+            connection,
             &custody_record,
             &reservation,
             &source_cut_jcs,
@@ -2203,6 +2280,42 @@ impl GovernedCustodyStoreV1 {
             result_reconciliation,
             result_evidence,
         }))
+    }
+
+    fn read_reconciliation_round(
+        &mut self,
+        request: &str,
+    ) -> Result<Option<ReconciliationRoundRecordV1>, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-reconciliation-read-transaction:{error}"))?;
+        let round = Self::read_reconciliation_round_at(&transaction, request)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-read-commit:{error}"))?;
+        Ok(round)
+    }
+
+    fn read_reconciliation_round_with_custody(
+        &mut self,
+        request: &str,
+    ) -> Result<Option<(ReconciliationRoundRecordV1, CustodyRecordV1)>, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-reconciliation-observation-transaction:{error}"))?;
+        let observation = Self::read_reconciliation_round_at(&transaction, request)?
+            .map(|round| -> Result<_, String> {
+                let custody = Self::get_at(&transaction, &round.reservation.issuance)?
+                    .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
+                Ok((round, custody))
+            })
+            .transpose()?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-observation-commit:{error}"))?;
+        Ok(observation)
     }
 
     fn current_reconciliation_terminal(
@@ -2510,7 +2623,6 @@ impl GovernedCustodyStoreV1 {
     fn resolve_claimed_round_from_durable_source(
         &mut self,
         round: &ReconciliationRoundRecordV1,
-        record: &CustodyRecordV1,
         completed_at: u64,
     ) -> Result<bool, String> {
         if round.state != "claimed" {
@@ -2542,12 +2654,14 @@ impl GovernedCustodyStoreV1 {
         if state != "claimed" {
             return Err("governed-reconciliation-local-completion-state".to_owned());
         }
+        let record = Self::get_at(&transaction, &round.reservation.issuance)?
+            .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
         let source: ReconciliationSourceCutWireV1 =
             strict_json(&source_cut_jcs, "stored-reconciliation-source-cut")?;
-        let current = Self::reconciliation_source_cut(&transaction, record)?;
+        let current = Self::reconciliation_source_cut(&transaction, &record)?;
         match Self::classify_reconciliation_source_advance(
             &transaction,
-            record,
+            &record,
             &round.reservation,
             &source,
             &current,
@@ -2825,17 +2939,16 @@ impl GovernedCustodyStoreV1 {
             .optional()
             .map_err(|error| format!("governed-reconciliation-claim-read:{error}"))?
         {
-            transaction
-                .commit()
-                .map_err(|error| format!("governed-reconciliation-claim-commit:{error}"))?;
-            let existing = self
-                .read_reconciliation_round(&existing_request)?
+            let existing = Self::read_reconciliation_round_at(&transaction, &existing_request)?
                 .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
             if existing.signed_body_b64 != envelope.body_b64
                 || existing.authentication != envelope.authentication
             {
                 return Err("governed-reconciliation-request-replay-collision".to_owned());
             }
+            transaction
+                .commit()
+                .map_err(|error| format!("governed-reconciliation-claim-commit:{error}"))?;
             return Ok(ReconciliationRoundClaimV1::Existing(Box::new(existing)));
         }
         if transaction
@@ -3363,8 +3476,8 @@ impl GovernedCustodyStoreV1 {
         Ok(response)
     }
 
-    fn reconciliation_round_response(
-        &mut self,
+    fn reconciliation_round_response_at(
+        connection: &Connection,
         round: ReconciliationRoundRecordV1,
     ) -> Result<DocketReconciliationRoundResponseWireV1, String> {
         let request = round.reservation.request.clone();
@@ -3378,8 +3491,7 @@ impl GovernedCustodyStoreV1 {
             let completion = round
                 .completion
                 .ok_or_else(|| "governed-reconciliation-completion-missing".to_owned())?;
-            let custody_record = self
-                .get(&round.reservation.issuance)?
+            let custody_record = Self::get_at(connection, &round.reservation.issuance)?
                 .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
             let response = match round.result_kind.as_deref() {
                 Some("indeterminate") => {
@@ -3389,8 +3501,7 @@ impl GovernedCustodyStoreV1 {
                     let evidence = round.result_evidence.ok_or_else(|| {
                         "governed-reconciliation-historical-evidence-missing".to_owned()
                     })?;
-                    let stored: Option<(String, String, String)> = self
-                        .connection
+                    let stored: Option<(String, String, String)> = connection
                         .query_row(
                             "SELECT result_identity,outcome,receipt FROM governed_executor_result
                              WHERE issuance=?1 AND attempt=?2 AND receipt=?3",
@@ -3446,7 +3557,7 @@ impl GovernedCustodyStoreV1 {
                 }
                 Some("governed_repair") => {
                     let sealed = governed_repair::read_sealed_result(
-                        &self.connection,
+                        connection,
                         &round.reservation.issuance,
                     )?
                     .ok_or_else(|| "governed-repair-checkpoint-disappeared".to_owned())?;
@@ -3477,6 +3588,24 @@ impl GovernedCustodyStoreV1 {
             round: round_identity,
             state: result,
         })
+    }
+
+    fn reconciliation_round_response(
+        &mut self,
+        observed: ReconciliationRoundRecordV1,
+    ) -> Result<DocketReconciliationRoundResponseWireV1, String> {
+        let request = observed.reservation.request;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-reconciliation-response-transaction:{error}"))?;
+        let current = Self::read_reconciliation_round_at(&transaction, &request)?
+            .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+        let response = Self::reconciliation_round_response_at(&transaction, current)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-response-commit:{error}"))?;
+        Ok(response)
     }
 
     fn refuse(
@@ -3673,9 +3802,8 @@ impl GovernedCustodyStoreV1 {
             .map_err(|error| format!("governed-custody-commit:{error}"))
     }
 
-    fn get(&mut self, issuance: &str) -> Result<Option<CustodyRecordV1>, String> {
-        let record = self
-            .connection
+    fn get_at(connection: &Connection, issuance: &str) -> Result<Option<CustodyRecordV1>, String> {
+        let record = connection
             .query_row(
                 "SELECT signed_body_b64,issuer_principal,signer_key_id,signer_public_key,signature,
                         campaign,occurrence,program,proposal,work_schema,work,subject,scope,
@@ -3801,11 +3929,13 @@ impl GovernedCustodyStoreV1 {
             )
             .optional()
             .map_err(|error| format!("governed-custody-read:{error}"))?;
+        #[cfg(test)]
+        pause_after_custody_base_row(issuance);
         record
             .map(|record| {
                 validate_stored_record(&record)?;
                 governed_repair::validate_ordinary_executor_result(
-                    &self.connection,
+                    connection,
                     &record.issuance.issuance,
                     &record.custody.attempt,
                     &record.status,
@@ -3813,7 +3943,7 @@ impl GovernedCustodyStoreV1 {
                 )?;
                 if let Some(settlement) = &record.settlement {
                     let latest = governed_repair::latest_cumulative_effect_journal_identity(
-                        &self.connection,
+                        connection,
                         &record.issuance.issuance,
                         &record.custody.attempt,
                         &record.issuance.effect_scope,
@@ -3822,8 +3952,7 @@ impl GovernedCustodyStoreV1 {
                     if latest != settlement.cumulative_effect_journal_identity {
                         return Err("governed-stored-settlement-journal-substitution".to_owned());
                     }
-                    let terminal: Option<(String, String)> = self
-                        .connection
+                    let terminal: Option<(String, String)> = connection
                         .query_row(
                             "SELECT outcome,receipt FROM governed_executor_result
                              WHERE issuance=?1 AND attempt=?2
@@ -3846,6 +3975,44 @@ impl GovernedCustodyStoreV1 {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Materialize one complete custody observation from a single deferred
+    /// SQLite snapshot. The transaction is closed before any caller may cross
+    /// a checkpoint-verifier or executor boundary.
+    fn get(&mut self, issuance: &str) -> Result<Option<CustodyRecordV1>, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-custody-read-transaction:{error}"))?;
+        let record = Self::get_at(&transaction, issuance)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-custody-read-commit:{error}"))?;
+        Ok(record)
+    }
+
+    fn get_with_sealed_result(
+        &mut self,
+        issuance: &str,
+    ) -> Result<Option<(CustodyRecordV1, Option<StoreSealedGovernedRepairResultV1>)>, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|error| format!("governed-custody-result-transaction:{error}"))?;
+        let observation = Self::get_at(&transaction, issuance)?
+            .map(|record| -> Result<_, String> {
+                let result = governed_repair::read_sealed_result(&transaction, issuance)?;
+                if let Some(result) = &result {
+                    require_result_custody(result, &record.custody)?;
+                }
+                Ok((record, result))
+            })
+            .transpose()?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-custody-result-commit:{error}"))?;
+        Ok(observation)
     }
 
     fn record_executor_outcome(
@@ -4073,7 +4240,12 @@ impl GovernedCustodyStoreV1 {
         );
         let tx = self
             .connection
-            .transaction()
+            // Claim the writer slot before the journal reads. A deferred
+            // transaction can pin a WAL snapshot, observe a concurrent
+            // migration/open commit, and then fail its first write with
+            // SQLITE_BUSY_SNAPSHOT even though the configured busy timeout
+            // is intact.
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("governed-indeterminate-transaction:{error}"))?;
         let exact_replay = governed_repair::append_ordinary_executor_result(
             &tx,
@@ -5113,6 +5285,249 @@ mod tests {
         include_bytes!("../../../conformance/governed-repair-r2/wire-vectors.v1.json");
     const R5_RECONCILIATION_ROUNDS: &[u8] =
         include_bytes!("../../../conformance/governed-repair-r2/reconciliation-rounds.v1.json");
+
+    #[test]
+    fn custody_classification_is_one_sqlite_snapshot_during_terminal_commit() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let observed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let database = fixture.database.clone();
+        let issuance = fixture.issuance.issuance.clone();
+        let reader_start = start.clone();
+        let reader = std::thread::spawn(move || {
+            reader_start.wait();
+            let mut store = GovernedCustodyStoreV1::open(&database).unwrap();
+            store.get(&issuance)
+        });
+        *CUSTODY_READ_PAUSE.lock().unwrap() = Some(CustodyReadPauseV1 {
+            issuance: fixture.issuance.issuance.clone(),
+            reader: reader.thread().id(),
+            observed: observed.clone(),
+            resume: resume.clone(),
+        });
+        start.wait();
+        observed.wait();
+
+        let terminal = ExecutorOutcomeWireV1 {
+            attempt: fixture.custody.attempt.clone(),
+            marker: fixture.custody.executor_marker.clone(),
+            receipt: digest("coherent-snapshot-terminal"),
+            outcome: ExecutorOutcomeClassWireV1::Success,
+            effect_journal: Vec::new(),
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        };
+        let mut winner = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        winner
+            .record_executor_outcome(&fixture.issuance.issuance, &fixture.custody, terminal, 100)
+            .unwrap();
+        resume.wait();
+
+        let old_cut = reader.join().unwrap().unwrap().unwrap();
+        *CUSTODY_READ_PAUSE.lock().unwrap() = None;
+        assert_eq!(old_cut.status, "indeterminate");
+        assert!(old_cut.settlement.is_none());
+
+        let mut reopened = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let new_cut = reopened.get(&fixture.issuance.issuance).unwrap().unwrap();
+        assert_eq!(new_cut.status, "settled");
+        assert!(new_cut.settlement.is_some());
+    }
+
+    #[test]
+    fn eight_processes_pin_the_loser_snapshot_before_terminal_commit() {
+        struct ReleaseSignals(Vec<PathBuf>);
+
+        impl Drop for ReleaseSignals {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::write(path, b"release\n");
+                }
+            }
+        }
+
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        std::fs::set_permissions(&fixture.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let initial = ExecutorOutcomeWireV1 {
+            attempt: fixture.custody.attempt.clone(),
+            marker: fixture.custody.executor_marker.clone(),
+            receipt: digest("process-snapshot-initial"),
+            outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+            effect_journal: Vec::new(),
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        };
+        let terminal = ExecutorOutcomeWireV1 {
+            attempt: fixture.custody.attempt.clone(),
+            marker: fixture.custody.executor_marker.clone(),
+            receipt: digest("process-snapshot-terminal"),
+            outcome: ExecutorOutcomeClassWireV1::Success,
+            effect_journal: Vec::new(),
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        };
+        write_blocking_mixed_executor(&fixture.executor_program, &initial, &terminal);
+        std::fs::write(
+            fixture.executor_program.with_extension("execute-release"),
+            b"release\n",
+        )
+        .unwrap();
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+
+        let (round_envelope, _) = signed_round(&fixture, "process-snapshot-round", None);
+        let envelope_path = fixture.root.join("process-round-envelope.json");
+        let trust_path = fixture.root.join("process-round-trust.json");
+        std::fs::write(&envelope_path, round_envelope).unwrap();
+        std::fs::write(&trust_path, &fixture.trust).unwrap();
+        let reconcile_release = fixture.executor_program.with_extension("reconcile-release");
+        let snapshot_resume = fixture.root.join("process-snapshot-resume");
+        let _release_on_failure =
+            ReleaseSignals(vec![reconcile_release.clone(), snapshot_resume.clone()]);
+
+        let winner_output = fixture.root.join("process-winner-response.json");
+        let winner = spawn_reconciliation_test_process(
+            &fixture,
+            &envelope_path,
+            &trust_path,
+            &winner_output,
+            None,
+        );
+        wait_for_test_path(&fixture.executor_program.with_extension("reconcile-started"));
+
+        let mut losers = Vec::new();
+        for index in 0..7 {
+            let observed = fixture
+                .root
+                .join(format!("process-loser-{index}-snapshot-pinned"));
+            let output = fixture
+                .root
+                .join(format!("process-loser-{index}-response.json"));
+            let child = spawn_reconciliation_test_process(
+                &fixture,
+                &envelope_path,
+                &trust_path,
+                &output,
+                Some((&observed, &snapshot_resume)),
+            );
+            losers.push((child, observed, output));
+        }
+        for (_, observed, _) in &losers {
+            wait_for_test_path(observed);
+            assert_eq!(std::fs::read(observed).unwrap(), b"snapshot-pinned\n");
+        }
+
+        // Every loser now holds a deferred snapshot containing the claimed,
+        // nonterminal round. Commit the winner before any loser continues.
+        std::fs::write(&reconcile_release, b"release\n").unwrap();
+        assert_reconciliation_test_process(winner, &winner_output);
+        std::fs::write(&snapshot_resume, b"release\n").unwrap();
+        for (loser, _, output) in losers {
+            assert_reconciliation_test_process(loser, &output);
+        }
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconcile-calls")).unwrap(),
+            b"x",
+            "one exact round may cross the external reconciliation boundary once"
+        );
+    }
+
+    #[test]
+    #[ignore = "process helper invoked only by the deterministic snapshot parent"]
+    fn deterministic_reconciliation_process_child() {
+        assert_eq!(
+            std::env::var("DOCKET_TEST_RECONCILIATION_CHILD").as_deref(),
+            Ok("v1"),
+            "this ignored helper is not a standalone fixture"
+        );
+        let required_path = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("missing {name}")))
+        };
+        let database = required_path("DOCKET_TEST_RECONCILIATION_DATABASE");
+        let envelope = std::fs::read(required_path("DOCKET_TEST_RECONCILIATION_ENVELOPE")).unwrap();
+        let trust = std::fs::read(required_path("DOCKET_TEST_RECONCILIATION_TRUST")).unwrap();
+        let executor = required_path("DOCKET_TEST_RECONCILIATION_EXECUTOR");
+        let config = required_path("DOCKET_TEST_RECONCILIATION_CONFIG");
+        let output = required_path("DOCKET_TEST_RECONCILIATION_OUTPUT");
+        let response = reconcile_signed_round_with_checkpoint_verifier(
+            &database, &envelope, &trust, &executor, &config, None,
+        )
+        .unwrap();
+        std::fs::write(output, serde_jcs::to_vec(&response).unwrap()).unwrap();
+    }
+
+    fn spawn_reconciliation_test_process(
+        fixture: &Fixture,
+        envelope: &Path,
+        trust: &Path,
+        output: &Path,
+        pause: Option<(&Path, &Path)>,
+    ) -> std::process::Child {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("governed_loop::tests::deterministic_reconciliation_process_child")
+            .args(["--exact", "--ignored", "--test-threads=1"])
+            .env("DOCKET_TEST_RECONCILIATION_CHILD", "v1")
+            .env("DOCKET_TEST_RECONCILIATION_DATABASE", &fixture.database)
+            .env("DOCKET_TEST_RECONCILIATION_ENVELOPE", envelope)
+            .env("DOCKET_TEST_RECONCILIATION_TRUST", trust)
+            .env(
+                "DOCKET_TEST_RECONCILIATION_EXECUTOR",
+                &fixture.executor_program,
+            )
+            .env(
+                "DOCKET_TEST_RECONCILIATION_CONFIG",
+                fixture.root.join("executor-config"),
+            )
+            .env("DOCKET_TEST_RECONCILIATION_OUTPUT", output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some((observed, resume)) = pause {
+            command
+                .env(
+                    "DOCKET_TEST_CUSTODY_READ_ISSUANCE",
+                    &fixture.issuance.issuance,
+                )
+                // The first matching base-row read is Store-open's durable
+                // round census. The second is the public duplicate-delivery
+                // classification whose old/new cut this test controls.
+                .env("DOCKET_TEST_CUSTODY_READ_ORDINAL", "2")
+                .env("DOCKET_TEST_CUSTODY_READ_OBSERVED", observed)
+                .env("DOCKET_TEST_CUSTODY_READ_RESUME", resume);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn assert_reconciliation_test_process(child: std::process::Child, response: &Path) {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "reconciliation process failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(response).unwrap()).unwrap();
+        assert_eq!(response["status"], "completed", "{response}");
+    }
 
     fn raw_sha256(bytes: &[u8]) -> String {
         format!("sha256:{}", lower_hex(&Sha256::digest(bytes)))
@@ -7335,7 +7750,7 @@ mod tests {
         assert_eq!(schema, (0, 1));
         connection
             .execute_batch(
-                "DROP TRIGGER governed_executor_result_immutable_update;
+                "DROP TRIGGER IF EXISTS governed_executor_result_immutable_update;
                  UPDATE governed_executor_result SET effect_journal_entries='';",
             )
             .unwrap();

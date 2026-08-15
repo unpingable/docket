@@ -56,6 +56,12 @@ pub enum StoreError {
     /// A persisted record failed to decode: a malformed column is a typed read
     /// error, never a panic and never a defaulted value.
     Corrupt(String),
+    /// The complete migration cut could not acquire SQLite's writer lock
+    /// within Docket's declared bounded contention window. No schema decision
+    /// or DDL has occurred on this connection and a later clean retry is safe.
+    MigrationContention {
+        timeout_ms: u32,
+    },
     Backend(String),
 }
 

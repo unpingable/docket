@@ -32,7 +32,8 @@ use gwr_runtime::ports::store::{
     CampaignBurn, ProjectedAttempt, RelianceRefusalRecord, RelianceSubject, Store, StoreError,
     TimelineEntry,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::ffi::ErrorCode;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::Path;
 
 const MIGRATION: &str = include_str!("../../migrations/0001_init.sql");
@@ -51,6 +52,33 @@ const MIGRATION_0011: &str =
 const MIGRATION_0012: &str =
     include_str!("../../migrations/0012_governed_reconciliation_round.sql");
 
+const RESTORE_EXECUTOR_RESULT_IMMUTABILITY: &str =
+    "CREATE TRIGGER governed_executor_result_immutable_update
+     BEFORE UPDATE ON governed_executor_result BEGIN
+       SELECT RAISE(ABORT, 'governed executor result is immutable');
+     END;";
+
+const RESTORE_SETTLEMENT_IMMUTABILITY: &str =
+    "CREATE TRIGGER governed_loop_settlement_immutable_update
+     BEFORE UPDATE OF settlement,receipt,outcome,settled_at,
+                      settlement_cumulative_effect_journal_identity,
+                      legacy_r1_settlement_identity,legacy_r1_settlement_jcs
+     ON governed_loop_attempt
+     WHEN OLD.status='settled' AND (
+       NEW.settlement IS NOT OLD.settlement
+       OR NEW.receipt IS NOT OLD.receipt
+       OR NEW.outcome IS NOT OLD.outcome
+       OR NEW.settled_at IS NOT OLD.settled_at
+       OR NEW.settlement_cumulative_effect_journal_identity
+          IS NOT OLD.settlement_cumulative_effect_journal_identity
+       OR NEW.legacy_r1_settlement_identity
+          IS NOT OLD.legacy_r1_settlement_identity
+       OR NEW.legacy_r1_settlement_jcs
+          IS NOT OLD.legacy_r1_settlement_jcs
+     ) BEGIN
+       SELECT RAISE(ABORT, 'governed settlement is immutable');
+     END;";
+
 pub struct SqliteStore {
     conn: Connection,
 }
@@ -65,6 +93,25 @@ fn backend(e: rusqlite::Error) -> StoreError {
         }
     }
     StoreError::Backend(e.to_string())
+}
+
+fn migration_backend(error: rusqlite::Error) -> StoreError {
+    if matches!(
+        error,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    ) {
+        StoreError::MigrationContention {
+            timeout_ms: SQLITE_BUSY_TIMEOUT_MS,
+        }
+    } else {
+        backend(error)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -154,21 +201,21 @@ pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let conn = Connection::open(path).map_err(backend)?;
+        let mut conn = Connection::open(path).map_err(backend)?;
+        conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
+            .map_err(backend)?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(backend)?;
-        conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
-            .map_err(backend)?;
-        Self::migrate(&conn)?;
+        Self::migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let conn = Connection::open_in_memory().map_err(backend)?;
+        let mut conn = Connection::open_in_memory().map_err(backend)?;
         conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
             .map_err(backend)?;
-        Self::migrate(&conn)?;
+        Self::migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -183,32 +230,64 @@ impl SqliteStore {
     /// reliance-refusal subject columns and is applied only when a database
     /// predates them, so a pre-0002 store (including the pilot's) opens
     /// unchanged except for the added nullable columns.
-    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(migration_backend)?;
+        Self::migrate_locked(&transaction)?;
+        transaction.commit().map_err(migration_backend)
+    }
+
+    /// Complete migration census and application under the caller's one
+    /// outer `BEGIN IMMEDIATE`. Every conditional DDL decision is therefore
+    /// made after the migration writer lock is held.
+    fn migrate_locked(conn: &Connection) -> Result<(), StoreError> {
         conn.execute_batch(MIGRATION).map_err(backend)?;
-        let has_subject: i64 = conn
+        let subject_columns: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('reliance_refusal')
-                 WHERE name='observation'",
+                 WHERE name IN ('observation','consumer','claim')",
                 [],
                 |r| r.get(0),
             )
             .map_err(backend)?;
-        if has_subject == 0 {
-            conn.execute_batch(MIGRATION_0002).map_err(backend)?;
+        match subject_columns {
+            0 => conn.execute_batch(MIGRATION_0002).map_err(backend)?,
+            3 => {}
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "partial reliance-refusal subject migration".to_owned(),
+                ));
+            }
         }
         // 0003 adds the upstream-authorization issuance table and the grant's
         // authorization source. Pre-0003 grants keep a NULL source, which reads
         // as "unrecorded" — never as either authorization source.
-        let has_source: i64 = conn
+        let standing_source_columns: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('standing_grant')
-                 WHERE name='source'",
+                 WHERE name IN ('source','issuance_id')",
                 [],
                 |r| r.get(0),
             )
             .map_err(backend)?;
-        if has_source == 0 {
-            conn.execute_batch(MIGRATION_0003).map_err(backend)?;
+        let authorization_objects: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE (type='table' AND name='authz_issuance')
+                    OR (type='index' AND name='standing_grant_issuance_unique')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        match (standing_source_columns, authorization_objects) {
+            (0, 0) => conn.execute_batch(MIGRATION_0003).map_err(backend)?,
+            (2, 2) => {}
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "partial upstream-authorization migration".to_owned(),
+                ));
+            }
         }
         // 0004 introduces Docket's explicit logical repository registry.
         // It intentionally does not backfill from stored paths: a path is a
@@ -265,57 +344,114 @@ impl SqliteStore {
         // executor observations. Historical rows are deterministically
         // backfilled from their existing append order; no authority is
         // inferred and the immutable trigger is restored before open returns.
-        let has_cumulative_journal: i64 = conn
+        let cumulative_journal_columns: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('governed_executor_result')
-                 WHERE name='cumulative_effect_journal_digest'",
+                 WHERE name IN (
+                    'cumulative_effect_journal_digest',
+                    'cumulative_effect_journal_entries'
+                 )",
                 [],
                 |row| row.get(0),
             )
             .map_err(backend)?;
+        let narrowed_checkpoint_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_repair_checkpoint')
+                 WHERE name IN (
+                    'no_unauthorized_effect_reported',
+                    'reported_authorized_effects_occurred'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let overstrong_checkpoint_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_repair_checkpoint')
+                 WHERE name IN (
+                    'unauthorized_effect_not_performed',
+                    'authorized_effects_occurred'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let cumulative_required_trigger: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger'
+                   AND name='governed_executor_result_cumulative_required_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let executor_immutable_trigger: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger'
+                   AND name='governed_executor_result_immutable_update'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(backend)?;
+        let has_cumulative_journal = match (
+            cumulative_journal_columns,
+            narrowed_checkpoint_columns,
+            overstrong_checkpoint_columns,
+            cumulative_required_trigger,
+            executor_immutable_trigger,
+        ) {
+            (0, 0, 2, 0, 1) => false,
+            (2, 2, 0, 1, 1) => true,
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "partial governed cumulative-journal migration".to_owned(),
+                ));
+            }
+        };
         // 0011 closes the ordinary-settlement identity over the exact
         // cumulative executor journal.  Run 0010 and 0011 in one additive
         // transaction when opening a rejected-R1 development store so journal
         // backfill necessarily precedes settlement identity recomputation.
         // The independent checks also safely complete an interrupted R2
         // development migration that already has 0010 but not 0011.
-        let has_settlement_journal: i64 = conn
+        let settlement_journal_columns: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
-                 WHERE name='settlement_cumulative_effect_journal_identity'",
+                 WHERE name IN (
+                    'settlement_cumulative_effect_journal_identity',
+                    'legacy_r1_settlement_identity',
+                    'legacy_r1_settlement_jcs'
+                 )",
                 [],
                 |row| row.get(0),
             )
             .map_err(backend)?;
-        let has_legacy_settlement: i64 = conn
+        let settlement_journal_triggers: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
-                 WHERE name='legacy_r1_settlement_identity'",
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type='trigger' AND name IN (
+                    'governed_loop_settlement_journal_required_insert',
+                    'governed_loop_settlement_journal_required_update',
+                    'governed_loop_settlement_immutable_update'
+                 )",
                 [],
                 |row| row.get(0),
             )
             .map_err(backend)?;
-        let has_legacy_settlement_jcs: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
-                 WHERE name='legacy_r1_settlement_jcs'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(backend)?;
-        if has_settlement_journal != has_legacy_settlement
-            || has_settlement_journal != has_legacy_settlement_jcs
+        let has_settlement_journal = match (settlement_journal_columns, settlement_journal_triggers)
         {
-            return Err(StoreError::Corrupt(
-                "partial governed settlement journal migration".to_owned(),
-            ));
-        }
-        if has_cumulative_journal == 0 || has_settlement_journal == 0 {
-            migrate_governed_repair_r2(
-                conn,
-                has_cumulative_journal != 0,
-                has_settlement_journal != 0,
-            )?;
+            (0, 0) => false,
+            (3, 3) => true,
+            _ => {
+                return Err(StoreError::Corrupt(
+                    "partial governed settlement journal migration".to_owned(),
+                ));
+            }
+        };
+        if !has_cumulative_journal || !has_settlement_journal {
+            migrate_governed_repair_r2(conn, has_cumulative_journal, has_settlement_journal)?;
         }
         // 0012 introduces explicit authenticated reconciliation rounds.  It
         // intentionally creates no rows for R3 attempts: historical
@@ -324,14 +460,7 @@ impl SqliteStore {
         // missing custody state.
         let round_objects = governed_reconciliation_schema_objects(conn)?;
         if round_objects.is_empty() {
-            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
-            let result = conn.execute_batch(MIGRATION_0012).map_err(backend);
-            if result.is_ok() {
-                conn.execute_batch("COMMIT").map_err(backend)?;
-            } else {
-                let _ = conn.execute_batch("ROLLBACK");
-                result?;
-            }
+            conn.execute_batch(MIGRATION_0012).map_err(backend)?;
         }
         require_exact_governed_reconciliation_schema(conn)?;
         Ok(())
@@ -347,55 +476,23 @@ fn migrate_governed_repair_r2(
     has_cumulative_journal: bool,
     has_settlement_journal: bool,
 ) -> Result<(), StoreError> {
-    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
-    let result = (|| {
-        if !has_cumulative_journal {
-            conn.execute_batch(MIGRATION_0010).map_err(backend)?;
-            crate::governed_repair::backfill_cumulative_executor_journals(conn)
-                .map_err(StoreError::Corrupt)?;
-        }
-        if !has_settlement_journal {
-            conn.execute_batch(MIGRATION_0011).map_err(backend)?;
-            crate::governed_loop::backfill_settlement_journal_identities(conn)
-                .map_err(StoreError::Corrupt)?;
-            conn.execute_batch(
-                "CREATE TRIGGER governed_loop_settlement_immutable_update
-                 BEFORE UPDATE OF settlement,receipt,outcome,settled_at,
-                                  settlement_cumulative_effect_journal_identity,
-                                  legacy_r1_settlement_identity,legacy_r1_settlement_jcs
-                 ON governed_loop_attempt
-                 WHEN OLD.status='settled' AND (
-                   NEW.settlement IS NOT OLD.settlement
-                   OR NEW.receipt IS NOT OLD.receipt
-                   OR NEW.outcome IS NOT OLD.outcome
-                   OR NEW.settled_at IS NOT OLD.settled_at
-                   OR NEW.settlement_cumulative_effect_journal_identity
-                      IS NOT OLD.settlement_cumulative_effect_journal_identity
-                   OR NEW.legacy_r1_settlement_identity
-                      IS NOT OLD.legacy_r1_settlement_identity
-                   OR NEW.legacy_r1_settlement_jcs
-                      IS NOT OLD.legacy_r1_settlement_jcs
-                 ) BEGIN
-                   SELECT RAISE(ABORT, 'governed settlement is immutable');
-                 END;",
-            )
-            .map_err(backend)?;
-        }
-        if !has_cumulative_journal {
-            conn.execute_batch(
-                "CREATE TRIGGER governed_executor_result_immutable_update
-                 BEFORE UPDATE ON governed_executor_result BEGIN
-                   SELECT RAISE(ABORT, 'governed executor result is immutable');
-                 END;",
-            )
-            .map_err(backend)?;
-        }
-        conn.execute_batch("COMMIT").map_err(backend)
-    })();
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
+    if !has_cumulative_journal {
+        conn.execute_batch(MIGRATION_0010).map_err(backend)?;
+        crate::governed_repair::backfill_cumulative_executor_journals(conn)
+            .map_err(StoreError::Corrupt)?;
     }
-    result
+    if !has_settlement_journal {
+        conn.execute_batch(MIGRATION_0011).map_err(backend)?;
+        crate::governed_loop::backfill_settlement_journal_identities(conn)
+            .map_err(StoreError::Corrupt)?;
+        conn.execute_batch(RESTORE_SETTLEMENT_IMMUTABILITY)
+            .map_err(backend)?;
+    }
+    if !has_cumulative_journal {
+        conn.execute_batch(RESTORE_EXECUTOR_RESULT_IMMUTABILITY)
+            .map_err(backend)?;
+    }
+    Ok(())
 }
 
 /// Serialize the projection columns for an attempt state.
@@ -3231,6 +3328,10 @@ impl Store for SqliteStore {
 #[cfg(test)]
 mod reconciliation_schema_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
     const DROP_RECONCILIATION_SCHEMA: &str = "DROP TRIGGER governed_reconciliation_round_no_delete;
          DROP TRIGGER governed_reconciliation_round_monotone;
@@ -3241,7 +3342,7 @@ mod reconciliation_schema_tests {
         SqliteStore::open_in_memory().expect("exact schema").conn
     }
 
-    fn assert_schema_refused(connection: &Connection) {
+    fn assert_schema_refused(connection: &mut Connection) {
         let error = SqliteStore::migrate(connection).expect_err("weakened schema must refuse");
         assert!(
             matches!(error, StoreError::Corrupt(ref message)
@@ -3252,14 +3353,14 @@ mod reconciliation_schema_tests {
 
     #[test]
     fn reconciliation_schema_exact_census_reopens() {
-        let connection = exact_connection();
-        SqliteStore::migrate(&connection).expect("exact schema reopens");
+        let mut connection = exact_connection();
+        SqliteStore::migrate(&mut connection).expect("exact schema reopens");
         require_exact_governed_reconciliation_schema(&connection).expect("exact census");
     }
 
     #[test]
     fn reconciliation_schema_complete_but_weakened_table_refuses() {
-        let connection = exact_connection();
+        let mut connection = exact_connection();
         connection
             .execute_batch(DROP_RECONCILIATION_SCHEMA)
             .expect("drop exact schema");
@@ -3268,7 +3369,7 @@ mod reconciliation_schema_tests {
         connection
             .execute_batch(&weakened)
             .expect("install complete weakened object set");
-        assert_schema_refused(&connection);
+        assert_schema_refused(&mut connection);
     }
 
     #[test]
@@ -3278,7 +3379,7 @@ mod reconciliation_schema_tests {
             "governed_reconciliation_round_monotone",
             "governed_reconciliation_round_no_delete",
         ] {
-            let connection = exact_connection();
+            let mut connection = exact_connection();
             connection
                 .execute_batch(&format!(
                     "DROP TRIGGER {trigger};
@@ -3287,9 +3388,9 @@ mod reconciliation_schema_tests {
                      BEGIN SELECT 1; END;"
                 ))
                 .expect("install inert trigger");
-            assert_schema_refused(&connection);
+            assert_schema_refused(&mut connection);
 
-            let connection = exact_connection();
+            let mut connection = exact_connection();
             connection
                 .execute_batch(&format!(
                     "DROP TRIGGER {trigger};
@@ -3298,7 +3399,215 @@ mod reconciliation_schema_tests {
                      BEGIN SELECT 1; END;"
                 ))
                 .expect("install rebound trigger");
-            assert_schema_refused(&connection);
+            assert_schema_refused(&mut connection);
+        }
+    }
+
+    #[test]
+    fn every_supported_schema_cut_migrates_under_eight_concurrent_openers() {
+        for cut in 0..=12 {
+            let database = temporary_database(&format!("cut-{cut}"));
+            if cut != 0 {
+                let connection = Connection::open(&database).unwrap();
+                install_schema_cut(&connection, cut);
+            }
+            let barrier = Arc::new(Barrier::new(9));
+            let openers = (0..8)
+                .map(|_| {
+                    let database = database.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SqliteStore::open(&database)
+                    })
+                })
+                .collect::<Vec<_>>();
+            barrier.wait();
+            for opener in openers {
+                drop(opener.join().unwrap().unwrap());
+            }
+            let reopened = SqliteStore::open(&database).unwrap();
+            require_exact_governed_reconciliation_schema(&reopened.conn).unwrap();
+            assert_eq!(
+                reopened
+                    .conn
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok",
+                "schema cut {cut}"
+            );
+            drop(reopened);
+            remove_database(&database);
+        }
+    }
+
+    #[test]
+    fn rolled_back_migration_winner_allows_one_clean_retry() {
+        let database = temporary_database("rollback-winner");
+        let winner = Connection::open(&database).unwrap();
+        winner.execute_batch(MIGRATION).unwrap();
+        winner.execute_batch("BEGIN IMMEDIATE").unwrap();
+        winner
+            .execute_batch("ALTER TABLE reliance_refusal ADD COLUMN observation TEXT;")
+            .unwrap();
+        let path = database.clone();
+        let loser = std::thread::spawn(move || SqliteStore::open(&path));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        winner.execute_batch("ROLLBACK").unwrap();
+        drop(loser.join().unwrap().unwrap());
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('reliance_refusal')
+                     WHERE name IN ('observation','consumer','claim')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(connection);
+        remove_database(&database);
+    }
+
+    #[test]
+    fn malformed_legacy_cut_refuses_identically_under_contention() {
+        let database = temporary_database("malformed-legacy");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(MIGRATION).unwrap();
+        connection
+            .execute_batch("ALTER TABLE reliance_refusal ADD COLUMN observation TEXT;")
+            .unwrap();
+        drop(connection);
+        let barrier = Arc::new(Barrier::new(3));
+        let openers = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteStore::open(&database).err().expect("malformed cut")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for opener in openers {
+            assert_eq!(
+                opener.join().unwrap(),
+                StoreError::Corrupt("partial reliance-refusal subject migration".to_owned())
+            );
+        }
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('reliance_refusal')
+                     WHERE name IN ('observation','consumer','claim')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "refusal must not opportunistically complete an ambiguous cut"
+        );
+        drop(connection);
+        remove_database(&database);
+    }
+
+    #[test]
+    fn migration_busy_timeout_is_typed_and_retryable() {
+        let database = temporary_database("busy-timeout");
+        drop(SqliteStore::open(&database).unwrap());
+        let holder = Connection::open(&database).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let path = database.clone();
+        let started = std::time::Instant::now();
+        let contender = std::thread::spawn(move || {
+            SqliteStore::open(&path)
+                .err()
+                .expect("bounded migration contention")
+        });
+        let error = contender.join().unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(4_500));
+        assert_eq!(
+            error,
+            StoreError::MigrationContention {
+                timeout_ms: SQLITE_BUSY_TIMEOUT_MS
+            }
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        drop(SqliteStore::open(&database).unwrap());
+        remove_database(&database);
+    }
+
+    fn temporary_database(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "docket-r5-migration-{label}-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn remove_database(database: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut path = database.as_os_str().to_owned();
+            path.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(path));
+        }
+    }
+
+    fn install_schema_cut(connection: &Connection, cut: usize) {
+        connection.execute_batch(MIGRATION).unwrap();
+        if cut >= 2 {
+            connection.execute_batch(MIGRATION_0002).unwrap();
+        }
+        if cut >= 3 {
+            connection.execute_batch(MIGRATION_0003).unwrap();
+        }
+        if cut >= 4 {
+            connection
+                .execute_batch("ALTER TABLE work_request ADD COLUMN repository_id TEXT;")
+                .unwrap();
+            connection.execute_batch(MIGRATION_0004).unwrap();
+        }
+        if cut >= 5 {
+            connection.execute_batch(MIGRATION_0005).unwrap();
+        }
+        if cut >= 6 {
+            connection.execute_batch(MIGRATION_0006).unwrap();
+        }
+        if cut >= 7 {
+            connection.execute_batch(MIGRATION_0007).unwrap();
+        }
+        if cut >= 8 {
+            connection.execute_batch(MIGRATION_0008).unwrap();
+        }
+        if cut >= 9 {
+            connection.execute_batch(MIGRATION_0009).unwrap();
+        }
+        if cut >= 10 {
+            connection.execute_batch(MIGRATION_0010).unwrap();
+            crate::governed_repair::backfill_cumulative_executor_journals(connection).unwrap();
+            connection
+                .execute_batch(RESTORE_EXECUTOR_RESULT_IMMUTABILITY)
+                .unwrap();
+        }
+        if cut >= 11 {
+            connection.execute_batch(MIGRATION_0011).unwrap();
+            crate::governed_loop::backfill_settlement_journal_identities(connection).unwrap();
+            connection
+                .execute_batch(RESTORE_SETTLEMENT_IMMUTABILITY)
+                .unwrap();
+        }
+        if cut >= 12 {
+            connection.execute_batch(MIGRATION_0012).unwrap();
         }
     }
 }

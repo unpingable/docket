@@ -285,6 +285,7 @@ fn cargo_targets_exports_and_intake_versions_match_the_closed_custody_surface() 
         "test:read_surface",
         "test:ref_custody_boundary",
         "test:reservation",
+        "test:store_migration_concurrency",
         "test:token_canonicality",
         "test:vertical_slice",
     ]

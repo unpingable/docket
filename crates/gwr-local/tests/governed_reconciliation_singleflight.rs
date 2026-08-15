@@ -32,6 +32,7 @@ struct Fixture {
     standing_program: PathBuf,
     executor: PathBuf,
     config: PathBuf,
+    issuance: String,
     issuance_envelope: Vec<u8>,
     envelope: Vec<u8>,
     effectd_store: Option<PathBuf>,
@@ -56,6 +57,113 @@ fn two_processes_make_one_physical_reconciliation_call() {
 #[test]
 fn eight_processes_make_one_physical_reconciliation_call() {
     concurrent_duplicate_round(8);
+}
+
+#[test]
+fn eight_processes_cross_terminal_commit_without_false_substitution() {
+    // The unit-level snapshot barrier proves the exact old/new cut. This
+    // public-process specimen repeatedly releases the physical-call winner
+    // while seven duplicate deliveries are classifying the same round.
+    for _ in 0..16 {
+        concurrent_terminal_commit_overlap(8);
+    }
+}
+
+#[test]
+fn concurrent_first_open_and_immediate_custody_share_one_migration_cut() {
+    // Repeat the barrier schedule: before the immediate journal transaction
+    // this reliably exposed a stale deferred WAL snapshot as SQLITE_BUSY_SNAPSHOT.
+    for _ in 0..16 {
+        concurrent_first_open_and_immediate_custody_once();
+    }
+}
+
+fn concurrent_first_open_and_immediate_custody_once() {
+    let fixture =
+        fixture_with_executor_acceptance_and_preopen(ExecutorFixture::Shell, false, false);
+    let executable = env!("CARGO_BIN_EXE_docket");
+    let release = fixture.root.join("first-open-release");
+    let spawn = |args: &[&str], stdin: Option<&[u8]>| {
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "release=$1; shift; while [ ! -f \"$release\" ]; do sleep 0.001; done; exec \"$@\"",
+                "docket-first-open",
+                release.to_str().unwrap(),
+                executable,
+            ])
+            .args(args)
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(stdin) = stdin {
+            child.stdin.take().unwrap().write_all(stdin).unwrap();
+        }
+        child
+    };
+    let accept_args = [
+        "governed-loop",
+        "accept",
+        "--state",
+        fixture.state.to_str().unwrap(),
+        "--trust",
+        fixture.trust_path.to_str().unwrap(),
+        "--standing-resolver",
+        fixture.standing_program.to_str().unwrap(),
+        "--executor",
+        fixture.executor.to_str().unwrap(),
+        "--executor-config",
+        fixture.config.to_str().unwrap(),
+    ];
+    let accept = spawn(&accept_args, Some(&fixture.issuance_envelope));
+    let lists = (0..7)
+        .map(|_| {
+            spawn(
+                &["list", "--json", "--state", fixture.state.to_str().unwrap()],
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(&release, b"release").unwrap();
+    let accepted = accept.wait_with_output().unwrap();
+    assert!(
+        accepted.status.success(),
+        "custody opener failed: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    for list in lists {
+        let output = list.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "read opener failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("duplicate column name"));
+    }
+    let database = fixture.state.join("state.sqlite");
+    let connection = Connection::open(database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_loop_attempt WHERE issuance=?1",
+                [&fixture.issuance],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
 }
 
 #[test]
@@ -341,6 +449,70 @@ fn concurrent_duplicate_round(fanout: usize) {
     );
 }
 
+fn concurrent_terminal_commit_overlap(fanout: usize) {
+    assert!(fanout >= 2);
+    let fixture = fixture();
+    let executable = env!("CARGO_BIN_EXE_docket");
+    let spawn = || {
+        let mut child = Command::new(executable)
+            .args([
+                "governed-loop",
+                "reconcile-attempt",
+                "--state",
+                fixture.state.to_str().unwrap(),
+                "--trust",
+                fixture.trust_path.to_str().unwrap(),
+                "--executor",
+                fixture.executor.to_str().unwrap(),
+                "--executor-config",
+                fixture.config.to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&fixture.envelope)
+            .unwrap();
+        child
+    };
+
+    let winner = spawn();
+    wait_for_path(&fixture.executor.with_extension("calls"));
+    let losers = (1..fanout).map(|_| spawn()).collect::<Vec<_>>();
+    // All duplicate processes now exist and have their complete input. Release
+    // the one durable claim winner while they race through read classification.
+    std::fs::write(fixture.executor.with_extension("release"), b"release").unwrap();
+
+    let mut children = vec![winner];
+    children.extend(losers);
+    let mut completed = 0;
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "coherent loser emitted a false refusal: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        match value["status"].as_str() {
+            Some("completed") => completed += 1,
+            Some("unresolved") => {}
+            other => panic!("unexpected loser state {other:?}: {value}"),
+        }
+    }
+    assert!(completed >= 1);
+    assert_eq!(
+        std::fs::read(fixture.executor.with_extension("calls")).unwrap(),
+        b"x",
+        "one exact reconciliation round crosses the external boundary once"
+    );
+}
+
 fn fixture() -> Fixture {
     fixture_with_executor(ExecutorFixture::Shell)
 }
@@ -353,6 +525,14 @@ fn fixture_with_executor_and_acceptance(
     executor_fixture: ExecutorFixture,
     accept_now: bool,
 ) -> Fixture {
+    fixture_with_executor_acceptance_and_preopen(executor_fixture, accept_now, true)
+}
+
+fn fixture_with_executor_acceptance_and_preopen(
+    executor_fixture: ExecutorFixture,
+    accept_now: bool,
+    preopen: bool,
+) -> Fixture {
     let root = std::env::temp_dir().join(format!(
         "docket-r4-reconcile-process-{}-{}",
         std::process::id(),
@@ -362,7 +542,9 @@ fn fixture_with_executor_and_acceptance(
     std::fs::create_dir_all(&state).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let database = state.join("state.sqlite");
-    drop(SqliteStore::open(&database).unwrap());
+    if preopen {
+        drop(SqliteStore::open(&database).unwrap());
+    }
 
     let actual_effectd = matches!(executor_fixture, ExecutorFixture::ActualAgEffectd(_));
     let operation = if actual_effectd {
@@ -598,6 +780,7 @@ fn fixture_with_executor_and_acceptance(
         ));
     }
 
+    let issuance_identity = issuance.issuance.clone();
     let idempotency = digest("round-idempotency");
     let caller_state = digest("caller-state");
     let mut round = ReconciliationRoundRequestWireV1 {
@@ -638,6 +821,7 @@ fn fixture_with_executor_and_acceptance(
         standing_program,
         executor,
         config,
+        issuance: issuance_identity,
         issuance_envelope,
         envelope,
         effectd_store,
