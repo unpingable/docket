@@ -108,10 +108,22 @@ human-decision request. A later human disposition opens a new occurrence under
 fresh observation, standing, admission, and spend. Neither Docket nor AG may
 reinterpret this record as the retired campaign-stage `exact_repair` route.
 
-The Docket CLI exposes custody acceptance and read-only reconciliation. It
-does not expose constructors for requirements, checkpoints, sealed results, or
-repair authority. Legacy campaign-stage repair artifacts remain historical and
-cannot be imported into this path.
+The Docket CLI exposes custody acceptance, consequence-free issuance
+observation (`reconcile-issuance`), and authenticated explicit reconciliation
+rounds (`reconcile-attempt`).  Only the latter may cross the executor
+reconciliation boundary, and its durable reservation commits first.  Neither
+operation exposes constructors for requirements, checkpoints, sealed results,
+or repair authority. Legacy campaign-stage repair artifacts remain historical
+and cannot be imported into this path.
+
+Custody becomes visible before the retained initial executor response returns,
+so initial execution and a first explicit round can legitimately overlap.  If
+that initial execution advances the exact claimed source cut, Docket resolves
+the round only from the monotone durable attempt result.  A superseded executor
+response may not add a journal entry, and replay does not reinvoke the executor.
+An unchanged claimed cut remains unresolved after restart.  A terminal result
+that lands after a completed indeterminate round is observable through exactly
+one predecessor-bound local round; it does not authorize another poll.
 
 ## Campaign boundary and nonclaims
 

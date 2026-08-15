@@ -13,7 +13,7 @@ use crate::governed_repair::{
 };
 use gwr_core::digest::{Sha256Digest, Transcript};
 use ring::signature::{UnparsedPublicKey, ED25519};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -32,6 +32,18 @@ pub const AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.issuance/v2";
 pub const CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 pub const SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
 pub const ISSUANCE_REFUSAL_SCHEMA_V1: &str = "docket.governed-loop.issuance-refusal/v1";
+pub const SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1: &str =
+    "ag.governed-loop.signed-reconciliation-round-request/v1";
+pub const RECONCILIATION_ROUND_REQUEST_SCHEMA_V1: &str =
+    "ag.governed-loop.reconciliation-round-request/v1";
+pub const RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-response/v1";
+pub const RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-reservation/v1";
+pub const RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-completion/v1";
+pub const EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1: &str =
+    "docket.governed-loop.executor-reconciliation-dispatch/v1";
 
 #[cfg(test)]
 thread_local! {
@@ -40,12 +52,19 @@ thread_local! {
     /// not a claim about physical power-loss durability.
     static CRASH_AFTER_EXECUTOR_RESULT_BEFORE_SEAL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Transaction-local fault used to prove that journal/settlement writes
+    /// and round completion roll back as one cut. It fires only after the
+    /// response has been validated and staged in the open transaction.
+    static ABORT_ROUND_COMPLETION_BEFORE_ROUND_ROW: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-standing-request/v1";
 pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
 
 const SIGNATURE_PREFIX_V2: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v2\0";
+const RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1: &[u8] =
+    b"ag-ng\0governed-loop-reconciliation-round-signature\0v1\0";
 const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXECUTOR_CONFIG_BYTES: u64 = 512 * 1024 * 1024;
@@ -254,6 +273,68 @@ pub struct SignedIssuanceEnvelopeWireV1 {
     pub schema: String,
     pub body_b64: String,
     pub authentication: IssuanceAuthenticationWireV1,
+}
+
+/// One AG-authorized reconciliation observation.  The idempotency value is a
+/// caller-selected non-authorizing replay key.  Both identities bind it; it is
+/// deliberately not derived from either identity (which would be circular).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRoundRequestWireV1 {
+    pub schema: String,
+    pub request: String,
+    pub round: String,
+    pub issuance: String,
+    pub attempt: String,
+    pub caller_state_digest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_round: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_reconciliation: Option<String>,
+    pub idempotency: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedReconciliationRoundRequestEnvelopeWireV1 {
+    pub schema: String,
+    pub body_b64: String,
+    pub authentication: IssuanceAuthenticationWireV1,
+}
+
+#[derive(Serialize)]
+struct ReconciliationRoundIdentityBasisV1<'a> {
+    schema: &'a str,
+    issuance: &'a str,
+    attempt: &'a str,
+    caller_state_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a str>,
+    idempotency: &'a str,
+}
+
+#[derive(Serialize)]
+struct ReconciliationRequestIdentityBasisV1<'a> {
+    schema: &'a str,
+    round: &'a str,
+    issuance: &'a str,
+    attempt: &'a str,
+    caller_state_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a str>,
+    idempotency: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -522,6 +603,212 @@ pub enum DocketReconciliationWireV1 {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRoundReservationWireV1 {
+    pub schema: String,
+    pub reservation: String,
+    pub request: String,
+    pub round: String,
+    pub issuance: String,
+    pub attempt: String,
+    pub caller_state_digest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_round: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_reconciliation: Option<String>,
+    pub source_cut: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub checkpoint_identity: Option<String>,
+    pub executor_binding: String,
+    pub claimed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRoundCompletionWireV1 {
+    pub schema: String,
+    pub completion: String,
+    pub reservation: String,
+    pub round: String,
+    pub result_identity: String,
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorReconciliationDispatchWireV1 {
+    pub schema: String,
+    pub request: String,
+    pub round: String,
+    pub reservation: String,
+    pub source_cut: String,
+    pub dispatch: ExecutorDispatchWireV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum DocketReconciliationRoundStateWireV1 {
+    NotAccepted,
+    Refused(DocketIssuanceRefusalWireV1),
+    Unresolved(ReconciliationRoundReservationWireV1),
+    Completed {
+        reservation: ReconciliationRoundReservationWireV1,
+        completion: ReconciliationRoundCompletionWireV1,
+        response: Box<DocketReconciliationWireV1>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketReconciliationRoundResponseWireV1 {
+    pub schema: String,
+    pub request: String,
+    pub round: String,
+    #[serde(flatten)]
+    pub state: DocketReconciliationRoundStateWireV1,
+}
+
+#[derive(Clone, Debug)]
+struct ReconciliationRoundRecordV1 {
+    reservation: ReconciliationRoundReservationWireV1,
+    signed_body_b64: String,
+    authentication: IssuanceAuthenticationWireV1,
+    state: String,
+    completion: Option<ReconciliationRoundCompletionWireV1>,
+    result_kind: Option<String>,
+    result_reconciliation: Option<String>,
+    result_evidence: Option<String>,
+}
+
+enum ReconciliationRoundClaimV1 {
+    Winner(Box<ReconciliationRoundReservationWireV1>),
+    Existing(Box<ReconciliationRoundRecordV1>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationSourceCutWireV1 {
+    issuance: String,
+    attempt: String,
+    custody: String,
+    status: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    checkpoint_identity: Option<String>,
+    executor_binding: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    latest_executor_result: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    latest_executor_outcome: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    latest_cumulative_journal: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    latest_completed_round: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    latest_completed_result: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    terminal_result_kind: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    terminal_result_identity: Option<String>,
+}
+
+struct ReconciliationSourceCutV1 {
+    identity: String,
+    canonical_bytes: Vec<u8>,
+    basis: ReconciliationSourceCutWireV1,
+    terminal_result: Option<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DurableReconciliationResultV1 {
+    kind: String,
+    identity: String,
+    reconciliation: Option<String>,
+    evidence: Option<String>,
+}
+
+enum ReconciliationSourceAdvanceV1 {
+    Unchanged,
+    Monotone(DurableReconciliationResultV1),
+}
+
+#[derive(Serialize)]
+struct ReconciliationReservationIdentityBasisV1<'a> {
+    schema: &'a str,
+    request: &'a str,
+    round: &'a str,
+    issuance: &'a str,
+    attempt: &'a str,
+    caller_state_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a str>,
+    source_cut: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_identity: Option<&'a str>,
+    executor_binding: &'a str,
+    claimed_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ReconciliationCompletionIdentityBasisV1<'a> {
+    schema: &'a str,
+    reservation: &'a str,
+    round: &'a str,
+    result_identity: &'a str,
+    completed_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 struct CustodyRecordV1 {
     issuance: AgIssuanceWireV2,
@@ -572,6 +859,132 @@ pub fn verify_signed_issuance(
     let (envelope, issuance, _) = authenticate_signed_issuance(envelope_bytes, trust_bytes)?;
     validate_issuance(&issuance)?;
     Ok((envelope, issuance))
+}
+
+/// Authenticates one exact AG reconciliation-round request.  Certificate
+/// bytes are evidence only: custody is not touched until the Store later
+/// claims the exact round against its current durable source cut.
+pub fn verify_signed_reconciliation_round_request(
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+) -> Result<
+    (
+        SignedReconciliationRoundRequestEnvelopeWireV1,
+        ReconciliationRoundRequestWireV1,
+    ),
+    String,
+> {
+    let envelope: SignedReconciliationRoundRequestEnvelopeWireV1 =
+        strict_json(envelope_bytes, "reconciliation-round-envelope")?;
+    let canonical_envelope = serde_jcs::to_vec(
+        &serde_json::to_value(&envelope)
+            .map_err(|error| format!("reconciliation-round-envelope-value:{error}"))?,
+    )
+    .map_err(|error| format!("reconciliation-round-envelope-canonical:{error}"))?;
+    if canonical_envelope != envelope_bytes {
+        return Err("governed-reconciliation-round-envelope-not-canonical".to_owned());
+    }
+    if envelope.schema != SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1 {
+        return Err("governed-reconciliation-round-envelope-schema".to_owned());
+    }
+    let trust: AgIssuerTrustConfigV1 = strict_json(trust_bytes, "issuer-trust")?;
+    let trusted = trust
+        .issuers
+        .iter()
+        .find(|candidate| {
+            candidate.issuer_principal == envelope.authentication.issuer_principal
+                && candidate.key_id == envelope.authentication.signer_key_id
+        })
+        .ok_or_else(|| "governed-reconciliation-round-untrusted-issuer".to_owned())?;
+    if trusted.public_key != envelope.authentication.signer_public_key {
+        return Err("governed-reconciliation-round-public-key-substitution".to_owned());
+    }
+    let body = b64_decode(&envelope.body_b64)?;
+    let public_key = b64_decode(&trusted.public_key)?;
+    let signature = b64_decode(&envelope.authentication.signature)?;
+    let mut signed =
+        Vec::with_capacity(RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.len() + body.len());
+    signed.extend_from_slice(RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1);
+    signed.extend_from_slice(&body);
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(&signed, &signature)
+        .map_err(|_| "governed-reconciliation-round-signature-invalid".to_owned())?;
+    let request: ReconciliationRoundRequestWireV1 =
+        strict_json(&body, "reconciliation-round-body")?;
+    let canonical_body = serde_jcs::to_vec(
+        &serde_json::to_value(&request)
+            .map_err(|error| format!("reconciliation-round-body-value:{error}"))?,
+    )
+    .map_err(|error| format!("reconciliation-round-body-canonical:{error}"))?;
+    if canonical_body != body {
+        return Err("governed-reconciliation-round-body-not-canonical".to_owned());
+    }
+    validate_reconciliation_round_request(&request)?;
+    Ok((envelope, request))
+}
+
+fn validate_reconciliation_round_request(
+    request: &ReconciliationRoundRequestWireV1,
+) -> Result<(), String> {
+    if request.schema != RECONCILIATION_ROUND_REQUEST_SCHEMA_V1 {
+        return Err("governed-reconciliation-round-schema".to_owned());
+    }
+    for (value, label) in [
+        (&request.request, "request"),
+        (&request.round, "round"),
+        (&request.issuance, "issuance"),
+        (&request.attempt, "attempt"),
+        (&request.caller_state_digest, "caller state"),
+        (&request.idempotency, "idempotency"),
+    ] {
+        require_digest(value, label)?;
+    }
+    match (
+        request.predecessor_round.as_deref(),
+        request.predecessor_reconciliation.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(round), Some(reconciliation)) => {
+            require_digest(round, "predecessor round")?;
+            require_digest(reconciliation, "predecessor reconciliation")?;
+        }
+        _ => return Err("governed-reconciliation-round-predecessor-shape".to_owned()),
+    }
+    let round_basis = ReconciliationRoundIdentityBasisV1 {
+        schema: &request.schema,
+        issuance: &request.issuance,
+        attempt: &request.attempt,
+        caller_state_digest: &request.caller_state_digest,
+        predecessor_round: request.predecessor_round.as_deref(),
+        predecessor_reconciliation: request.predecessor_reconciliation.as_deref(),
+        idempotency: &request.idempotency,
+    };
+    let round_bytes = serde_jcs::to_vec(&round_basis)
+        .map_err(|error| format!("governed-reconciliation-round-basis:{error}"))?;
+    if request.round != hash_domain("ag.governed-loop.reconciliation-round/v1", &round_bytes) {
+        return Err("governed-reconciliation-round-identity".to_owned());
+    }
+    let request_basis = ReconciliationRequestIdentityBasisV1 {
+        schema: &request.schema,
+        round: &request.round,
+        issuance: &request.issuance,
+        attempt: &request.attempt,
+        caller_state_digest: &request.caller_state_digest,
+        predecessor_round: request.predecessor_round.as_deref(),
+        predecessor_reconciliation: request.predecessor_reconciliation.as_deref(),
+        idempotency: &request.idempotency,
+    };
+    let request_bytes = serde_jcs::to_vec(&request_basis)
+        .map_err(|error| format!("governed-reconciliation-request-basis:{error}"))?;
+    if request.request
+        != hash_domain(
+            "ag.governed-loop.reconciliation-round-request/v1",
+            &request_bytes,
+        )
+    {
+        return Err("governed-reconciliation-request-identity".to_owned());
+    }
+    Ok(())
 }
 
 fn authenticate_signed_issuance(
@@ -882,9 +1295,157 @@ pub fn accept_with_checkpoint_verifier(
     }
 }
 
-/// Reconciles one already-custodied issuance.  The executor command receives
-/// the explicit `reconcile` operation; this path never calls `execute`.
-pub fn reconcile_with_checkpoint_verifier(
+/// Consequence-free durable issuance/custody lookup used by AG recovery before
+/// it has (or may lawfully create) an explicit reconciliation round.  This
+/// operation never prepares or invokes an executor.
+pub fn observe_issuance_with_checkpoint_verifier(
+    database: &Path,
+    issuance: &str,
+    checkpoint_verifier: Option<&Path>,
+) -> Result<DocketReconciliationWireV1, String> {
+    require_digest(issuance, "issuance")?;
+    let mut store = GovernedCustodyStoreV1::open(database)?;
+    let Some(record) = store.get(issuance)? else {
+        if let Some(refusal) = store.get_refusal(issuance)? {
+            return Ok(DocketReconciliationWireV1::Refused(refusal.refusal));
+        }
+        return Ok(DocketReconciliationWireV1::NotAccepted);
+    };
+    verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
+    if let Some(result) = governed_repair::read_sealed_result(&store.connection, issuance)? {
+        require_result_custody(&result, &record.custody)?;
+        return Ok(DocketReconciliationWireV1::GovernedRepairRequired {
+            custody: record.custody,
+            result: Box::new(result),
+        });
+    }
+    response_from_record(record)
+}
+
+/// Authenticates and durably resolves one exact reconciliation round.
+/// A nonterminal claim commits before the external boundary. A first round at
+/// an already-terminal initial-attempt cut is claimed and completed locally in
+/// one transaction, with no executor invocation. Exact duplicate delivery
+/// observes the durable completed or unresolved round and never calls the
+/// executor again.
+pub fn reconcile_signed_round_with_checkpoint_verifier(
+    database: &Path,
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+    executor: &Path,
+    executor_config: &Path,
+    checkpoint_verifier: Option<&Path>,
+) -> Result<DocketReconciliationRoundResponseWireV1, String> {
+    let (envelope, request) =
+        verify_signed_reconciliation_round_request(envelope_bytes, trust_bytes)?;
+    let mut store = GovernedCustodyStoreV1::open(database)?;
+    if let Some(mut existing) = store.read_reconciliation_round(&request.request)? {
+        if existing.signed_body_b64 != envelope.body_b64
+            || existing.authentication != envelope.authentication
+        {
+            return Err("governed-reconciliation-request-replay-collision".to_owned());
+        }
+        let record = store
+            .get(&request.issuance)?
+            .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
+        if existing.authentication.issuer_principal != record.authentication.issuer_principal
+            || existing.authentication.signer_key_id != record.authentication.signer_key_id
+            || existing.authentication.signer_public_key != record.authentication.signer_public_key
+        {
+            return Err("governed-reconciliation-issuance-issuer-substitution".to_owned());
+        }
+        verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
+        // A process crash with an unchanged source cut stays explicitly
+        // unresolved. If the independently running initial dispatch advanced
+        // the exact attempt after this round claimed, resolve the round from
+        // that durable monotone result without another executor call.
+        if store.resolve_claimed_round_from_durable_source(&existing, &record, now_unix_ms()?)? {
+            existing = store
+                .read_reconciliation_round(&request.request)?
+                .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+        }
+        return store.reconciliation_round_response(existing);
+    }
+    let Some(record) = store.get(&request.issuance)? else {
+        let result = if let Some(refusal) = store.get_refusal(&request.issuance)? {
+            DocketReconciliationRoundStateWireV1::Refused(refusal.refusal)
+        } else {
+            DocketReconciliationRoundStateWireV1::NotAccepted
+        };
+        return Ok(DocketReconciliationRoundResponseWireV1 {
+            schema: RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+            request: request.request,
+            round: request.round,
+            state: result,
+        });
+    };
+    if request.attempt != record.custody.attempt {
+        return Err("governed-reconciliation-attempt-substitution".to_owned());
+    }
+    verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
+    let expected_binding = ExecutorBindingV1 {
+        identity: record.executor_binding.clone(),
+        program_digest: record.executor_program_digest.clone(),
+        config_digest: record.executor_config_digest.clone(),
+        plan: record.executor_plan.clone(),
+    };
+    // Revalidate and retain the exact executor/config bytes without crossing
+    // the executor process boundary.  The round reservation must commit
+    // before *any* external reconciliation process is invoked.  Acceptance
+    // already bound the plan identity to these exact byte digests; reproducing
+    // the complete binding here therefore needs no pre-claim `plan-id` call.
+    let retained_executor = retain_bound_executor(executor, executor_config, &expected_binding)?;
+    let reservation = match store.claim_reconciliation_round(
+        &envelope,
+        &request,
+        &record,
+        &expected_binding,
+        now_unix_ms()?,
+    )? {
+        ReconciliationRoundClaimV1::Existing(existing) => {
+            return store.reconciliation_round_response(*existing)
+        }
+        ReconciliationRoundClaimV1::Winner(reservation) => *reservation,
+    };
+    let dispatch =
+        executor_reconciliation_dispatch(&request, &reservation, &record.issuance, &record.custody);
+    let outcome = match invoke_retained_json::<_, ExecutorOutcomeWireV1>(
+        &retained_executor,
+        "reconcile",
+        &dispatch,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => ExecutorOutcomeWireV1 {
+            attempt: record.custody.attempt.clone(),
+            marker: record.custody.executor_marker.clone(),
+            receipt: hash_domain(
+                "docket.governed-loop.reconciliation-unavailable/v1",
+                format!("{}:{error}", request.round).as_bytes(),
+            ),
+            outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+            effect_journal: Vec::new(),
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        },
+    };
+    store.complete_reconciliation_round(
+        &request,
+        &reservation,
+        &record,
+        outcome,
+        now_unix_ms()?,
+    )?;
+    let completed = store
+        .read_reconciliation_round(&request.request)?
+        .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+    store.reconciliation_round_response(completed)
+}
+
+/// Legacy raw reconciliation exists only for internal R3 regression tests. It
+/// is absent from ordinary production builds; production callers must present
+/// an authenticated explicit round request.
+#[cfg(test)]
+fn reconcile_with_checkpoint_verifier(
     database: &Path,
     issuance: &str,
     expected_attempt: Option<&str>,
@@ -923,7 +1484,7 @@ pub fn reconcile_with_checkpoint_verifier(
         // checkpoint correspondence. Successor settlement replay therefore
         // observes the same fresh verifier boundary as governed-result replay.
         verify_starting_checkpoint(&record.issuance, checkpoint_verifier, now_unix_ms()?)?;
-        return response(record);
+        return response_from_record(record);
     }
 
     // A starting checkpoint is evidence, never inherited authority. Every
@@ -972,12 +1533,12 @@ pub fn reconcile_with_checkpoint_verifier(
     record = store
         .get(issuance)?
         .ok_or_else(|| "governed-custody-disappeared".to_owned())?;
-    response(record)
+    response_from_record(record)
 }
 
-/// Reconciles an issuance that has no immutable starting checkpoint. Callers
-/// handling successor work must use [`reconcile_with_checkpoint_verifier`].
-pub fn reconcile(
+/// Test-only R3 compatibility wrapper.
+#[cfg(test)]
+fn reconcile(
     database: &Path,
     issuance: &str,
     expected_attempt: Option<&str>,
@@ -994,7 +1555,7 @@ pub fn reconcile(
     )
 }
 
-fn response(record: CustodyRecordV1) -> Result<DocketReconciliationWireV1, String> {
+fn response_from_record(record: CustodyRecordV1) -> Result<DocketReconciliationWireV1, String> {
     match record.status.as_str() {
         "accepted" => Ok(DocketReconciliationWireV1::Accepted(record.custody)),
         "settled" => Ok(DocketReconciliationWireV1::Settled {
@@ -1026,6 +1587,78 @@ fn executor_dispatch(
         effect_scope: issuance.effect_scope.clone(),
         effect_scope_digest: issuance.effect_scope_digest.clone(),
     }
+}
+
+fn executor_reconciliation_dispatch(
+    request: &ReconciliationRoundRequestWireV1,
+    reservation: &ReconciliationRoundReservationWireV1,
+    issuance: &AgIssuanceWireV2,
+    custody: &DocketCustodyWireV1,
+) -> ExecutorReconciliationDispatchWireV1 {
+    ExecutorReconciliationDispatchWireV1 {
+        schema: EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        reservation: reservation.reservation.clone(),
+        source_cut: reservation.source_cut.clone(),
+        dispatch: executor_dispatch(issuance, custody),
+    }
+}
+
+fn starting_checkpoint_identity(issuance: &AgIssuanceWireV2) -> Result<Option<String>, String> {
+    issuance
+        .governed_repair_checkpoint
+        .as_ref()
+        .map(|checkpoint| {
+            let bytes = serde_jcs::to_vec(checkpoint)
+                .map_err(|error| format!("governed-starting-checkpoint-canonical:{error}"))?;
+            Ok(hash_domain(
+                "docket.governed-loop.starting-checkpoint/v1",
+                &bytes,
+            ))
+        })
+        .transpose()
+}
+
+fn reservation_identity(
+    reservation: &ReconciliationRoundReservationWireV1,
+) -> Result<String, String> {
+    let basis = ReconciliationReservationIdentityBasisV1 {
+        schema: &reservation.schema,
+        request: &reservation.request,
+        round: &reservation.round,
+        issuance: &reservation.issuance,
+        attempt: &reservation.attempt,
+        caller_state_digest: &reservation.caller_state_digest,
+        predecessor_round: reservation.predecessor_round.as_deref(),
+        predecessor_reconciliation: reservation.predecessor_reconciliation.as_deref(),
+        source_cut: &reservation.source_cut,
+        checkpoint_identity: reservation.checkpoint_identity.as_deref(),
+        executor_binding: &reservation.executor_binding,
+        claimed_at_unix_ms: reservation.claimed_at_unix_ms,
+    };
+    let bytes = serde_jcs::to_vec(&basis)
+        .map_err(|error| format!("governed-reconciliation-reservation-canonical:{error}"))?;
+    Ok(hash_domain(
+        "docket.governed-loop.reconciliation-round-reservation/v1",
+        &bytes,
+    ))
+}
+
+fn completion_identity(completion: &ReconciliationRoundCompletionWireV1) -> Result<String, String> {
+    let basis = ReconciliationCompletionIdentityBasisV1 {
+        schema: &completion.schema,
+        reservation: &completion.reservation,
+        round: &completion.round,
+        result_identity: &completion.result_identity,
+        completed_at_unix_ms: completion.completed_at_unix_ms,
+    };
+    let bytes = serde_jcs::to_vec(&basis)
+        .map_err(|error| format!("governed-reconciliation-completion-canonical:{error}"))?;
+    Ok(hash_domain(
+        "docket.governed-loop.reconciliation-round-completion/v1",
+        &bytes,
+    ))
 }
 
 fn require_result_custody(
@@ -1355,15 +1988,1495 @@ struct GovernedCustodyStoreV1 {
 
 impl GovernedCustodyStoreV1 {
     fn open(database: &Path) -> Result<Self, String> {
-        let connection =
-            Connection::open(database).map_err(|error| format!("governed-custody-open:{error}"))?;
+        // Every public custody operation reaches this owner.  Retain the same
+        // connection that performed canonical migration and the exact schema
+        // object census; a direct library caller therefore cannot bypass the
+        // gate that the `docket` CLI establishes during `State::open`.
+        let connection = crate::store::SqliteStore::open(database)
+            .map_err(|error| format!("governed-custody-store:{error:?}"))?
+            .into_validated_connection();
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("governed-custody-foreign-keys:{error}"))?;
         connection
             .pragma_update(None, "busy_timeout", 5_000_u32)
             .map_err(|error| format!("governed-custody-busy-timeout:{error}"))?;
-        Ok(Self { connection })
+        let mut store = Self { connection };
+        let requests = store
+            .connection
+            .prepare("SELECT request FROM governed_reconciliation_round ORDER BY rowid")
+            .map_err(|error| format!("governed-reconciliation-round-census:{error}"))?
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("governed-reconciliation-round-census:{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("governed-reconciliation-round-census:{error}"))?;
+        for request in requests {
+            store
+                .read_reconciliation_round(&request)?
+                .ok_or_else(|| "governed-reconciliation-round-census-gap".to_owned())?;
+        }
+        Ok(store)
+    }
+
+    fn read_reconciliation_round(
+        &mut self,
+        request: &str,
+    ) -> Result<Option<ReconciliationRoundRecordV1>, String> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT round,issuance,attempt,caller_state_digest,idempotency,
+                        predecessor_round,predecessor_reconciliation,source_cut,
+                        checkpoint_identity,executor_binding,reservation,signed_body_b64,
+                        issuer_principal,signer_key_id,signer_public_key,signature,
+                        claimed_at,state,completion,result_kind,result_identity,
+                        result_reconciliation,result_evidence,completed_at,source_cut_jcs
+                 FROM governed_reconciliation_round WHERE request=?1",
+                [request],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, i64>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<String>>(20)?,
+                        row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, Option<i64>>(23)?,
+                        row.get::<_, Vec<u8>>(24)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-round-read:{error}"))?;
+        let Some((
+            round,
+            issuance,
+            attempt,
+            caller_state_digest,
+            idempotency,
+            predecessor_round,
+            predecessor_reconciliation,
+            source_cut,
+            checkpoint_identity,
+            executor_binding,
+            reservation_identity_value,
+            signed_body_b64,
+            issuer_principal,
+            signer_key_id,
+            signer_public_key,
+            signature,
+            claimed_at,
+            state,
+            completion_identity_value,
+            result_kind,
+            result_identity,
+            result_reconciliation,
+            result_evidence,
+            completed_at,
+            source_cut_jcs,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let body = b64_decode(&signed_body_b64)?;
+        let parsed: ReconciliationRoundRequestWireV1 =
+            strict_json(&body, "stored-reconciliation-round")?;
+        validate_reconciliation_round_request(&parsed)?;
+        let canonical = serde_jcs::to_vec(&parsed)
+            .map_err(|error| format!("stored-reconciliation-round-canonical:{error}"))?;
+        if canonical != body
+            || parsed.request != request
+            || parsed.round != round
+            || parsed.issuance != issuance
+            || parsed.attempt != attempt
+            || parsed.caller_state_digest != caller_state_digest
+            || parsed.idempotency != idempotency
+            || parsed.predecessor_round != predecessor_round
+            || parsed.predecessor_reconciliation != predecessor_reconciliation
+        {
+            return Err("governed-reconciliation-round-stored-substitution".to_owned());
+        }
+        let mut reservation = ReconciliationRoundReservationWireV1 {
+            schema: RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1.to_owned(),
+            reservation: String::new(),
+            request: request.to_owned(),
+            round,
+            issuance,
+            attempt,
+            caller_state_digest,
+            predecessor_round,
+            predecessor_reconciliation,
+            source_cut,
+            checkpoint_identity,
+            executor_binding,
+            claimed_at_unix_ms: read_u64(claimed_at, 16)
+                .map_err(|error| format!("governed-reconciliation-claimed-at:{error}"))?,
+        };
+        reservation.reservation = reservation_identity(&reservation)?;
+        if reservation.reservation != reservation_identity_value {
+            return Err("governed-reconciliation-reservation-substitution".to_owned());
+        }
+        let completion = match (
+            state.as_str(),
+            completion_identity_value,
+            result_identity,
+            completed_at,
+        ) {
+            ("claimed", None, None, None) => None,
+            ("completed", Some(identity), Some(result_identity), Some(completed_at)) => {
+                let mut completion = ReconciliationRoundCompletionWireV1 {
+                    schema: RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+                    completion: String::new(),
+                    reservation: reservation.reservation.clone(),
+                    round: reservation.round.clone(),
+                    result_identity,
+                    completed_at_unix_ms: read_u64(completed_at, 23)
+                        .map_err(|error| format!("governed-reconciliation-completed-at:{error}"))?,
+                };
+                completion.completion = completion_identity(&completion)?;
+                if completion.completion != identity {
+                    return Err("governed-reconciliation-completion-substitution".to_owned());
+                }
+                Some(completion)
+            }
+            _ => return Err("governed-reconciliation-round-state-corrupt".to_owned()),
+        };
+        if (result_kind.as_deref() == Some("indeterminate"))
+            != (result_reconciliation.is_some() && result_evidence.is_some())
+        {
+            return Err("governed-reconciliation-round-result-shape".to_owned());
+        }
+        let public_key = b64_decode(&signer_public_key)?;
+        let signature_bytes = b64_decode(&signature)?;
+        let mut signed =
+            Vec::with_capacity(RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.len() + body.len());
+        signed.extend_from_slice(RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1);
+        signed.extend_from_slice(&body);
+        UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(&signed, &signature_bytes)
+            .map_err(|_| "governed-stored-reconciliation-round-signature-invalid".to_owned())?;
+        let custody_record = self
+            .get(&reservation.issuance)?
+            .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
+        if issuer_principal != custody_record.authentication.issuer_principal
+            || signer_key_id != custody_record.authentication.signer_key_id
+            || signer_public_key != custody_record.authentication.signer_public_key
+        {
+            return Err("governed-reconciliation-issuance-issuer-substitution".to_owned());
+        }
+        Self::validate_reconciliation_source_cut(
+            &self.connection,
+            &custody_record,
+            &reservation,
+            &source_cut_jcs,
+            &state,
+        )?;
+        Ok(Some(ReconciliationRoundRecordV1 {
+            reservation,
+            signed_body_b64,
+            authentication: IssuanceAuthenticationWireV1 {
+                issuer_principal,
+                signer_key_id,
+                signer_public_key,
+                signature,
+            },
+            state,
+            completion,
+            result_kind,
+            result_reconciliation,
+            result_evidence,
+        }))
+    }
+
+    fn current_reconciliation_terminal(
+        connection: &Connection,
+        record: &CustodyRecordV1,
+    ) -> Result<(String, Option<(String, String)>), String> {
+        let (current_status, settlement_identity): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status,settlement FROM governed_loop_attempt
+                 WHERE issuance=?1 AND attempt=?2",
+                params![record.issuance.issuance, record.custody.attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("governed-reconciliation-source-status:{error}"))?;
+        let sealed = governed_repair::read_sealed_result(connection, &record.issuance.issuance)?;
+        let terminal_result = match (
+            current_status.as_str(),
+            settlement_identity,
+            sealed.as_ref(),
+        ) {
+            ("accepted" | "indeterminate", None, None) => None,
+            ("accepted" | "indeterminate", None, Some(result)) => {
+                Some(("governed_repair".to_owned(), result.sealed_result.clone()))
+            }
+            ("settled", Some(settlement), None) => {
+                require_digest(&settlement, "terminal settlement")?;
+                Some(("settled".to_owned(), settlement))
+            }
+            _ => return Err("governed-reconciliation-source-terminal-shape".to_owned()),
+        };
+        Ok((current_status, terminal_result))
+    }
+
+    fn reconciliation_source_cut(
+        connection: &Connection,
+        record: &CustodyRecordV1,
+    ) -> Result<ReconciliationSourceCutV1, String> {
+        let (current_status, terminal_result) =
+            Self::current_reconciliation_terminal(connection, record)?;
+        let latest_executor: Option<(String, String, String)> = connection
+            .query_row(
+                "SELECT result_identity,outcome,cumulative_effect_journal_digest
+                 FROM governed_executor_result WHERE issuance=?1 AND attempt=?2
+                 ORDER BY sequence DESC LIMIT 1",
+                params![record.issuance.issuance, record.custody.attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-source-result:{error}"))?;
+        let latest_round: Option<(String, String)> = connection
+            .query_row(
+                "SELECT round,result_identity FROM governed_reconciliation_round
+                 WHERE issuance=?1 AND attempt=?2 AND state='completed'
+                 ORDER BY rowid DESC LIMIT 1",
+                params![record.issuance.issuance, record.custody.attempt],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-source-round:{error}"))?;
+        let custody = governed_repair::ag_custody_reference(&record.custody)?;
+        let checkpoint = starting_checkpoint_identity(&record.issuance)?;
+        let basis = ReconciliationSourceCutWireV1 {
+            issuance: record.issuance.issuance.clone(),
+            attempt: record.custody.attempt.clone(),
+            custody,
+            status: current_status,
+            checkpoint_identity: checkpoint,
+            executor_binding: record.executor_binding.clone(),
+            latest_executor_result: latest_executor.as_ref().map(|value| value.0.clone()),
+            latest_executor_outcome: latest_executor.as_ref().map(|value| value.1.clone()),
+            latest_cumulative_journal: latest_executor.as_ref().map(|value| value.2.clone()),
+            latest_completed_round: latest_round.as_ref().map(|value| value.0.clone()),
+            latest_completed_result: latest_round.as_ref().map(|value| value.1.clone()),
+            terminal_result_kind: terminal_result.as_ref().map(|value| value.0.clone()),
+            terminal_result_identity: terminal_result.as_ref().map(|value| value.1.clone()),
+        };
+        let bytes = serde_jcs::to_vec(&basis)
+            .map_err(|error| format!("governed-reconciliation-source-cut:{error}"))?;
+        Ok(ReconciliationSourceCutV1 {
+            identity: hash_domain("docket.governed-loop.reconciliation-source-cut/v1", &bytes),
+            canonical_bytes: bytes,
+            basis,
+            terminal_result,
+        })
+    }
+
+    fn durable_reconciliation_result(
+        connection: &Connection,
+        record: &CustodyRecordV1,
+    ) -> Result<Option<DurableReconciliationResultV1>, String> {
+        let (status, settlement, reconciliation, evidence): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = connection
+            .query_row(
+                "SELECT status,settlement,reconciliation,indeterminate_evidence
+                 FROM governed_loop_attempt WHERE issuance=?1 AND attempt=?2",
+                params![record.issuance.issuance, record.custody.attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|error| format!("governed-reconciliation-durable-result-read:{error}"))?;
+        let sealed = governed_repair::read_sealed_result(connection, &record.issuance.issuance)?;
+        match (
+            status.as_str(),
+            settlement,
+            reconciliation,
+            evidence,
+            sealed,
+        ) {
+            ("accepted" | "indeterminate", None, _, _, Some(result)) => {
+                require_result_custody(&result, &record.custody)?;
+                Ok(Some(DurableReconciliationResultV1 {
+                    kind: "governed_repair".to_owned(),
+                    identity: result.sealed_result,
+                    reconciliation: None,
+                    evidence: None,
+                }))
+            }
+            ("settled", Some(settlement), None, None, None) => {
+                require_digest(&settlement, "durable reconciliation settlement")?;
+                Ok(Some(DurableReconciliationResultV1 {
+                    kind: "settled".to_owned(),
+                    identity: settlement,
+                    reconciliation: None,
+                    evidence: None,
+                }))
+            }
+            ("indeterminate", None, Some(reconciliation), Some(evidence), None) => {
+                require_digest(&reconciliation, "durable reconciliation identity")?;
+                require_digest(&evidence, "durable reconciliation evidence")?;
+                if reconciliation
+                    != hash_domain(
+                        "docket.governed-loop.reconciliation/v1",
+                        format!(
+                            "{}:{}:{evidence}",
+                            record.issuance.issuance, record.custody.attempt
+                        )
+                        .as_bytes(),
+                    )
+                {
+                    return Err("governed-reconciliation-durable-result-identity".to_owned());
+                }
+                let observed: Option<(String, String)> = connection
+                    .query_row(
+                        "SELECT outcome,receipt FROM governed_executor_result
+                         WHERE issuance=?1 AND attempt=?2 AND receipt=?3",
+                        params![record.issuance.issuance, record.custody.attempt, evidence],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("governed-reconciliation-durable-result-evidence:{error}")
+                    })?;
+                if observed != Some(("indeterminate".to_owned(), evidence.clone())) {
+                    return Err("governed-reconciliation-durable-result-evidence".to_owned());
+                }
+                Ok(Some(DurableReconciliationResultV1 {
+                    kind: "indeterminate".to_owned(),
+                    identity: reconciliation.clone(),
+                    reconciliation: Some(reconciliation),
+                    evidence: Some(evidence),
+                }))
+            }
+            ("accepted", None, None, None, None) => Ok(None),
+            _ => Err("governed-reconciliation-durable-result-shape".to_owned()),
+        }
+    }
+
+    fn require_executor_history_monotone(
+        connection: &Connection,
+        reservation: &ReconciliationRoundReservationWireV1,
+        source: &ReconciliationSourceCutWireV1,
+        current: &ReconciliationSourceCutWireV1,
+    ) -> Result<(), String> {
+        match (
+            source.latest_executor_result.as_deref(),
+            current.latest_executor_result.as_deref(),
+        ) {
+            (None, Some(_)) | (None, None) => Ok(()),
+            (Some(source_result), Some(current_result)) if source_result == current_result => {
+                Ok(())
+            }
+            (Some(source_result), Some(current_result)) => {
+                let source_sequence: Option<i64> = connection
+                    .query_row(
+                        "SELECT sequence FROM governed_executor_result
+                         WHERE issuance=?1 AND attempt=?2 AND result_identity=?3",
+                        params![reservation.issuance, reservation.attempt, source_result],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("governed-reconciliation-source-sequence-read:{error}")
+                    })?;
+                let current_sequence: Option<i64> = connection
+                    .query_row(
+                        "SELECT sequence FROM governed_executor_result
+                         WHERE issuance=?1 AND attempt=?2 AND result_identity=?3",
+                        params![reservation.issuance, reservation.attempt, current_result],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("governed-reconciliation-current-sequence-read:{error}")
+                    })?;
+                if !matches!((source_sequence, current_sequence), (Some(source), Some(current)) if current > source)
+                {
+                    return Err("governed-reconciliation-source-history-nonmonotone".to_owned());
+                }
+                Ok(())
+            }
+            (Some(_), None) => Err("governed-reconciliation-source-history-nonmonotone".to_owned()),
+        }
+    }
+
+    fn classify_reconciliation_source_advance(
+        connection: &Connection,
+        record: &CustodyRecordV1,
+        reservation: &ReconciliationRoundReservationWireV1,
+        source: &ReconciliationSourceCutWireV1,
+        current: &ReconciliationSourceCutV1,
+    ) -> Result<ReconciliationSourceAdvanceV1, String> {
+        if current.identity == reservation.source_cut {
+            return Ok(ReconciliationSourceAdvanceV1::Unchanged);
+        }
+        let current_basis = &current.basis;
+        if source.issuance != current_basis.issuance
+            || source.attempt != current_basis.attempt
+            || source.custody != current_basis.custody
+            || source.checkpoint_identity != current_basis.checkpoint_identity
+            || source.executor_binding != current_basis.executor_binding
+            || source.latest_completed_round != current_basis.latest_completed_round
+            || source.latest_completed_result != current_basis.latest_completed_result
+            || source.terminal_result_kind.is_some()
+            || source.terminal_result_identity.is_some()
+        {
+            return Err("governed-reconciliation-source-advance-substitution".to_owned());
+        }
+        Self::require_executor_history_monotone(connection, reservation, source, current_basis)?;
+        let allowed_status = match (source.status.as_str(), current_basis.status.as_str()) {
+            ("accepted", "indeterminate" | "settled")
+            | ("indeterminate", "indeterminate" | "settled") => true,
+            ("accepted" | "indeterminate", "accepted") => {
+                current_basis.terminal_result_kind.as_deref() == Some("governed_repair")
+            }
+            _ => false,
+        };
+        if !allowed_status {
+            return Err("governed-reconciliation-source-advance-nonmonotone".to_owned());
+        }
+        let result = Self::durable_reconciliation_result(connection, record)?
+            .ok_or_else(|| "governed-reconciliation-source-advance-result-missing".to_owned())?;
+        if current_basis.terminal_result_kind.as_deref()
+            != (result.kind != "indeterminate").then_some(result.kind.as_str())
+            || current_basis.terminal_result_identity.as_deref()
+                != (result.kind != "indeterminate").then_some(result.identity.as_str())
+        {
+            return Err("governed-reconciliation-source-advance-result-substitution".to_owned());
+        }
+        Ok(ReconciliationSourceAdvanceV1::Monotone(result))
+    }
+
+    fn complete_claimed_round_row(
+        transaction: &Transaction<'_>,
+        reservation: &ReconciliationRoundReservationWireV1,
+        result: &DurableReconciliationResultV1,
+        completed_at: u64,
+    ) -> Result<(), String> {
+        let mut completion = ReconciliationRoundCompletionWireV1 {
+            schema: RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+            completion: String::new(),
+            reservation: reservation.reservation.clone(),
+            round: reservation.round.clone(),
+            result_identity: result.identity.clone(),
+            completed_at_unix_ms: completed_at,
+        };
+        completion.completion = completion_identity(&completion)?;
+        let changed = transaction
+            .execute(
+                "UPDATE governed_reconciliation_round
+                 SET state='completed',completion=?1,result_kind=?2,result_identity=?3,
+                     result_reconciliation=?4,result_evidence=?5,completed_at=?6
+                 WHERE request=?7 AND round=?8 AND reservation=?9 AND state='claimed'",
+                params![
+                    completion.completion,
+                    result.kind,
+                    result.identity,
+                    result.reconciliation,
+                    result.evidence,
+                    u64_to_i64(completed_at)?,
+                    reservation.request,
+                    reservation.round,
+                    reservation.reservation,
+                ],
+            )
+            .map_err(|error| format!("governed-reconciliation-local-completion-write:{error}"))?;
+        if changed != 1 {
+            return Err("governed-reconciliation-local-completion-race".to_owned());
+        }
+        Ok(())
+    }
+
+    fn resolve_claimed_round_from_durable_source(
+        &mut self,
+        round: &ReconciliationRoundRecordV1,
+        record: &CustodyRecordV1,
+        completed_at: u64,
+    ) -> Result<bool, String> {
+        if round.state != "claimed" {
+            return Ok(false);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("governed-reconciliation-local-completion-transaction:{error}")
+            })?;
+        let (state, reservation, source_cut_jcs): (String, String, Vec<u8>) = transaction
+            .query_row(
+                "SELECT state,reservation,source_cut_jcs FROM governed_reconciliation_round
+                 WHERE request=?1 AND round=?2",
+                params![round.reservation.request, round.reservation.round],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("governed-reconciliation-local-completion-read:{error}"))?;
+        if reservation != round.reservation.reservation {
+            return Err("governed-reconciliation-local-completion-claim-substitution".to_owned());
+        }
+        if state == "completed" {
+            transaction.commit().map_err(|error| {
+                format!("governed-reconciliation-local-completion-commit:{error}")
+            })?;
+            return Ok(true);
+        }
+        if state != "claimed" {
+            return Err("governed-reconciliation-local-completion-state".to_owned());
+        }
+        let source: ReconciliationSourceCutWireV1 =
+            strict_json(&source_cut_jcs, "stored-reconciliation-source-cut")?;
+        let current = Self::reconciliation_source_cut(&transaction, record)?;
+        match Self::classify_reconciliation_source_advance(
+            &transaction,
+            record,
+            &round.reservation,
+            &source,
+            &current,
+        )? {
+            ReconciliationSourceAdvanceV1::Unchanged => {
+                transaction.commit().map_err(|error| {
+                    format!("governed-reconciliation-local-completion-commit:{error}")
+                })?;
+                Ok(false)
+            }
+            ReconciliationSourceAdvanceV1::Monotone(result) => {
+                Self::complete_claimed_round_row(
+                    &transaction,
+                    &round.reservation,
+                    &result,
+                    completed_at,
+                )?;
+                transaction.commit().map_err(|error| {
+                    format!("governed-reconciliation-local-completion-commit:{error}")
+                })?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn validate_reconciliation_source_cut(
+        connection: &Connection,
+        record: &CustodyRecordV1,
+        reservation: &ReconciliationRoundReservationWireV1,
+        source_cut_jcs: &[u8],
+        round_state: &str,
+    ) -> Result<(), String> {
+        let source: ReconciliationSourceCutWireV1 =
+            strict_json(source_cut_jcs, "stored-reconciliation-source-cut")?;
+        let canonical = serde_jcs::to_vec(&source)
+            .map_err(|error| format!("governed-reconciliation-source-cut-canonical:{error}"))?;
+        if canonical != source_cut_jcs {
+            return Err("governed-reconciliation-source-cut-noncanonical".to_owned());
+        }
+        let source_identity = hash_domain(
+            "docket.governed-loop.reconciliation-source-cut/v1",
+            source_cut_jcs,
+        );
+        if source_identity != reservation.source_cut {
+            return Err("governed-reconciliation-source-cut-substitution".to_owned());
+        }
+        let executor_shape = (
+            source.latest_executor_result.is_some(),
+            source.latest_executor_outcome.is_some(),
+            source.latest_cumulative_journal.is_some(),
+        );
+        if !matches!(executor_shape, (false, false, false) | (true, true, true)) {
+            return Err("governed-reconciliation-source-executor-shape".to_owned());
+        }
+        let completed_shape = (
+            source.latest_completed_round.is_some(),
+            source.latest_completed_result.is_some(),
+        );
+        if !matches!(completed_shape, (false, false) | (true, true)) {
+            return Err("governed-reconciliation-source-round-shape".to_owned());
+        }
+        let terminal_shape = (
+            source.terminal_result_kind.as_deref(),
+            source.terminal_result_identity.as_deref(),
+        );
+        match terminal_shape {
+            (None, None) if source.status != "settled" => {}
+            (Some("settled"), Some(identity)) if source.status == "settled" => {
+                require_digest(identity, "stored terminal settlement")?;
+            }
+            (Some("governed_repair"), Some(identity))
+                if matches!(source.status.as_str(), "accepted" | "indeterminate") =>
+            {
+                require_digest(identity, "stored terminal governed result")?;
+            }
+            _ => return Err("governed-reconciliation-source-terminal-shape".to_owned()),
+        }
+        let custody = governed_repair::ag_custody_reference(&record.custody)?;
+        if source.issuance != reservation.issuance
+            || source.issuance != record.issuance.issuance
+            || source.attempt != reservation.attempt
+            || source.attempt != record.custody.attempt
+            || source.custody != custody
+            || source.checkpoint_identity != reservation.checkpoint_identity
+            || source.checkpoint_identity != starting_checkpoint_identity(&record.issuance)?
+            || source.executor_binding != reservation.executor_binding
+            || source.executor_binding != record.executor_binding
+            || !matches!(
+                source.status.as_str(),
+                "accepted" | "indeterminate" | "settled"
+            )
+        {
+            return Err("governed-reconciliation-source-static-substitution".to_owned());
+        }
+        if let (Some(kind), Some(identity)) = terminal_shape {
+            let (_, current_terminal) = Self::current_reconciliation_terminal(connection, record)?;
+            if current_terminal
+                .as_ref()
+                .map(|value| (value.0.as_str(), value.1.as_str()))
+                != Some((kind, identity))
+            {
+                return Err("governed-reconciliation-source-terminal-substitution".to_owned());
+            }
+        }
+        if source.latest_completed_round != reservation.predecessor_round
+            || source.latest_completed_result != reservation.predecessor_reconciliation
+        {
+            return Err("governed-reconciliation-source-predecessor-substitution".to_owned());
+        }
+
+        let source_executor: Option<(String, String, String, String)> = match &source
+            .latest_executor_result
+        {
+            Some(identity) => connection
+                .query_row(
+                    "SELECT outcome,cumulative_effect_journal_digest,receipt,attempt
+                         FROM governed_executor_result
+                         WHERE issuance=?1 AND result_identity=?2",
+                    params![reservation.issuance, identity],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| format!("governed-reconciliation-source-executor-read:{error}"))?,
+            None => None,
+        };
+        match (
+            source_executor,
+            &source.latest_executor_outcome,
+            &source.latest_cumulative_journal,
+        ) {
+            (None, None, None) if source.status == "accepted" => {}
+            (
+                Some((outcome, cumulative, _receipt, attempt)),
+                Some(source_outcome),
+                Some(source_cumulative),
+            ) if attempt == reservation.attempt
+                && outcome == *source_outcome
+                && cumulative == *source_cumulative
+                && ((source.status == "indeterminate" && outcome == "indeterminate")
+                    || (source.status == "settled"
+                        && matches!(outcome.as_str(), "success" | "failure"))) => {}
+            _ => return Err("governed-reconciliation-source-executor-substitution".to_owned()),
+        }
+
+        match (
+            &reservation.predecessor_round,
+            &reservation.predecessor_reconciliation,
+        ) {
+            (None, None) => {
+                let earlier: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM governed_reconciliation_round
+                         WHERE issuance=?1 AND attempt=?2 AND rowid <
+                           (SELECT rowid FROM governed_reconciliation_round WHERE request=?3)",
+                        params![
+                            reservation.issuance,
+                            reservation.attempt,
+                            reservation.request
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        format!("governed-reconciliation-source-first-round:{error}")
+                    })?;
+                if earlier != 0 {
+                    return Err("governed-reconciliation-source-predecessor-gap".to_owned());
+                }
+            }
+            (Some(round), Some(reconciliation)) => {
+                let predecessor: Option<(String, String, String, String, String, String)> =
+                    connection
+                        .query_row(
+                            "SELECT issuance,attempt,result_kind,result_identity,
+                                    result_reconciliation,result_evidence
+                             FROM governed_reconciliation_round
+                             WHERE round=?1 AND state='completed'",
+                            [round],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("governed-reconciliation-source-predecessor-read:{error}")
+                        })?;
+                let Some((issuance, attempt, kind, result, stored_reconciliation, evidence)) =
+                    predecessor
+                else {
+                    return Err("governed-reconciliation-source-predecessor-missing".to_owned());
+                };
+                if issuance != reservation.issuance
+                    || attempt != reservation.attempt
+                    || kind != "indeterminate"
+                    || result != *reconciliation
+                    || stored_reconciliation != *reconciliation
+                {
+                    return Err(
+                        "governed-reconciliation-source-predecessor-substitution".to_owned()
+                    );
+                }
+                let immediate: Option<String> = connection
+                    .query_row(
+                        "SELECT round FROM governed_reconciliation_round
+                         WHERE issuance=?1 AND attempt=?2 AND state='completed'
+                           AND rowid < (SELECT rowid FROM governed_reconciliation_round WHERE request=?3)
+                         ORDER BY rowid DESC LIMIT 1",
+                        params![reservation.issuance, reservation.attempt, reservation.request],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        format!("governed-reconciliation-source-immediate-predecessor:{error}")
+                    })?;
+                // The predecessor's indeterminate observation must remain
+                // durable, but it need not remain the latest executor row: an
+                // independently running initial dispatch may have advanced the
+                // same attempt after that explicit round completed.
+                let predecessor_receipt: Option<String> = connection
+                    .query_row(
+                        "SELECT receipt FROM governed_executor_result
+                         WHERE issuance=?1 AND attempt=?2 AND receipt=?3
+                           AND outcome='indeterminate'",
+                        params![reservation.issuance, reservation.attempt, evidence],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("governed-reconciliation-source-receipt:{error}"))?;
+                if immediate.as_deref() != Some(round.as_str())
+                    || predecessor_receipt.as_deref() != Some(evidence.as_str())
+                {
+                    return Err("governed-reconciliation-source-predecessor-gap".to_owned());
+                }
+            }
+            _ => return Err("governed-reconciliation-source-predecessor-shape".to_owned()),
+        }
+
+        if round_state == "claimed" {
+            let current = Self::reconciliation_source_cut(connection, record)?;
+            Self::classify_reconciliation_source_advance(
+                connection,
+                record,
+                reservation,
+                &source,
+                &current,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn claim_reconciliation_round(
+        &mut self,
+        envelope: &SignedReconciliationRoundRequestEnvelopeWireV1,
+        request: &ReconciliationRoundRequestWireV1,
+        record: &CustodyRecordV1,
+        expected_executor: &ExecutorBindingV1,
+        claimed_at: u64,
+    ) -> Result<ReconciliationRoundClaimV1, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("governed-reconciliation-claim-transaction:{error}"))?;
+        if let Some(existing_request) = transaction
+            .query_row(
+                "SELECT request FROM governed_reconciliation_round WHERE request=?1",
+                [&request.request],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-claim-read:{error}"))?
+        {
+            transaction
+                .commit()
+                .map_err(|error| format!("governed-reconciliation-claim-commit:{error}"))?;
+            let existing = self
+                .read_reconciliation_round(&existing_request)?
+                .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+            if existing.signed_body_b64 != envelope.body_b64
+                || existing.authentication != envelope.authentication
+            {
+                return Err("governed-reconciliation-request-replay-collision".to_owned());
+            }
+            return Ok(ReconciliationRoundClaimV1::Existing(Box::new(existing)));
+        }
+        if transaction
+            .query_row(
+                "SELECT request FROM governed_reconciliation_round
+                 WHERE issuance=?1 AND attempt=?2 AND state='claimed' LIMIT 1",
+                params![request.issuance, request.attempt],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-outstanding-read:{error}"))?
+            .is_some()
+        {
+            return Err("governed-reconciliation-outstanding-round-unresolved".to_owned());
+        }
+        let current: (String, String, String, String, String, String, String) = transaction
+            .query_row(
+                "SELECT attempt,status,executor_binding,executor_marker,
+                        issuer_principal,signer_key_id,signer_public_key
+                 FROM governed_loop_attempt WHERE issuance=?1",
+                [&request.issuance],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("governed-reconciliation-current-read:{error}"))?;
+        if current.0 != request.attempt || current.0 != record.custody.attempt {
+            return Err("governed-reconciliation-attempt-substitution".to_owned());
+        }
+        if !matches!(current.1.as_str(), "accepted" | "indeterminate" | "settled") {
+            return Err("governed-reconciliation-terminal-attempt".to_owned());
+        }
+        if current.2 != expected_executor.identity || current.3 != record.custody.executor_marker {
+            return Err("governed-reconciliation-executor-binding-substitution".to_owned());
+        }
+        if current.4 != envelope.authentication.issuer_principal
+            || current.5 != envelope.authentication.signer_key_id
+            || current.6 != envelope.authentication.signer_public_key
+        {
+            return Err("governed-reconciliation-issuance-issuer-substitution".to_owned());
+        }
+        let mut current_record = record.clone();
+        current_record.status = current.1;
+        let source_cut = Self::reconciliation_source_cut(&transaction, &current_record)?;
+        let latest_completed: Option<(String, String, Option<String>)> = transaction
+            .query_row(
+                "SELECT round,result_kind,result_reconciliation
+                 FROM governed_reconciliation_round
+                 WHERE issuance=?1 AND attempt=?2 AND state='completed'
+                 ORDER BY rowid DESC LIMIT 1",
+                params![request.issuance, request.attempt],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("governed-reconciliation-predecessor-read:{error}"))?;
+        if source_cut.terminal_result.is_some() {
+            match (
+                latest_completed,
+                &request.predecessor_round,
+                &request.predecessor_reconciliation,
+            ) {
+                (None, None, None) => {}
+                (
+                    Some((round, kind, Some(reconciliation))),
+                    Some(request_round),
+                    Some(request_result),
+                ) if kind == "indeterminate"
+                    && round == *request_round
+                    && reconciliation == *request_result => {}
+                (Some((_round, kind, _)), _, _) if kind != "indeterminate" => {
+                    return Err("governed-reconciliation-new-round-after-terminal".to_owned())
+                }
+                _ => return Err("governed-reconciliation-predecessor-substitution".to_owned()),
+            }
+        } else {
+            match (
+                latest_completed,
+                &request.predecessor_round,
+                &request.predecessor_reconciliation,
+            ) {
+                (None, None, None) => {}
+                (
+                    Some((round, kind, Some(reconciliation))),
+                    Some(request_round),
+                    Some(request_result),
+                ) if kind == "indeterminate"
+                    && round == *request_round
+                    && reconciliation == *request_result => {}
+                (Some((_round, kind, _)), _, _) if kind != "indeterminate" => {
+                    return Err("governed-reconciliation-predecessor-terminal".to_owned())
+                }
+                _ => return Err("governed-reconciliation-predecessor-substitution".to_owned()),
+            }
+        }
+        let checkpoint_identity = starting_checkpoint_identity(&record.issuance)?;
+        let mut reservation = ReconciliationRoundReservationWireV1 {
+            schema: RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1.to_owned(),
+            reservation: String::new(),
+            request: request.request.clone(),
+            round: request.round.clone(),
+            issuance: request.issuance.clone(),
+            attempt: request.attempt.clone(),
+            caller_state_digest: request.caller_state_digest.clone(),
+            predecessor_round: request.predecessor_round.clone(),
+            predecessor_reconciliation: request.predecessor_reconciliation.clone(),
+            source_cut: source_cut.identity,
+            checkpoint_identity,
+            executor_binding: expected_executor.identity.clone(),
+            claimed_at_unix_ms: claimed_at,
+        };
+        reservation.reservation = reservation_identity(&reservation)?;
+        let terminal_completion = source_cut
+            .terminal_result
+            .as_ref()
+            .map(|(_, result_identity)| {
+                let mut completion = ReconciliationRoundCompletionWireV1 {
+                    schema: RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+                    completion: String::new(),
+                    reservation: reservation.reservation.clone(),
+                    round: reservation.round.clone(),
+                    result_identity: result_identity.clone(),
+                    completed_at_unix_ms: claimed_at,
+                };
+                completion.completion = completion_identity(&completion)?;
+                Ok::<_, String>(completion)
+            })
+            .transpose()?;
+        transaction
+            .execute(
+                "INSERT INTO governed_reconciliation_round
+                 (request,round,issuance,attempt,caller_state_digest,idempotency,
+                  predecessor_round,predecessor_reconciliation,source_cut,source_cut_jcs,checkpoint_identity,
+                  executor_binding,reservation,signed_body_b64,issuer_principal,signer_key_id,
+                  signer_public_key,signature,claimed_at,state,completion,result_kind,result_identity,completed_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,
+                         ?20,?21,?22,?23,?24)",
+                params![
+                    request.request,
+                    request.round,
+                    request.issuance,
+                    request.attempt,
+                    request.caller_state_digest,
+                    request.idempotency,
+                    request.predecessor_round,
+                    request.predecessor_reconciliation,
+                    reservation.source_cut,
+                    source_cut.canonical_bytes,
+                    reservation.checkpoint_identity,
+                    expected_executor.identity,
+                    reservation.reservation,
+                    envelope.body_b64,
+                    envelope.authentication.issuer_principal,
+                    envelope.authentication.signer_key_id,
+                    envelope.authentication.signer_public_key,
+                    envelope.authentication.signature,
+                    u64_to_i64(claimed_at)?,
+                    if terminal_completion.is_some() { "completed" } else { "claimed" },
+                    terminal_completion.as_ref().map(|value| &value.completion),
+                    source_cut.terminal_result.as_ref().map(|value| &value.0),
+                    source_cut.terminal_result.as_ref().map(|value| &value.1),
+                    terminal_completion
+                        .as_ref()
+                        .map(|_| u64_to_i64(claimed_at))
+                        .transpose()?,
+                ],
+            )
+            .map_err(|error| format!("governed-reconciliation-claim-write:{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-claim-commit:{error}"))?;
+        if terminal_completion.is_some() {
+            let completed = self
+                .read_reconciliation_round(&request.request)?
+                .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+            Ok(ReconciliationRoundClaimV1::Existing(Box::new(completed)))
+        } else {
+            Ok(ReconciliationRoundClaimV1::Winner(Box::new(reservation)))
+        }
+    }
+
+    fn complete_reconciliation_round(
+        &mut self,
+        request: &ReconciliationRoundRequestWireV1,
+        reservation: &ReconciliationRoundReservationWireV1,
+        record: &CustodyRecordV1,
+        outcome: ExecutorOutcomeWireV1,
+        completed_at: u64,
+    ) -> Result<DocketReconciliationWireV1, String> {
+        if outcome.attempt != record.custody.attempt
+            || outcome.marker != record.custody.executor_marker
+        {
+            return Err("governed-reconciliation-executor-result-binding".to_owned());
+        }
+        governed_repair::validate_effect_journal_for_issuance(
+            &record.issuance.effect_scope,
+            &outcome.effect_journal,
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("governed-reconciliation-completion-transaction:{error}"))?;
+        let round_state: (String, String, String, String, Vec<u8>) = transaction
+            .query_row(
+                "SELECT state,reservation,source_cut,executor_binding,source_cut_jcs
+                 FROM governed_reconciliation_round WHERE request=?1 AND round=?2",
+                params![request.request, request.round],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("governed-reconciliation-completion-claim:{error}"))?;
+        if round_state.0 != "claimed"
+            || round_state.1.as_str() != reservation.reservation
+            || round_state.2.as_str() != reservation.source_cut
+            || round_state.3.as_str() != reservation.executor_binding
+        {
+            return Err("governed-reconciliation-completion-claim-substitution".to_owned());
+        }
+        let current_status: String = transaction
+            .query_row(
+                "SELECT status FROM governed_loop_attempt
+                 WHERE issuance=?1 AND attempt=?2 AND executor_binding=?3",
+                params![
+                    request.issuance,
+                    request.attempt,
+                    reservation.executor_binding
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("governed-reconciliation-completion-current:{error}"))?;
+        let mut current_record = record.clone();
+        current_record.status = current_status;
+        let current_source = Self::reconciliation_source_cut(&transaction, &current_record)?;
+        if current_source.identity != reservation.source_cut {
+            let source: ReconciliationSourceCutWireV1 =
+                strict_json(&round_state.4, "stored-reconciliation-source-cut")?;
+            let result = match Self::classify_reconciliation_source_advance(
+                &transaction,
+                &current_record,
+                reservation,
+                &source,
+                &current_source,
+            )? {
+                ReconciliationSourceAdvanceV1::Unchanged => {
+                    return Err("governed-reconciliation-completion-source-cut-stale".to_owned())
+                }
+                ReconciliationSourceAdvanceV1::Monotone(result) => result,
+            };
+            // The raced executor response is no longer allowed to extend the
+            // durable attempt. It must nevertheless be consistent with the
+            // effects already recorded at the independently durable cut.
+            governed_repair::require_reported_journal_already_durable(
+                &transaction,
+                &request.issuance,
+                &request.attempt,
+                &record.issuance.effect_scope,
+                &outcome.effect_journal,
+            )?;
+            Self::complete_claimed_round_row(&transaction, reservation, &result, completed_at)?;
+            transaction
+                .commit()
+                .map_err(|error| format!("governed-reconciliation-completion-commit:{error}"))?;
+            let completed = self
+                .read_reconciliation_round(&request.request)?
+                .ok_or_else(|| "governed-reconciliation-round-disappeared".to_owned())?;
+            let response = self.reconciliation_round_response(completed)?;
+            let DocketReconciliationRoundStateWireV1::Completed { response, .. } = response.state
+            else {
+                return Err("governed-reconciliation-local-completion-missing".to_owned());
+            };
+            return Ok(*response);
+        }
+
+        let (result_kind, result_identity, result_reconciliation, result_evidence, response) =
+            match (&outcome.outcome, &outcome.governed_repair) {
+                (
+                    ExecutorOutcomeClassWireV1::ScopeExpansionRequired,
+                    Some(ExecutorGovernedRepairRequirementWireV1::ScopeExpansionRequired {
+                        ..
+                    }),
+                )
+                | (
+                    ExecutorOutcomeClassWireV1::ReadjudicationRequired,
+                    Some(ExecutorGovernedRepairRequirementWireV1::ReadjudicationRequired {
+                        ..
+                    }),
+                ) => {
+                    let result = governed_repair::seal_requirement_in_transaction(
+                        &transaction,
+                        governed_repair::SealRequirementInputV1 {
+                            issuance: &record.issuance,
+                            custody: &record.custody,
+                            executor_binding: &record.executor_binding,
+                            executor_receipt: &outcome.receipt,
+                            draft: outcome
+                                .governed_repair
+                                .clone()
+                                .ok_or_else(|| "governed-repair-requirement-missing".to_owned())?,
+                            journal: &outcome.effect_journal,
+                            immutable_work_checkpoint: outcome.immutable_work_checkpoint.as_ref(),
+                            now_unix_ms: completed_at,
+                        },
+                    )?;
+                    require_result_custody(&result, &record.custody)?;
+                    (
+                        "governed_repair".to_owned(),
+                        result.sealed_result.clone(),
+                        None,
+                        None,
+                        DocketReconciliationWireV1::GovernedRepairRequired {
+                            custody: record.custody.clone(),
+                            result: Box::new(result),
+                        },
+                    )
+                }
+                (
+                    ExecutorOutcomeClassWireV1::ScopeExpansionRequired
+                    | ExecutorOutcomeClassWireV1::ReadjudicationRequired,
+                    _,
+                )
+                | (
+                    ExecutorOutcomeClassWireV1::Success
+                    | ExecutorOutcomeClassWireV1::Failure
+                    | ExecutorOutcomeClassWireV1::Indeterminate,
+                    Some(_),
+                ) => return Err("governed-repair-outcome-shape".to_owned()),
+                (
+                    ExecutorOutcomeClassWireV1::Success | ExecutorOutcomeClassWireV1::Failure,
+                    None,
+                ) => {
+                    require_digest(&outcome.receipt, "executor receipt")?;
+                    let known = if outcome.outcome == ExecutorOutcomeClassWireV1::Success {
+                        "success"
+                    } else {
+                        "failure"
+                    };
+                    governed_repair::append_ordinary_executor_result(
+                        &transaction,
+                        governed_repair::OrdinaryExecutorResultInputV1 {
+                            issuance: &request.issuance,
+                            attempt: &request.attempt,
+                            outcome: known,
+                            receipt: &outcome.receipt,
+                            scope: &record.issuance.effect_scope,
+                            entries: &outcome.effect_journal,
+                            recorded_at: completed_at,
+                        },
+                    )?;
+                    let cumulative_effect_journal_identity =
+                        governed_repair::latest_cumulative_effect_journal_identity(
+                            &transaction,
+                            &request.issuance,
+                            &request.attempt,
+                            &record.issuance.effect_scope,
+                        )?
+                        .ok_or_else(|| "governed-settlement-journal-missing".to_owned())?;
+                    let mut settlement = DocketSettlementWireV1 {
+                        schema: SETTLEMENT_SCHEMA_V1.to_owned(),
+                        settlement: String::new(),
+                        issuance: request.issuance.clone(),
+                        attempt: request.attempt.clone(),
+                        executor_marker: record.custody.executor_marker.clone(),
+                        receipt: outcome.receipt.clone(),
+                        outcome: if known == "success" {
+                            KnownOutcomeWireV1::Success
+                        } else {
+                            KnownOutcomeWireV1::Failure
+                        },
+                        cumulative_effect_journal_identity: cumulative_effect_journal_identity
+                            .clone(),
+                        settled_at_unix_ms: completed_at,
+                    };
+                    settlement.settlement = docket_settlement_identity(&settlement)?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE governed_loop_attempt
+                             SET status='settled',settlement=?1,receipt=?2,outcome=?3,settled_at=?4,
+                                 settlement_cumulative_effect_journal_identity=?5
+                             WHERE issuance=?6 AND attempt=?7 AND executor_marker=?8
+                               AND status IN ('accepted','indeterminate')
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM governed_repair_checkpoint
+                                 WHERE governed_repair_checkpoint.issuance=governed_loop_attempt.issuance
+                               )",
+                            params![
+                                settlement.settlement,
+                                outcome.receipt,
+                                known,
+                                u64_to_i64(completed_at)?,
+                                cumulative_effect_journal_identity,
+                                request.issuance,
+                                request.attempt,
+                                record.custody.executor_marker,
+                            ],
+                        )
+                        .map_err(|error| format!("governed-settlement-write:{error}"))?;
+                    if changed != 1 {
+                        return Err("governed-reconciliation-settlement-race".to_owned());
+                    }
+                    (
+                        "settled".to_owned(),
+                        settlement.settlement.clone(),
+                        None,
+                        None,
+                        DocketReconciliationWireV1::Settled {
+                            custody: record.custody.clone(),
+                            settlement,
+                        },
+                    )
+                }
+                (ExecutorOutcomeClassWireV1::Indeterminate, None) => {
+                    require_digest(&outcome.receipt, "indeterminate evidence")?;
+                    governed_repair::append_ordinary_executor_result(
+                        &transaction,
+                        governed_repair::OrdinaryExecutorResultInputV1 {
+                            issuance: &request.issuance,
+                            attempt: &request.attempt,
+                            outcome: "indeterminate",
+                            receipt: &outcome.receipt,
+                            scope: &record.issuance.effect_scope,
+                            entries: &outcome.effect_journal,
+                            recorded_at: completed_at,
+                        },
+                    )?;
+                    let reconciliation = hash_domain(
+                        "docket.governed-loop.reconciliation/v1",
+                        format!(
+                            "{}:{}:{}",
+                            request.issuance, request.attempt, outcome.receipt
+                        )
+                        .as_bytes(),
+                    );
+                    let changed = transaction
+                        .execute(
+                            "UPDATE governed_loop_attempt
+                             SET status='indeterminate',reconciliation=?1,indeterminate_evidence=?2
+                             WHERE issuance=?3 AND attempt=?4 AND executor_marker=?5
+                               AND status IN ('accepted','indeterminate')
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM governed_repair_checkpoint
+                                 WHERE governed_repair_checkpoint.issuance=governed_loop_attempt.issuance
+                               )",
+                            params![
+                                reconciliation,
+                                outcome.receipt,
+                                request.issuance,
+                                request.attempt,
+                                record.custody.executor_marker,
+                            ],
+                        )
+                        .map_err(|error| format!("governed-indeterminate-write:{error}"))?;
+                    if changed != 1 {
+                        return Err("governed-reconciliation-indeterminate-race".to_owned());
+                    }
+                    let indeterminate = IndeterminateOutcomeWireV1 {
+                        issuance: request.issuance.clone(),
+                        attempt: request.attempt.clone(),
+                        reconciliation: reconciliation.clone(),
+                        evidence: outcome.receipt.clone(),
+                    };
+                    (
+                        "indeterminate".to_owned(),
+                        reconciliation.clone(),
+                        Some(reconciliation),
+                        Some(outcome.receipt.clone()),
+                        DocketReconciliationWireV1::Indeterminate {
+                            custody: record.custody.clone(),
+                            indeterminate,
+                        },
+                    )
+                }
+            };
+        #[cfg(test)]
+        if ABORT_ROUND_COMPLETION_BEFORE_ROUND_ROW.with(|failpoint| failpoint.replace(false)) {
+            return Err("injected round completion failure".to_owned());
+        }
+        let mut completion = ReconciliationRoundCompletionWireV1 {
+            schema: RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+            completion: String::new(),
+            reservation: reservation.reservation.clone(),
+            round: reservation.round.clone(),
+            result_identity: result_identity.clone(),
+            completed_at_unix_ms: completed_at,
+        };
+        completion.completion = completion_identity(&completion)?;
+        let changed = transaction
+            .execute(
+                "UPDATE governed_reconciliation_round
+                 SET state='completed',completion=?1,result_kind=?2,result_identity=?3,
+                     result_reconciliation=?4,result_evidence=?5,completed_at=?6
+                 WHERE request=?7 AND round=?8 AND reservation=?9 AND state='claimed'",
+                params![
+                    completion.completion,
+                    result_kind,
+                    result_identity,
+                    result_reconciliation,
+                    result_evidence,
+                    u64_to_i64(completed_at)?,
+                    request.request,
+                    request.round,
+                    reservation.reservation,
+                ],
+            )
+            .map_err(|error| format!("governed-reconciliation-completion-write:{error}"))?;
+        if changed != 1 {
+            return Err("governed-reconciliation-completion-race".to_owned());
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("governed-reconciliation-completion-commit:{error}"))?;
+        Ok(response)
+    }
+
+    fn reconciliation_round_response(
+        &mut self,
+        round: ReconciliationRoundRecordV1,
+    ) -> Result<DocketReconciliationRoundResponseWireV1, String> {
+        let request = round.reservation.request.clone();
+        let round_identity = round.reservation.round.clone();
+        let result = if round.state == "claimed" {
+            if round.completion.is_some() || round.result_kind.is_some() {
+                return Err("governed-reconciliation-claimed-result-corrupt".to_owned());
+            }
+            DocketReconciliationRoundStateWireV1::Unresolved(round.reservation)
+        } else if round.state == "completed" {
+            let completion = round
+                .completion
+                .ok_or_else(|| "governed-reconciliation-completion-missing".to_owned())?;
+            let custody_record = self
+                .get(&round.reservation.issuance)?
+                .ok_or_else(|| "governed-reconciliation-custody-missing".to_owned())?;
+            let response = match round.result_kind.as_deref() {
+                Some("indeterminate") => {
+                    let reconciliation = round.result_reconciliation.ok_or_else(|| {
+                        "governed-reconciliation-historical-reconciliation-missing".to_owned()
+                    })?;
+                    let evidence = round.result_evidence.ok_or_else(|| {
+                        "governed-reconciliation-historical-evidence-missing".to_owned()
+                    })?;
+                    let stored: Option<(String, String, String)> = self
+                        .connection
+                        .query_row(
+                            "SELECT result_identity,outcome,receipt FROM governed_executor_result
+                             WHERE issuance=?1 AND attempt=?2 AND receipt=?3",
+                            params![
+                                round.reservation.issuance,
+                                round.reservation.attempt,
+                                evidence,
+                            ],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("governed-reconciliation-historical-result:{error}")
+                        })?;
+                    if !matches!(stored, Some((_, ref outcome, ref receipt))
+                        if outcome == "indeterminate" && receipt == &evidence)
+                        || reconciliation
+                            != hash_domain(
+                                "docket.governed-loop.reconciliation/v1",
+                                format!(
+                                    "{}:{}:{}",
+                                    round.reservation.issuance, round.reservation.attempt, evidence
+                                )
+                                .as_bytes(),
+                            )
+                        || completion.result_identity != reconciliation
+                    {
+                        return Err(
+                            "governed-reconciliation-historical-result-substitution".to_owned()
+                        );
+                    }
+                    DocketReconciliationWireV1::Indeterminate {
+                        custody: custody_record.custody,
+                        indeterminate: IndeterminateOutcomeWireV1 {
+                            issuance: round.reservation.issuance.clone(),
+                            attempt: round.reservation.attempt.clone(),
+                            reconciliation,
+                            evidence,
+                        },
+                    }
+                }
+                Some("settled") => {
+                    let settlement = custody_record
+                        .settlement
+                        .ok_or_else(|| "governed-settlement-columns-missing".to_owned())?;
+                    if settlement.settlement != completion.result_identity {
+                        return Err("governed-reconciliation-settlement-substitution".to_owned());
+                    }
+                    DocketReconciliationWireV1::Settled {
+                        custody: custody_record.custody,
+                        settlement,
+                    }
+                }
+                Some("governed_repair") => {
+                    let sealed = governed_repair::read_sealed_result(
+                        &self.connection,
+                        &round.reservation.issuance,
+                    )?
+                    .ok_or_else(|| "governed-repair-checkpoint-disappeared".to_owned())?;
+                    if sealed.sealed_result != completion.result_identity {
+                        return Err(
+                            "governed-reconciliation-governed-result-substitution".to_owned()
+                        );
+                    }
+                    require_result_custody(&sealed, &custody_record.custody)?;
+                    DocketReconciliationWireV1::GovernedRepairRequired {
+                        custody: custody_record.custody,
+                        result: Box::new(sealed),
+                    }
+                }
+                _ => return Err("governed-reconciliation-result-kind-corrupt".to_owned()),
+            };
+            DocketReconciliationRoundStateWireV1::Completed {
+                reservation: round.reservation,
+                completion,
+                response: Box::new(response),
+            }
+        } else {
+            return Err("governed-reconciliation-round-state-corrupt".to_owned());
+        };
+        Ok(DocketReconciliationRoundResponseWireV1 {
+            schema: RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+            request,
+            round: round_identity,
+            state: result,
+        })
     }
 
     fn refuse(
@@ -2563,21 +4676,7 @@ fn prepare_executor(
     expected_plan: &str,
 ) -> Result<PreparedExecutorV1, String> {
     require_digest(expected_plan, "executor plan")?;
-    if !program.is_absolute() || !config.is_absolute() {
-        return Err("governed-executor-path-not-absolute".to_owned());
-    }
-    // Preserve the existing UTF-8 path refusal even though the retained launch
-    // exposes only descriptor locators to the child.
-    let _ = config
-        .to_str()
-        .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
-    let program_bytes =
-        read_exact_regular_file(program, MAX_EXECUTOR_PROGRAM_BYTES, "executor", true)?;
-    let config_bytes =
-        read_exact_regular_file(config, MAX_EXECUTOR_CONFIG_BYTES, "executor-config", false)?;
-    let program_digest = hash_domain("docket.governed-loop.executor-program/v1", &program_bytes);
-    let config_digest = hash_domain("docket.governed-loop.executor-config/v1", &config_bytes);
-    let retained = materialize_executor_snapshot(program, &program_bytes, &config_bytes)?;
+    let (retained, program_digest, config_digest) = retain_executor(program, config)?;
     let plan = invoke_plan_id(&retained)?;
     if plan != expected_plan {
         return Err("governed-executor-plan-substitution".to_owned());
@@ -2597,6 +4696,56 @@ fn prepare_executor(
             plan,
         },
     })
+}
+
+fn retain_bound_executor(
+    program: &Path,
+    config: &Path,
+    expected: &ExecutorBindingV1,
+) -> Result<RetainedExecutorV1, String> {
+    require_digest(&expected.identity, "executor binding")?;
+    require_digest(&expected.program_digest, "executor program")?;
+    require_digest(&expected.config_digest, "executor config")?;
+    require_digest(&expected.plan, "executor plan")?;
+    let (retained, program_digest, config_digest) = retain_executor(program, config)?;
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "config_digest": config_digest,
+        "plan": expected.plan,
+        "program_digest": program_digest,
+    }))
+    .map_err(|error| format!("governed-executor-binding-canonical:{error}"))?;
+    let observed = ExecutorBindingV1 {
+        identity: hash_domain("docket.governed-loop.executor-binding/v1", &canonical),
+        program_digest,
+        config_digest,
+        plan: expected.plan.clone(),
+    };
+    if &observed != expected {
+        return Err("governed-executor-binding-substitution".to_owned());
+    }
+    Ok(retained)
+}
+
+fn retain_executor(
+    program: &Path,
+    config: &Path,
+) -> Result<(RetainedExecutorV1, String, String), String> {
+    if !program.is_absolute() || !config.is_absolute() {
+        return Err("governed-executor-path-not-absolute".to_owned());
+    }
+    // Preserve the existing UTF-8 path refusal even though the retained launch
+    // exposes only descriptor locators to the child.
+    let _ = config
+        .to_str()
+        .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
+    let program_bytes =
+        read_exact_regular_file(program, MAX_EXECUTOR_PROGRAM_BYTES, "executor", true)?;
+    let config_bytes =
+        read_exact_regular_file(config, MAX_EXECUTOR_CONFIG_BYTES, "executor-config", false)?;
+    let program_digest = hash_domain("docket.governed-loop.executor-program/v1", &program_bytes);
+    let config_digest = hash_domain("docket.governed-loop.executor-config/v1", &config_bytes);
+    let retained = materialize_executor_snapshot(program, &program_bytes, &config_bytes)?;
+    Ok((retained, program_digest, config_digest))
 }
 
 fn read_exact_regular_file(
@@ -2752,7 +4901,8 @@ fn invoke_retained_json<I: Serialize + ?Sized, O: DeserializeOwned>(
     operation: &str,
     input: &I,
 ) -> Result<O, String> {
-    let bytes = serde_json::to_vec(input).map_err(|error| format!("process-request:{error}"))?;
+    let bytes =
+        serde_jcs::to_vec(input).map_err(|error| format!("process-request-canonical:{error}"))?;
     let mut child = executor
         .command(operation)
         .stdin(Stdio::piped())
@@ -2961,6 +5111,8 @@ mod tests {
         include_bytes!("../../../conformance/governed-repair-r2/wire-hostiles.v1.json");
     const R2_WIRE_VECTORS: &[u8] =
         include_bytes!("../../../conformance/governed-repair-r2/wire-vectors.v1.json");
+    const R5_RECONCILIATION_ROUNDS: &[u8] =
+        include_bytes!("../../../conformance/governed-repair-r2/reconciliation-rounds.v1.json");
 
     fn raw_sha256(bytes: &[u8]) -> String {
         format!("sha256:{}", lower_hex(&Sha256::digest(bytes)))
@@ -2978,7 +5130,7 @@ mod tests {
     fn r2_shared_contract_corpus_has_exact_pinned_bytes() {
         assert_pinned_canonical_corpus(
             R2_MANIFEST,
-            "sha256:b71a2e7a9a606c7209f95522c20c2ae221c99a5dbebc6a6eba3d303b738b97ae",
+            "sha256:74c429d8d32341fc31fba45e4cdd1a0b6d994bace4c7d4d8ccfccfc9dad8aded",
         );
         assert_pinned_canonical_corpus(
             R2_CONTRACT,
@@ -2999,6 +5151,10 @@ mod tests {
         assert_pinned_canonical_corpus(
             R2_WIRE_VECTORS,
             "sha256:ff75b856fd1a3076809d26f40d987b114046226aa15e7eeeb46db3388f36ea90",
+        );
+        assert_pinned_canonical_corpus(
+            R5_RECONCILIATION_ROUNDS,
+            "sha256:408a2fe3ddf75621c43da441cbdcd33c7fe0845abadd9b02adc72038d01496fc",
         );
     }
 
@@ -3339,6 +5495,1451 @@ mod tests {
                 signature: b64_encode(key.sign(&signed).as_ref()),
             },
         })
+    }
+
+    fn signed_round(
+        fixture: &Fixture,
+        idempotency_label: &str,
+        predecessor: Option<(&str, &str)>,
+    ) -> (Vec<u8>, ReconciliationRoundRequestWireV1) {
+        let key = Ed25519KeyPair::from_pkcs8(&fixture.signing_key_pkcs8).unwrap();
+        let mut request = ReconciliationRoundRequestWireV1 {
+            schema: RECONCILIATION_ROUND_REQUEST_SCHEMA_V1.to_owned(),
+            request: String::new(),
+            round: String::new(),
+            issuance: fixture.issuance.issuance.clone(),
+            attempt: fixture.custody.attempt.clone(),
+            caller_state_digest: digest(&format!("caller-state-{idempotency_label}")),
+            predecessor_round: predecessor.map(|value| value.0.to_owned()),
+            predecessor_reconciliation: predecessor.map(|value| value.1.to_owned()),
+            idempotency: digest(idempotency_label),
+        };
+        let round_basis = ReconciliationRoundIdentityBasisV1 {
+            schema: &request.schema,
+            issuance: &request.issuance,
+            attempt: &request.attempt,
+            caller_state_digest: &request.caller_state_digest,
+            predecessor_round: request.predecessor_round.as_deref(),
+            predecessor_reconciliation: request.predecessor_reconciliation.as_deref(),
+            idempotency: &request.idempotency,
+        };
+        request.round = hash_domain(
+            "ag.governed-loop.reconciliation-round/v1",
+            &serde_jcs::to_vec(&round_basis).unwrap(),
+        );
+        let request_basis = ReconciliationRequestIdentityBasisV1 {
+            schema: &request.schema,
+            round: &request.round,
+            issuance: &request.issuance,
+            attempt: &request.attempt,
+            caller_state_digest: &request.caller_state_digest,
+            predecessor_round: request.predecessor_round.as_deref(),
+            predecessor_reconciliation: request.predecessor_reconciliation.as_deref(),
+            idempotency: &request.idempotency,
+        };
+        request.request = hash_domain(
+            "ag.governed-loop.reconciliation-round-request/v1",
+            &serde_jcs::to_vec(&request_basis).unwrap(),
+        );
+        let body = canonical_json(&request);
+        let mut signed = RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.to_vec();
+        signed.extend_from_slice(&body);
+        (
+            canonical_json(&SignedReconciliationRoundRequestEnvelopeWireV1 {
+                schema: SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1.to_owned(),
+                body_b64: b64_encode(&body),
+                authentication: IssuanceAuthenticationWireV1 {
+                    issuer_principal: "ag.test".to_owned(),
+                    signer_key_id: "ag-test-key".to_owned(),
+                    signer_public_key: b64_encode(key.public_key().as_ref()),
+                    signature: b64_encode(key.sign(&signed).as_ref()),
+                },
+            }),
+            request,
+        )
+    }
+
+    /// Corrupts one immutable round row while restoring the byte-exact
+    /// production trigger before any Store reopen.  The exact schema census
+    /// is a separate, earlier production gate; these fixtures intentionally
+    /// exercise the row decoder that follows it, rather than weakening that
+    /// gate and accidentally testing only its (correct) early refusal.
+    fn mutate_immutable_round_fixture(connection: &Connection, mutation: impl FnOnce(&Connection)) {
+        let trigger_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='trigger'
+                   AND name='governed_reconciliation_round_identity_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER governed_reconciliation_round_identity_immutable;")
+            .unwrap();
+        mutation(connection);
+        connection.execute_batch(&trigger_sql).unwrap();
+        let restored_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type='trigger'
+                   AND name='governed_reconciliation_round_identity_immutable'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_sql, trigger_sql);
+    }
+
+    #[test]
+    fn authenticated_rounds_are_single_flight_and_historical_replay_is_exact() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let first_receipt = digest("explicit-round-one");
+        write_executor_response(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: first_receipt.clone(),
+                outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let (round_one_bytes, round_one) = signed_round(&fixture, "round-one", None);
+        let first = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &round_one_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        let DocketReconciliationRoundStateWireV1::Completed { response, .. } = &first.state else {
+            panic!("first explicit round must complete indeterminate")
+        };
+        let DocketReconciliationWireV1::Indeterminate {
+            indeterminate: first_indeterminate,
+            ..
+        } = response.as_ref()
+        else {
+            panic!("first explicit round must complete indeterminate")
+        };
+        assert_eq!(first_indeterminate.evidence, first_receipt);
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"x"
+        );
+
+        // Exact duplicate delivery returns the completed durable round and
+        // never crosses the executor boundary a second time.
+        assert_eq!(
+            reconcile_signed_round_with_checkpoint_verifier(
+                &fixture.database,
+                &round_one_bytes,
+                &fixture.trust,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                None,
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"x"
+        );
+
+        let second_receipt = digest("explicit-round-two");
+        write_executor_response(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: second_receipt,
+                outcome: ExecutorOutcomeClassWireV1::Success,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let (round_two_bytes, _) = signed_round(
+            &fixture,
+            "round-two",
+            Some((&round_one.round, &first_indeterminate.reconciliation)),
+        );
+        let second = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &round_two_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        let DocketReconciliationRoundStateWireV1::Completed { response, .. } = &second.state else {
+            panic!("second explicit round must complete")
+        };
+        assert!(matches!(
+            response.as_ref(),
+            DocketReconciliationWireV1::Settled { .. }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"xx"
+        );
+
+        // Later global terminal state cannot rewrite the exact response of an
+        // earlier round.
+        let historical = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &round_one_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(historical, first);
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"xx"
+        );
+    }
+
+    #[test]
+    fn first_round_observes_preexisting_terminal_result_without_executor_reinvocation() {
+        for outcome in [
+            ExecutorOutcomeClassWireV1::Success,
+            ExecutorOutcomeClassWireV1::ScopeExpansionRequired,
+        ] {
+            let fixture = fixture(outcome);
+            if outcome == ExecutorOutcomeClassWireV1::ScopeExpansionRequired {
+                write_scope_expansion_executor(&fixture.executor_program, &fixture.custody);
+            }
+            let initial = accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap();
+            assert!(matches!(
+                (&outcome, &initial),
+                (
+                    ExecutorOutcomeClassWireV1::Success,
+                    DocketExecutionResponseWireV1::Custody(_)
+                ) | (
+                    ExecutorOutcomeClassWireV1::ScopeExpansionRequired,
+                    DocketExecutionResponseWireV1::GovernedRepairRequired { .. }
+                )
+            ));
+
+            let (envelope, _request) = signed_round(&fixture, "terminal-observation", None);
+            let observed = reconcile_signed_round_with_checkpoint_verifier(
+                &fixture.database,
+                &envelope,
+                &fixture.trust,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                None,
+            )
+            .unwrap();
+            let DocketReconciliationRoundStateWireV1::Completed { response, .. } = &observed.state
+            else {
+                panic!("terminal observation must complete locally")
+            };
+            assert!(matches!(
+                (&outcome, response.as_ref()),
+                (
+                    ExecutorOutcomeClassWireV1::Success,
+                    DocketReconciliationWireV1::Settled { .. }
+                ) | (
+                    ExecutorOutcomeClassWireV1::ScopeExpansionRequired,
+                    DocketReconciliationWireV1::GovernedRepairRequired { .. }
+                )
+            ));
+            assert_eq!(
+                std::fs::read(fixture.executor_program.with_extension("reconciliations"))
+                    .unwrap_or_default(),
+                b"",
+                "local terminal observation must not invoke executor reconciliation"
+            );
+            assert_eq!(
+                reconcile_signed_round_with_checkpoint_verifier(
+                    &fixture.database,
+                    &envelope,
+                    &fixture.trust,
+                    &fixture.executor_program,
+                    &fixture.root.join("executor-config"),
+                    None,
+                )
+                .unwrap(),
+                observed
+            );
+            let (later, _) = signed_round(&fixture, "second-terminal-observation", None);
+            assert_eq!(
+                reconcile_signed_round_with_checkpoint_verifier(
+                    &fixture.database,
+                    &later,
+                    &fixture.trust,
+                    &fixture.executor_program,
+                    &fixture.root.join("executor-config"),
+                    None,
+                )
+                .unwrap_err(),
+                "governed-reconciliation-new-round-after-terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_round_resolves_from_concurrent_initial_indeterminate_without_reinvocation() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let initial_entry = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("mixed-initial-effect"),
+        };
+        let initial_receipt = digest("mixed-initial-indeterminate");
+        write_blocking_mixed_executor(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: initial_receipt.clone(),
+                outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                effect_journal: vec![initial_entry.clone()],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: digest("mixed-raced-round-response"),
+                outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                effect_journal: vec![initial_entry.clone()],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let database = fixture.database.clone();
+        let issuance = fixture.envelope.clone();
+        let trust = fixture.trust.clone();
+        let standing = fixture.standing_program.clone();
+        let executor = fixture.executor_program.clone();
+        let config = fixture.root.join("executor-config");
+        let initial = std::thread::spawn(move || {
+            accept(&database, &issuance, &trust, &standing, &executor, &config)
+        });
+        wait_for_test_path(&fixture.executor_program.with_extension("execute-started"));
+
+        let (round_bytes, _) = signed_round(&fixture, "mixed-initial-round", None);
+        let database = fixture.database.clone();
+        let trust = fixture.trust.clone();
+        let executor = fixture.executor_program.clone();
+        let config = fixture.root.join("executor-config");
+        let submitted_round = round_bytes.clone();
+        let round = std::thread::spawn(move || {
+            reconcile_signed_round_with_checkpoint_verifier(
+                &database,
+                &submitted_round,
+                &trust,
+                &executor,
+                &config,
+                None,
+            )
+        });
+        wait_for_test_path(&fixture.executor_program.with_extension("reconcile-started"));
+
+        std::fs::write(
+            fixture.executor_program.with_extension("execute-release"),
+            b"release",
+        )
+        .unwrap();
+        assert!(matches!(
+            initial.join().unwrap().unwrap(),
+            DocketExecutionResponseWireV1::Custody(_)
+        ));
+        std::fs::write(
+            fixture.executor_program.with_extension("reconcile-release"),
+            b"release",
+        )
+        .unwrap();
+        let resolved = round.join().unwrap().unwrap();
+        let DocketReconciliationRoundStateWireV1::Completed { response, .. } = &resolved.state
+        else {
+            panic!("monotone initial result must complete the claimed round locally")
+        };
+        let DocketReconciliationWireV1::Indeterminate { indeterminate, .. } = response.as_ref()
+        else {
+            panic!("initial indeterminate result must win the mixed-source race")
+        };
+        assert_eq!(indeterminate.evidence, initial_receipt);
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("execute-calls")).unwrap(),
+            b"x"
+        );
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconcile-calls")).unwrap(),
+            b"x"
+        );
+        assert_eq!(
+            reconcile_signed_round_with_checkpoint_verifier(
+                &fixture.database,
+                &round_bytes,
+                &fixture.trust,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                None,
+            )
+            .unwrap(),
+            resolved
+        );
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconcile-calls")).unwrap(),
+            b"x",
+            "completed replay must not invoke reconciliation again"
+        );
+        let durable = governed_repair::cumulative_effect_journal_with(
+            &Connection::open(&fixture.database).unwrap(),
+            &fixture.issuance.issuance,
+            &fixture.custody.attempt,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(durable, vec![initial_entry]);
+    }
+
+    #[test]
+    fn superseded_round_response_cannot_introduce_a_novel_effect() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (envelope_bytes, request) = signed_round(&fixture, "superseded-journal", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("fresh round replayed"),
+        };
+        let durable_entry = EffectJournalEntryWireV1 {
+            resource: "repository".to_owned(),
+            path: "crates/nq-store/src/lib.rs".to_owned(),
+            operation: CanonicalEffectOperationWireV1::Modify,
+            effect_identity: digest("durable-raced-effect"),
+        };
+        store
+            .record_indeterminate_with_journal(
+                &fixture.issuance.issuance,
+                &fixture.custody,
+                &digest("durable-raced-observation"),
+                &fixture.issuance.effect_scope,
+                std::slice::from_ref(&durable_entry),
+                8,
+            )
+            .unwrap();
+        let novel_entry = EffectJournalEntryWireV1 {
+            effect_identity: digest("novel-superseded-effect"),
+            ..durable_entry
+        };
+        let error = store
+            .complete_reconciliation_round(
+                &request,
+                &reservation,
+                &record,
+                ExecutorOutcomeWireV1 {
+                    attempt: fixture.custody.attempt.clone(),
+                    marker: fixture.custody.executor_marker.clone(),
+                    receipt: digest("superseded-response"),
+                    outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                    effect_journal: vec![novel_entry],
+                    immutable_work_checkpoint: None,
+                    governed_repair: None,
+                },
+                9,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "governed-reconciliation-superseded-effect-not-durable"
+        );
+        let state: String = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM governed_reconciliation_round WHERE request=?1",
+                [&request.request],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+    }
+
+    #[test]
+    fn completed_indeterminate_round_may_observe_one_later_initial_terminal_locally() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        write_blocking_mixed_executor(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: digest("mixed-initial-terminal"),
+                outcome: ExecutorOutcomeClassWireV1::Success,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: digest("mixed-round-indeterminate"),
+                outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let database = fixture.database.clone();
+        let issuance = fixture.envelope.clone();
+        let trust = fixture.trust.clone();
+        let standing = fixture.standing_program.clone();
+        let executor = fixture.executor_program.clone();
+        let config = fixture.root.join("executor-config");
+        let initial = std::thread::spawn(move || {
+            accept(&database, &issuance, &trust, &standing, &executor, &config)
+        });
+        wait_for_test_path(&fixture.executor_program.with_extension("execute-started"));
+
+        let (first_bytes, first_request) = signed_round(&fixture, "mixed-first-round", None);
+        let database = fixture.database.clone();
+        let trust = fixture.trust.clone();
+        let executor = fixture.executor_program.clone();
+        let config = fixture.root.join("executor-config");
+        let submitted = first_bytes.clone();
+        let first = std::thread::spawn(move || {
+            reconcile_signed_round_with_checkpoint_verifier(
+                &database, &submitted, &trust, &executor, &config, None,
+            )
+        });
+        wait_for_test_path(&fixture.executor_program.with_extension("reconcile-started"));
+        std::fs::write(
+            fixture.executor_program.with_extension("reconcile-release"),
+            b"release",
+        )
+        .unwrap();
+        let first = first.join().unwrap().unwrap();
+        let DocketReconciliationRoundStateWireV1::Completed { response, .. } = &first.state else {
+            panic!("first round must complete indeterminate")
+        };
+        let DocketReconciliationWireV1::Indeterminate { indeterminate, .. } = response.as_ref()
+        else {
+            panic!("first round must provide an indeterminate predecessor")
+        };
+
+        std::fs::write(
+            fixture.executor_program.with_extension("execute-release"),
+            b"release",
+        )
+        .unwrap();
+        assert!(matches!(
+            initial.join().unwrap().unwrap(),
+            DocketExecutionResponseWireV1::Custody(_)
+        ));
+        let (terminal_bytes, _) = signed_round(
+            &fixture,
+            "mixed-terminal-observation",
+            Some((&first_request.round, &indeterminate.reconciliation)),
+        );
+        let observed = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &terminal_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            observed.state,
+            DocketReconciliationRoundStateWireV1::Completed {
+                response,
+                ..
+            } if matches!(response.as_ref(), DocketReconciliationWireV1::Settled { .. })
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconcile-calls")).unwrap(),
+            b"x",
+            "predecessor-bound terminal observation is local"
+        );
+        let (illegal, _) = signed_round(&fixture, "mixed-third-round", None);
+        assert_eq!(
+            reconcile_signed_round_with_checkpoint_verifier(
+                &fixture.database,
+                &illegal,
+                &fixture.trust,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                None,
+            )
+            .unwrap_err(),
+            "governed-reconciliation-new-round-after-terminal"
+        );
+    }
+
+    #[test]
+    fn reconciliation_round_wire_refuses_null_partial_and_unknown_predecessors() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let (_, request) = signed_round(&fixture, "round-wire-hostile", None);
+        let mut null = serde_json::to_value(&request).unwrap();
+        null["predecessor_round"] = serde_json::Value::Null;
+        assert!(strict_json::<ReconciliationRoundRequestWireV1>(
+            &serde_jcs::to_vec(&null).unwrap(),
+            "round-explicit-null"
+        )
+        .is_err());
+        let mut partial = request.clone();
+        partial.predecessor_round = Some(digest("predecessor"));
+        assert_eq!(
+            validate_reconciliation_round_request(&partial).unwrap_err(),
+            "governed-reconciliation-round-predecessor-shape"
+        );
+        let mut unknown = serde_json::to_value(&request).unwrap();
+        unknown["ambient_retry"] = serde_json::Value::Bool(true);
+        assert!(strict_json::<ReconciliationRoundRequestWireV1>(
+            &serde_jcs::to_vec(&unknown).unwrap(),
+            "round-unknown-field"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn claimed_round_reopens_unresolved_without_executor_reinvocation() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (envelope_bytes, request) = signed_round(&fixture, "crashed-round", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let durable_indeterminate = record
+            .indeterminate
+            .as_ref()
+            .expect("fixture starts indeterminate")
+            .clone();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("fresh claim replayed"),
+        };
+        drop(store);
+        let reopened = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.state,
+            DocketReconciliationRoundStateWireV1::Unresolved(reservation)
+        );
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+
+        // An unresolved claim is not a predecessor permitting another poll.
+        let (next, _) = signed_round(&fixture, "illegal-later-round", None);
+        let error = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &next,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "governed-reconciliation-outstanding-round-unresolved"
+        );
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+
+        // If the independently running initial attempt later establishes a
+        // new exact indeterminate cut, reopen may complete this already
+        // claimed round locally. It still must not reacquire the executor.
+        let later_evidence = digest("later-durable-initial-observation");
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        store
+            .record_indeterminate_with_journal(
+                &fixture.issuance.issuance,
+                &fixture.custody,
+                &later_evidence,
+                &fixture.issuance.effect_scope,
+                &[],
+                8,
+            )
+            .unwrap();
+        drop(store);
+        let resolved = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        let DocketReconciliationRoundStateWireV1::Completed { response, .. } = resolved.state
+        else {
+            panic!("durable monotone source advance must resolve the claimed round")
+        };
+        assert!(matches!(
+            response.as_ref(),
+            DocketReconciliationWireV1::Indeterminate { indeterminate, .. }
+                if indeterminate == &durable_indeterminate
+        ));
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+    }
+
+    #[test]
+    fn executor_response_lost_before_round_completion_remains_unresolved_without_reinvocation() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let response_receipt = digest("response-before-durable-completion");
+        write_executor_response(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: response_receipt.clone(),
+                outcome: ExecutorOutcomeClassWireV1::Indeterminate,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let (envelope_bytes, request) = signed_round(&fixture, "lost-response-round", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let retained = retain_bound_executor(
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            &binding,
+        )
+        .unwrap();
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("fresh claim replayed"),
+        };
+        let dispatch = executor_reconciliation_dispatch(
+            &request,
+            &reservation,
+            &record.issuance,
+            &record.custody,
+        );
+        let response =
+            invoke_retained_json::<_, ExecutorOutcomeWireV1>(&retained, "reconcile", &dispatch)
+                .unwrap();
+        assert_eq!(response.receipt, response_receipt);
+        // Model process loss after the physical response has arrived but before
+        // Docket can append the journal or complete the durable round.
+        drop(response);
+        drop(store);
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"x"
+        );
+
+        let replay = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope_bytes,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            replay.state,
+            DocketReconciliationRoundStateWireV1::Unresolved(reservation)
+        );
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"x",
+            "an ambiguous claimed round is never silently reinvoked"
+        );
+    }
+
+    #[test]
+    fn reconciliation_uses_retained_executor_after_source_path_substitution() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        write_inline_executor(
+            &fixture.executor_program,
+            &fixture.custody,
+            ExecutorOutcomeClassWireV1::Indeterminate,
+            &digest("retained-executor-result"),
+        );
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (envelope_bytes, request) = signed_round(&fixture, "retained-executor-round", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let retained = retain_bound_executor(
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            &binding,
+        )
+        .unwrap();
+
+        // The caller-controlled source path changes after exact local byte
+        // validation but before the durable claim.  The claim winner must use
+        // the retained snapshot, not reopen this path.
+        write_refusing_program(&fixture.executor_program);
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("fresh claim replayed"),
+        };
+        let dispatch = executor_reconciliation_dispatch(
+            &request,
+            &reservation,
+            &record.issuance,
+            &record.custody,
+        );
+        let outcome =
+            invoke_retained_json::<_, ExecutorOutcomeWireV1>(&retained, "reconcile", &dispatch)
+                .unwrap();
+        assert_eq!(outcome.receipt, digest("retained-executor-result"));
+        store
+            .complete_reconciliation_round(&request, &reservation, &record, outcome, 8)
+            .unwrap();
+        let stored_round = store
+            .read_reconciliation_round(&request.request)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            store
+                .reconciliation_round_response(stored_round)
+                .unwrap()
+                .state,
+            DocketReconciliationRoundStateWireV1::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn round_issuer_must_equal_the_exact_custodied_issuance_issuer() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (_, request) = signed_round(&fixture, "issuer-substitution", None);
+        let body = canonical_json(&request);
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
+        let mut signed = RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.to_vec();
+        signed.extend_from_slice(&body);
+        let second_public_key = b64_encode(key.public_key().as_ref());
+        let envelope = canonical_json(&SignedReconciliationRoundRequestEnvelopeWireV1 {
+            schema: SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1.to_owned(),
+            body_b64: b64_encode(&body),
+            authentication: IssuanceAuthenticationWireV1 {
+                issuer_principal: "ag.other".to_owned(),
+                signer_key_id: "ag-other-key".to_owned(),
+                signer_public_key: second_public_key.clone(),
+                signature: b64_encode(key.sign(&signed).as_ref()),
+            },
+        });
+        let original: AgIssuerTrustConfigV1 = serde_json::from_slice(&fixture.trust).unwrap();
+        let mut issuers = original.issuers;
+        issuers.push(TrustedAgIssuerV1 {
+            issuer_principal: "ag.other".to_owned(),
+            key_id: "ag-other-key".to_owned(),
+            public_key: second_public_key,
+        });
+        let trust = canonical_json(&AgIssuerTrustConfigV1 { issuers });
+        assert_eq!(
+            reconcile_signed_round_with_checkpoint_verifier(
+                &fixture.database,
+                &envelope,
+                &trust,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+                None,
+            )
+            .unwrap_err(),
+            "governed-reconciliation-issuance-issuer-substitution"
+        );
+        let connection = Connection::open(&fixture.database).unwrap();
+        let rounds: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_reconciliation_round",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rounds, 0);
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+    }
+
+    #[test]
+    fn issuance_observation_is_consequence_free_and_never_reconciles() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_refusing_program(&fixture.executor_program);
+        assert!(matches!(
+            observe_issuance_with_checkpoint_verifier(
+                &fixture.database,
+                &fixture.issuance.issuance,
+                None,
+            )
+            .unwrap(),
+            DocketReconciliationWireV1::Indeterminate { .. }
+        ));
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let rounds: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_reconciliation_round",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn r3_database_migrates_to_empty_round_ledger_and_partial_migration_refuses() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let connection = Connection::open(&fixture.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_reconciliation_round_no_delete;
+                 DROP TRIGGER governed_reconciliation_round_monotone;
+                 DROP TRIGGER governed_reconciliation_round_identity_immutable;
+                 DROP TABLE governed_reconciliation_round;",
+            )
+            .unwrap();
+        drop(connection);
+        drop(SqliteStore::open(&fixture.database).unwrap());
+        let connection = Connection::open(&fixture.database).unwrap();
+        let objects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'governed_reconciliation_round%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM governed_reconciliation_round",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((objects, rows), (4, 0));
+
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_reconciliation_round_no_delete;
+                 DROP TRIGGER governed_reconciliation_round_monotone;
+                 DROP TRIGGER governed_reconciliation_round_identity_immutable;
+                 DROP TABLE governed_reconciliation_round;
+                 CREATE TABLE governed_reconciliation_round(request TEXT PRIMARY KEY) STRICT;",
+            )
+            .unwrap();
+        drop(connection);
+        let error = match SqliteStore::open(&fixture.database) {
+            Ok(_) => panic!("partial migration unexpectedly reopened"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(error.contains("governed reconciliation round schema mismatch"));
+    }
+
+    #[test]
+    fn public_custody_entries_refuse_weakened_round_schema_before_external_work() {
+        let acceptance = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let connection = Connection::open(&acceptance.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_reconciliation_round_no_delete;
+                 CREATE TRIGGER governed_reconciliation_round_no_delete
+                 BEFORE DELETE ON governed_reconciliation_round
+                 BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        drop(connection);
+        let error = accept(
+            &acceptance.database,
+            &acceptance.envelope,
+            &acceptance.trust,
+            &acceptance.standing_program,
+            &acceptance.executor_program,
+            &acceptance.root.join("executor-config"),
+        )
+        .unwrap_err();
+        assert!(error.contains("governed reconciliation round schema mismatch"));
+        assert!(!acceptance
+            .executor_program
+            .with_extension("invocations")
+            .exists());
+        let attempts: i64 = Connection::open(&acceptance.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 0);
+
+        let reconciliation = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &reconciliation.database,
+            &reconciliation.envelope,
+            &reconciliation.trust,
+            &reconciliation.standing_program,
+            &reconciliation.executor_program,
+            &reconciliation.root.join("executor-config"),
+        )
+        .unwrap();
+        let (round_envelope, round) = signed_round(&reconciliation, "schema-gate", None);
+        let connection = Connection::open(&reconciliation.database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER governed_reconciliation_round_no_delete;
+                 CREATE TRIGGER governed_reconciliation_round_no_delete
+                 BEFORE DELETE ON governed_reconciliation_round
+                 BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        drop(connection);
+        let error = reconcile_signed_round_with_checkpoint_verifier(
+            &reconciliation.database,
+            &round_envelope,
+            &reconciliation.trust,
+            &reconciliation.executor_program,
+            &reconciliation.root.join("executor-config"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("governed reconciliation round schema mismatch"));
+        assert!(!reconciliation
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+        let rounds: i64 = Connection::open(&reconciliation.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM governed_reconciliation_round WHERE request=?1",
+                [&round.request],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rounds, 0);
+    }
+
+    #[test]
+    fn reconciliation_round_timestamps_are_sql_and_reopen_safe() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (envelope_bytes, request) = signed_round(&fixture, "unsafe-time", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let unsafe_error = match store.claim_reconciliation_round(
+            &envelope,
+            &request,
+            &record,
+            &binding,
+            MAX_JCS_SAFE_INTEGER + 1,
+        ) {
+            Ok(_) => panic!("unsafe timestamp was accepted"),
+            Err(error) => error,
+        };
+        assert!(unsafe_error.contains("clock-outside-jcs-safe-integer-domain"));
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 9)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("unexpected replay"),
+        };
+        drop(store);
+        let connection = Connection::open(&fixture.database).unwrap();
+        mutate_immutable_round_fixture(&connection, |connection| {
+            connection
+                .pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE governed_reconciliation_round SET claimed_at=?1 WHERE reservation=?2",
+                    params![(MAX_JCS_SAFE_INTEGER + 1) as i64, reservation.reservation],
+                )
+                .unwrap();
+            connection
+                .pragma_update(None, "ignore_check_constraints", "OFF")
+                .unwrap();
+        });
+        drop(connection);
+        let reopen_error = match GovernedCustodyStoreV1::open(&fixture.database) {
+            Ok(_) => panic!("unsafe timestamp reopened"),
+            Err(error) => error,
+        };
+        assert!(reopen_error.contains("unsafe JSON integer"));
+    }
+
+    #[test]
+    fn corrupt_round_and_reservation_rows_refuse_on_reopen() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let (envelope_bytes, request) = signed_round(&fixture, "corrupt-round", None);
+        let (envelope, _) =
+            verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust).unwrap();
+        let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+        let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+        let binding = ExecutorBindingV1 {
+            identity: record.executor_binding.clone(),
+            program_digest: record.executor_program_digest.clone(),
+            config_digest: record.executor_config_digest.clone(),
+            plan: record.executor_plan.clone(),
+        };
+        let reservation = match store
+            .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+            .unwrap()
+        {
+            ReconciliationRoundClaimV1::Winner(value) => *value,
+            ReconciliationRoundClaimV1::Existing(_) => panic!("fresh claim replayed"),
+        };
+        drop(store);
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        mutate_immutable_round_fixture(&connection, |connection| {
+            connection
+                .execute(
+                    "UPDATE governed_reconciliation_round SET reservation=?1 WHERE request=?2",
+                    params![digest("substituted-reservation"), request.request],
+                )
+                .unwrap();
+        });
+        drop(connection);
+        assert_eq!(
+            GovernedCustodyStoreV1::open(&fixture.database)
+                .err()
+                .unwrap(),
+            "governed-reconciliation-reservation-substitution"
+        );
+
+        let connection = Connection::open(&fixture.database).unwrap();
+        mutate_immutable_round_fixture(&connection, |connection| {
+            connection
+                .execute(
+                    "UPDATE governed_reconciliation_round SET reservation=?1,round=?2 WHERE request=?3",
+                    params![
+                        reservation.reservation,
+                        digest("substituted-round"),
+                        request.request
+                    ],
+                )
+                .unwrap();
+        });
+        drop(connection);
+        assert_eq!(
+            GovernedCustodyStoreV1::open(&fixture.database)
+                .err()
+                .unwrap(),
+            "governed-reconciliation-round-stored-substitution"
+        );
+    }
+
+    #[test]
+    fn stored_round_reopen_joins_exact_issuance_issuer_and_source_cut_bytes() {
+        fn claim_one(fixture: &Fixture, label: &str) -> ReconciliationRoundRequestWireV1 {
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap();
+            let (envelope_bytes, request) = signed_round(fixture, label, None);
+            let (envelope, _) =
+                verify_signed_reconciliation_round_request(&envelope_bytes, &fixture.trust)
+                    .unwrap();
+            let mut store = GovernedCustodyStoreV1::open(&fixture.database).unwrap();
+            let record = store.get(&fixture.issuance.issuance).unwrap().unwrap();
+            let binding = ExecutorBindingV1 {
+                identity: record.executor_binding.clone(),
+                program_digest: record.executor_program_digest.clone(),
+                config_digest: record.executor_config_digest.clone(),
+                plan: record.executor_plan.clone(),
+            };
+            assert!(matches!(
+                store
+                    .claim_reconciliation_round(&envelope, &request, &record, &binding, 7)
+                    .unwrap(),
+                ReconciliationRoundClaimV1::Winner(_)
+            ));
+            request
+        }
+
+        let issuer_fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let issuer_request = claim_one(&issuer_fixture, "corrupt-stored-issuer");
+        let connection = Connection::open(&issuer_fixture.database).unwrap();
+        mutate_immutable_round_fixture(&connection, |connection| {
+            connection
+                .execute(
+                    "UPDATE governed_reconciliation_round SET issuer_principal='ag.substituted'
+                     WHERE request=?1",
+                    [&issuer_request.request],
+                )
+                .unwrap();
+        });
+        drop(connection);
+        assert_eq!(
+            GovernedCustodyStoreV1::open(&issuer_fixture.database)
+                .err()
+                .unwrap(),
+            "governed-reconciliation-issuance-issuer-substitution"
+        );
+
+        let source_fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        let source_request = claim_one(&source_fixture, "corrupt-stored-source-cut");
+        let connection = Connection::open(&source_fixture.database).unwrap();
+        let source_bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT source_cut_jcs FROM governed_reconciliation_round WHERE request=?1",
+                [&source_request.request],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut source: serde_json::Value = serde_json::from_slice(&source_bytes).unwrap();
+        source["issuance"] = serde_json::Value::String(digest("substituted-source-issuance"));
+        let substituted = serde_jcs::to_vec(&source).unwrap();
+        mutate_immutable_round_fixture(&connection, |connection| {
+            connection
+                .execute(
+                    "UPDATE governed_reconciliation_round SET source_cut_jcs=?1 WHERE request=?2",
+                    params![substituted, source_request.request],
+                )
+                .unwrap();
+        });
+        drop(connection);
+        assert_eq!(
+            GovernedCustodyStoreV1::open(&source_fixture.database)
+                .err()
+                .unwrap(),
+            "governed-reconciliation-source-cut-substitution"
+        );
+    }
+
+    #[test]
+    fn round_completion_journal_and_settlement_are_one_atomic_cut() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Indeterminate);
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_executor_response(
+            &fixture.executor_program,
+            &ExecutorOutcomeWireV1 {
+                attempt: fixture.custody.attempt.clone(),
+                marker: fixture.custody.executor_marker.clone(),
+                receipt: digest("atomic-terminal"),
+                outcome: ExecutorOutcomeClassWireV1::Success,
+                effect_journal: vec![],
+                immutable_work_checkpoint: None,
+                governed_repair: None,
+            },
+        );
+        let (envelope, request) = signed_round(&fixture, "atomic-round", None);
+        ABORT_ROUND_COMPLETION_BEFORE_ROUND_ROW.with(|failpoint| failpoint.set(true));
+        let error = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("injected round completion failure"));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let (status, round_state, observations): (String, String, i64) = connection
+            .query_row(
+                "SELECT a.status,r.state,
+                        (SELECT COUNT(*) FROM governed_executor_result e
+                         WHERE e.issuance=a.issuance)
+                 FROM governed_loop_attempt a
+                 JOIN governed_reconciliation_round r ON r.issuance=a.issuance
+                 WHERE r.request=?1",
+                [&request.request],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), round_state.as_str(), observations),
+            ("indeterminate", "claimed", 1)
+        );
+        drop(connection);
+        let replay = reconcile_signed_round_with_checkpoint_verifier(
+            &fixture.database,
+            &envelope,
+            &fixture.trust,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            replay.state,
+            DocketReconciliationRoundStateWireV1::Unresolved(_)
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("reconciliations")).unwrap(),
+            b"x",
+            "claimed-round replay must not invoke external reconciliation again"
+        );
     }
 
     #[test]
@@ -5334,6 +8935,29 @@ mod tests {
             .unwrap();
         verification.status = CheckpointVerificationStatusWireV1::Mismatch;
         write_static_program(&verifier, &serde_json::to_string(&verification).unwrap());
+        assert_eq!(
+            observe_issuance_with_checkpoint_verifier(
+                &fixture.database,
+                &issuance.issuance,
+                Some(&verifier),
+            )
+            .unwrap_err(),
+            "governed-checkpoint-verification-mismatch"
+        );
+        assert!(!fixture
+            .executor_program
+            .with_extension("reconciliations")
+            .exists());
+        let after_observation_refusal: (String, i64) = Connection::open(&fixture.database)
+            .unwrap()
+            .query_row(
+                "SELECT status,(SELECT COUNT(*) FROM governed_executor_result)
+                 FROM governed_loop_attempt",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after_observation_refusal, before);
         write_refusing_program(&fixture.executor_program);
         assert_eq!(
             reconcile_with_checkpoint_verifier(
@@ -5939,16 +9563,93 @@ mod tests {
         .unwrap();
         let response = path.with_extension("response");
         let invocations = path.with_extension("invocations");
+        let reconciliations = path.with_extension("reconciliations");
         std::fs::write(&response, output).unwrap();
         if path.exists() {
             return;
         }
         let response = response.display().to_string().replace('\'', "'\\''");
         let invocations = invocations.display().to_string().replace('\'', "'\\''");
+        let reconciliations = reconciliations.display().to_string().replace('\'', "'\\''");
         std::fs::write(
             path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = plan-id ]; then cat \"$2\"; exit $?; fi\nif [ \"$1\" = execute ]; then cat >/dev/null; printf x >> '{invocations}'; cat '{response}'; exit $?; fi\nif [ \"$1\" = reconcile ]; then cat >/dev/null; cat '{response}'; exit $?; fi\nexit 64\n"
+                "#!/bin/sh\nif [ \"$1\" = plan-id ]; then cat \"$2\"; exit $?; fi\nif [ \"$1\" = execute ]; then cat >/dev/null; printf x >> '{invocations}'; cat '{response}'; exit $?; fi\nif [ \"$1\" = reconcile ]; then cat >/dev/null; printf x >> '{reconciliations}'; cat '{response}'; exit $?; fi\nexit 64\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_blocking_mixed_executor(
+        path: &Path,
+        initial: &ExecutorOutcomeWireV1,
+        reconciliation: &ExecutorOutcomeWireV1,
+    ) {
+        let initial_response = path.with_extension("initial-response");
+        let reconciliation_response = path.with_extension("reconciliation-response");
+        std::fs::write(&initial_response, serde_jcs::to_vec(initial).unwrap()).unwrap();
+        std::fs::write(
+            &reconciliation_response,
+            serde_jcs::to_vec(reconciliation).unwrap(),
+        )
+        .unwrap();
+        let escaped = |value: &Path| value.display().to_string().replace('\'', "'\\''");
+        let execute_started = escaped(&path.with_extension("execute-started"));
+        let execute_release = escaped(&path.with_extension("execute-release"));
+        let execute_calls = escaped(&path.with_extension("execute-calls"));
+        let reconcile_started = escaped(&path.with_extension("reconcile-started"));
+        let reconcile_release = escaped(&path.with_extension("reconcile-release"));
+        let reconcile_calls = escaped(&path.with_extension("reconcile-calls"));
+        let initial_response = escaped(&initial_response);
+        let reconciliation_response = escaped(&reconciliation_response);
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = plan-id ]; then cat \"$2\"; exit $?; fi\nif [ \"$1\" = execute ]; then cat >/dev/null; printf x >> '{execute_calls}'; : > '{execute_started}'; while [ ! -f '{execute_release}' ]; do sleep 0.01; done; cat '{initial_response}'; exit $?; fi\nif [ \"$1\" = reconcile ]; then cat >/dev/null; printf x >> '{reconcile_calls}'; : > '{reconcile_started}'; while [ ! -f '{reconcile_release}' ]; do sleep 0.01; done; cat '{reconciliation_response}'; exit $?; fi\nexit 64\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn wait_for_test_path(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn write_inline_executor(
+        path: &Path,
+        custody: &DocketCustodyWireV1,
+        outcome: ExecutorOutcomeClassWireV1,
+        receipt: &str,
+    ) {
+        let response = serde_json::to_string(&ExecutorOutcomeWireV1 {
+            attempt: custody.attempt.clone(),
+            marker: custody.executor_marker.clone(),
+            receipt: receipt.to_owned(),
+            outcome,
+            effect_journal: vec![],
+            immutable_work_checkpoint: None,
+            governed_repair: None,
+        })
+        .unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = plan-id ]; then cat \"$2\"; exit $?; fi\nif [ \"$1\" = execute ] || [ \"$1\" = reconcile ]; then cat >/dev/null; printf '%s' '{}'; exit $?; fi\nexit 64\n",
+                response.replace('\'', "'\\''")
             ),
         )
         .unwrap();

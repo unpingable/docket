@@ -29,9 +29,11 @@ Docket intake.
 Absent optional checkpoint members are omitted; explicit `null` refuses.  A
 present work checkpoint always carries its content-manifest identity.
 
-Before unknown-outcome reconciliation invokes an executor reconciliation
-operation or advances custody, Docket freshly verifies the exact stored
-starting checkpoint.  Reconciliation never repeats ordinary execution.  The
+Before an authenticated explicit reconciliation round invokes an executor
+reconciliation operation or advances custody, Docket freshly verifies the
+exact stored starting checkpoint and commits a one-winner round reservation.
+Raw issuance observation never invokes the executor. Reconciliation never
+repeats ordinary execution. The
 durable attempt journal is the cumulative ordered sequence across indeterminate
 and terminal observations; a later empty or partial response cannot erase an
 earlier effect.  Exact duplicate entries follow the declared idempotency law,

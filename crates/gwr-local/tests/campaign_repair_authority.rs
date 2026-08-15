@@ -83,18 +83,21 @@ fn assert_source_census(source: &str, needle: &str, expected: usize) {
 }
 
 #[test]
-fn structural_census_keeps_one_governed_path_and_retired_route_fences() {
+fn structural_census_keeps_only_the_two_governed_result_ingresses_and_retired_route_fences() {
     let loop_source = include_str!("../src/governed_loop.rs");
     let repair_source = include_str!("../src/governed_repair.rs");
     let retired_authority = include_str!("../../gwr-core/src/campaign/authority.rs");
     let campaign_service = include_str!("../../gwr-runtime/src/services/campaign.rs");
 
-    // Exactly one executor-result ingress performs the scope census and one
-    // governed branch delegates to the sole Store-owned seal operation.
+    // Exactly two executor-result ingresses perform the scope census: the
+    // initial attempt result and completion of an already-durable reserved
+    // reconciliation round. One governed branch delegates to the sole
+    // Store-owned seal operation. A third ingress is an uncensused authority
+    // surface and must fail this structural gate.
     assert_source_census(
         loop_source,
         "governed_repair::validate_effect_journal_for_issuance(",
-        1,
+        2,
     );
     assert_source_census(loop_source, "governed_repair::seal_requirement(", 1);
     assert_source_census(
@@ -273,6 +276,7 @@ fn cargo_targets_exports_and_intake_versions_match_the_closed_custody_surface() 
         "test:empty_observation_plan",
         "test:failure_injection",
         "test:git_broker",
+        "test:governed_reconciliation_singleflight",
         "test:nq_c1_repair_specimens",
         "test:persistence",
         "test:provider_contract",
@@ -638,10 +642,11 @@ fn cargo_targets_exports_and_intake_versions_match_the_closed_custody_surface() 
         [
             "accept",
             "accept_with_checkpoint_verifier",
-            "reconcile",
-            "reconcile_with_checkpoint_verifier",
+            "observe_issuance_with_checkpoint_verifier",
+            "reconcile_signed_round_with_checkpoint_verifier",
             "strict_json<T: DeserializeOwned>",
             "verify_signed_issuance",
+            "verify_signed_reconciliation_round_request",
         ]
         .into_iter()
         .map(str::to_owned)

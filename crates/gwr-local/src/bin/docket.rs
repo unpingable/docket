@@ -394,14 +394,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 issuance: String,
             }
             let st = State::open(args)?;
-            let request: Request = governed_loop::strict_json(&read_stdin_bounded()?, "governed reconciliation request")
-                .map_err(|error| format!("governed reconciliation request: {error}"))?;
-            let response = governed_loop::reconcile_with_checkpoint_verifier(
+            let request: Request = governed_loop::strict_json(
+                &read_stdin_bounded()?,
+                "governed issuance observation request",
+            )
+            .map_err(|error| format!("governed issuance observation request: {error}"))?;
+            let response = governed_loop::observe_issuance_with_checkpoint_verifier(
                 &st.dir.join("state.sqlite"),
                 &request.issuance,
-                None,
-                &PathBuf::from(need(args, "--executor")?),
-                &PathBuf::from(need(args, "--executor-config")?),
                 flag(args, "--checkpoint-verifier")
                     .map(PathBuf::from)
                     .as_deref(),
@@ -414,19 +414,14 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         ["governed-loop", "reconcile-attempt"] => {
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Request {
-                issuance: String,
-                attempt: String,
-            }
             let st = State::open(args)?;
-            let request: Request = governed_loop::strict_json(&read_stdin_bounded()?, "governed reconciliation request")
-                .map_err(|error| format!("governed reconciliation request: {error}"))?;
-            let response = governed_loop::reconcile_with_checkpoint_verifier(
+            let envelope = read_stdin_bounded()?;
+            let trust = std::fs::read(need(args, "--trust")?)
+                .map_err(|error| format!("reading governed-loop trust: {error}"))?;
+            let response = governed_loop::reconcile_signed_round_with_checkpoint_verifier(
                 &st.dir.join("state.sqlite"),
-                &request.issuance,
-                Some(&request.attempt),
+                &envelope,
+                &trust,
                 &PathBuf::from(need(args, "--executor")?),
                 &PathBuf::from(need(args, "--executor-config")?),
                 flag(args, "--checkpoint-verifier")

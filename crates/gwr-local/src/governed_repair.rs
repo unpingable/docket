@@ -212,6 +212,32 @@ pub(crate) fn seal_requirement(
     connection: &mut Connection,
     input: SealRequirementInputV1<'_>,
 ) -> Result<StoreSealedGovernedRepairResultV1, String> {
+    let issuance = input.issuance.issuance.clone();
+    // An immediate transaction makes the cumulative-journal read, terminal
+    // checkpoint insert, and custody terminalization one indivisible Store
+    // decision. A late indeterminate observation can neither disappear from
+    // the seal nor append after it.
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("governed-repair-transaction:{error}"))?;
+    let result = seal_requirement_in_transaction(&tx, input)?;
+    tx.commit()
+        .map_err(|error| format!("governed-repair-commit:{error}"))?;
+    let stored = read_sealed_result(connection, &issuance)?
+        .ok_or_else(|| "governed-repair-checkpoint-disappeared".to_owned())?;
+    if stored != result {
+        return Err("governed-repair-sealed-result-substitution".to_owned());
+    }
+    Ok(stored)
+}
+
+/// Transaction-aware sealer used by reconciliation-round completion so the
+/// executor journal, governed result, and completed reservation share one
+/// commit.  It never commits the caller's transaction.
+pub(crate) fn seal_requirement_in_transaction(
+    tx: &Transaction<'_>,
+    input: SealRequirementInputV1<'_>,
+) -> Result<StoreSealedGovernedRepairResultV1, String> {
     let SealRequirementInputV1 {
         issuance,
         custody,
@@ -223,15 +249,8 @@ pub(crate) fn seal_requirement(
         now_unix_ms,
     } = input;
     parse_digest(executor_receipt)?;
-    // An immediate transaction makes the cumulative-journal read, terminal
-    // checkpoint insert, and custody terminalization one indivisible Store
-    // decision. A late indeterminate observation can neither disappear from
-    // the seal nor append after it.
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("governed-repair-transaction:{error}"))?;
     let journal =
-        cumulative_effect_journal_with(&tx, &issuance.issuance, &custody.attempt, latest_journal)?;
+        cumulative_effect_journal_with(tx, &issuance.issuance, &custody.attempt, latest_journal)?;
     let executor_result = executor_result_identity(
         executor_receipt,
         &draft,
@@ -316,11 +335,8 @@ pub(crate) fn seal_requirement(
         checkpoint,
         outcome,
     };
-    append_exact(&tx, issuance, &result, &journal)?;
-    tx.commit()
-        .map_err(|error| format!("governed-repair-commit:{error}"))?;
-    read_sealed_result(connection, &issuance.issuance)?
-        .ok_or_else(|| "governed-repair-checkpoint-disappeared".to_owned())
+    append_exact(tx, issuance, &result, &journal)?;
+    Ok(result)
 }
 
 pub(crate) fn read_sealed_result(
@@ -1515,6 +1531,44 @@ pub(crate) fn cumulative_effect_journal_with(
     let mut cumulative = prior_cumulative_effect_journal(connection, issuance, attempt)?;
     merge_effect_journal(&mut cumulative, entries)?;
     Ok(cumulative)
+}
+
+/// Verifies that a superseded read-only reconciliation response reports no
+/// effect that is absent from the attempt's independently durable cumulative
+/// journal.  A response raced by a monotone initial-attempt result is evidence
+/// only: it must never extend or rewrite the already durable terminal cut.
+pub(crate) fn require_reported_journal_already_durable(
+    connection: &Connection,
+    issuance: &str,
+    attempt: &str,
+    scope: &CanonicalEffectScopeWireV1,
+    entries: &[EffectJournalEntryWireV1],
+) -> Result<(), String> {
+    validate_effect_journal(scope, entries)?;
+    let terminal: Option<String> = connection
+        .query_row(
+            "SELECT effect_journal_entries FROM governed_repair_checkpoint
+             WHERE issuance=?1 AND attempt=?2",
+            params![issuance, attempt],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("governed-reconciliation-terminal-journal-read:{error}"))?;
+    let durable = terminal.map_or_else(
+        || prior_cumulative_effect_journal(connection, issuance, attempt),
+        |encoded| decode_journal(&encoded),
+    )?;
+    for entry in entries {
+        match durable
+            .iter()
+            .find(|candidate| candidate.effect_identity == entry.effect_identity)
+        {
+            Some(candidate) if candidate == entry => {}
+            Some(_) => return Err("governed-reconciliation-superseded-effect-collision".to_owned()),
+            None => return Err("governed-reconciliation-superseded-effect-not-durable".to_owned()),
+        }
+    }
+    Ok(())
 }
 
 /// Returns the exact cumulative journal identity at the latest durable

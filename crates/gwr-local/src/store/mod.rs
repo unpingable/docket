@@ -48,6 +48,8 @@ const MIGRATION_0009: &str = include_str!("../../migrations/0009_governed_loop_r
 const MIGRATION_0010: &str = include_str!("../../migrations/0010_governed_repair_r2.sql");
 const MIGRATION_0011: &str =
     include_str!("../../migrations/0011_governed_settlement_journal_binding.sql");
+const MIGRATION_0012: &str =
+    include_str!("../../migrations/0012_governed_reconciliation_round.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -63,6 +65,80 @@ fn backend(e: rusqlite::Error) -> StoreError {
         }
     }
     StoreError::Backend(e.to_string())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SqliteSchemaObjectV1 {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
+}
+
+fn governed_reconciliation_schema_objects(
+    conn: &Connection,
+) -> Result<Vec<SqliteSchemaObjectV1>, StoreError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema
+             WHERE tbl_name='governed_reconciliation_round'
+             ORDER BY type,name",
+        )
+        .map_err(backend)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SqliteSchemaObjectV1 {
+                object_type: row.get(0)?,
+                name: row.get(1)?,
+                table_name: row.get(2)?,
+                sql: row.get(3)?,
+            })
+        })
+        .map_err(backend)?;
+    let objects = rows.collect::<Result<Vec<_>, _>>().map_err(backend)?;
+    Ok(objects)
+}
+
+fn governed_reconciliation_schema_census_identity(objects: &[SqliteSchemaObjectV1]) -> String {
+    let mut bytes = Vec::new();
+    for object in objects {
+        for value in [
+            Some(object.object_type.as_str()),
+            Some(object.name.as_str()),
+            Some(object.table_name.as_str()),
+            object.sql.as_deref(),
+        ] {
+            match value {
+                Some(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                    bytes.extend_from_slice(value.as_bytes());
+                }
+                None => bytes.push(0),
+            }
+        }
+    }
+    format!("sha256:{}", Sha256Digest::of_bytes(&bytes))
+}
+
+fn expected_governed_reconciliation_schema_objects() -> Result<Vec<SqliteSchemaObjectV1>, StoreError>
+{
+    let expected = Connection::open_in_memory().map_err(backend)?;
+    expected.execute_batch(MIGRATION_0012).map_err(backend)?;
+    governed_reconciliation_schema_objects(&expected)
+}
+
+fn require_exact_governed_reconciliation_schema(conn: &Connection) -> Result<(), StoreError> {
+    let expected = expected_governed_reconciliation_schema_objects()?;
+    let actual = governed_reconciliation_schema_objects(conn)?;
+    if actual != expected {
+        return Err(StoreError::Corrupt(format!(
+            "governed reconciliation round schema mismatch: expected {}, actual {}",
+            governed_reconciliation_schema_census_identity(&expected),
+            governed_reconciliation_schema_census_identity(&actual)
+        )));
+    }
+    Ok(())
 }
 
 /// Bounded writer-contention window (P4). When another connection holds the
@@ -94,6 +170,13 @@ impl SqliteStore {
             .map_err(backend)?;
         Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Transfers one already migrated and schema-validated connection to a
+    /// crate-internal consequence owner. Public custody entry points must not
+    /// reopen the same path through raw SQLite after this gate.
+    pub(crate) fn into_validated_connection(self) -> Connection {
+        self.conn
     }
 
     /// Apply migrations. 0001 is idempotent (`IF NOT EXISTS`); 0002 adds the
@@ -234,6 +317,23 @@ impl SqliteStore {
                 has_settlement_journal != 0,
             )?;
         }
+        // 0012 introduces explicit authenticated reconciliation rounds.  It
+        // intentionally creates no rows for R3 attempts: historical
+        // indeterminate evidence remains evidence and grants no round.  A
+        // partial object set is corruption rather than an invitation to infer
+        // missing custody state.
+        let round_objects = governed_reconciliation_schema_objects(conn)?;
+        if round_objects.is_empty() {
+            conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+            let result = conn.execute_batch(MIGRATION_0012).map_err(backend);
+            if result.is_ok() {
+                conn.execute_batch("COMMIT").map_err(backend)?;
+            } else {
+                let _ = conn.execute_batch("ROLLBACK");
+                result?;
+            }
+        }
+        require_exact_governed_reconciliation_schema(conn)?;
         Ok(())
     }
 
@@ -3125,5 +3225,80 @@ impl Store for SqliteStore {
             })
             .map_err(backend)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(backend)
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_schema_tests {
+    use super::*;
+
+    const DROP_RECONCILIATION_SCHEMA: &str = "DROP TRIGGER governed_reconciliation_round_no_delete;
+         DROP TRIGGER governed_reconciliation_round_monotone;
+         DROP TRIGGER governed_reconciliation_round_identity_immutable;
+         DROP TABLE governed_reconciliation_round;";
+
+    fn exact_connection() -> Connection {
+        SqliteStore::open_in_memory().expect("exact schema").conn
+    }
+
+    fn assert_schema_refused(connection: &Connection) {
+        let error = SqliteStore::migrate(connection).expect_err("weakened schema must refuse");
+        assert!(
+            matches!(error, StoreError::Corrupt(ref message)
+                if message.starts_with("governed reconciliation round schema mismatch:")),
+            "unexpected migration refusal: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconciliation_schema_exact_census_reopens() {
+        let connection = exact_connection();
+        SqliteStore::migrate(&connection).expect("exact schema reopens");
+        require_exact_governed_reconciliation_schema(&connection).expect("exact census");
+    }
+
+    #[test]
+    fn reconciliation_schema_complete_but_weakened_table_refuses() {
+        let connection = exact_connection();
+        connection
+            .execute_batch(DROP_RECONCILIATION_SCHEMA)
+            .expect("drop exact schema");
+        let weakened = MIGRATION_0012.replace("    UNIQUE (issuance, attempt, source_cut),\n", "");
+        assert_ne!(weakened, MIGRATION_0012, "test must weaken the table");
+        connection
+            .execute_batch(&weakened)
+            .expect("install complete weakened object set");
+        assert_schema_refused(&connection);
+    }
+
+    #[test]
+    fn reconciliation_schema_inert_or_rebound_triggers_refuse() {
+        for trigger in [
+            "governed_reconciliation_round_identity_immutable",
+            "governed_reconciliation_round_monotone",
+            "governed_reconciliation_round_no_delete",
+        ] {
+            let connection = exact_connection();
+            connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {trigger};
+                     CREATE TRIGGER {trigger}
+                     BEFORE DELETE ON governed_reconciliation_round
+                     BEGIN SELECT 1; END;"
+                ))
+                .expect("install inert trigger");
+            assert_schema_refused(&connection);
+
+            let connection = exact_connection();
+            connection
+                .execute_batch(&format!(
+                    "DROP TRIGGER {trigger};
+                     CREATE TRIGGER {trigger}
+                     BEFORE UPDATE ON governed_loop_attempt
+                     BEGIN SELECT 1; END;"
+                ))
+                .expect("install rebound trigger");
+            assert_schema_refused(&connection);
+        }
     }
 }

@@ -12,6 +12,8 @@ const WIRE_VECTORS: &[u8] =
     include_bytes!("../../../conformance/governed-repair-r2/wire-vectors.v1.json");
 const WIRE_HOSTILES: &[u8] =
     include_bytes!("../../../conformance/governed-repair-r2/wire-hostiles.v1.json");
+const RECONCILIATION_ROUNDS: &[u8] =
+    include_bytes!("../../../conformance/governed-repair-r2/reconciliation-rounds.v1.json");
 
 fn corpus() -> Value {
     strict_json(WIRE_VECTORS, "wire-vector-corpus").expect("pinned wire-vector corpus")
@@ -41,6 +43,134 @@ fn identity<'a>(vector: &'a Value, name: &str) -> &'a str {
     vector["identities"][name]
         .as_str()
         .expect("expected identity")
+}
+
+fn reconciliation_corpus() -> Value {
+    strict_json(RECONCILIATION_ROUNDS, "reconciliation-round-corpus")
+        .expect("pinned reconciliation-round corpus")
+}
+
+fn validate_corpus_round_response(
+    response: &DocketReconciliationRoundResponseWireV1,
+) -> Result<(), String> {
+    if response.schema != RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1 {
+        return Err("corpus-reconciliation-response-schema".to_owned());
+    }
+    match &response.state {
+        DocketReconciliationRoundStateWireV1::Unresolved(reservation) => {
+            if reservation.request != response.request
+                || reservation.round != response.round
+                || reservation_identity(reservation)? != reservation.reservation
+            {
+                return Err("corpus-reconciliation-reservation-substitution".to_owned());
+            }
+        }
+        DocketReconciliationRoundStateWireV1::Completed {
+            reservation,
+            completion,
+            response: result,
+        } => {
+            if reservation.request != response.request
+                || reservation.round != response.round
+                || reservation_identity(reservation)? != reservation.reservation
+                || completion.reservation != reservation.reservation
+                || completion.round != reservation.round
+                || completion_identity(completion)? != completion.completion
+            {
+                return Err("corpus-reconciliation-completed-substitution".to_owned());
+            }
+            let result_identity = match result.as_ref() {
+                DocketReconciliationWireV1::Indeterminate { indeterminate, .. } => {
+                    &indeterminate.reconciliation
+                }
+                DocketReconciliationWireV1::Settled { settlement, .. } => &settlement.settlement,
+                DocketReconciliationWireV1::GovernedRepairRequired { result, .. } => {
+                    &result.sealed_result
+                }
+                _ => return Err("corpus-reconciliation-completed-result-class".to_owned()),
+            };
+            if completion.result_identity != *result_identity {
+                return Err("corpus-reconciliation-public-result-substitution".to_owned());
+            }
+        }
+        DocketReconciliationRoundStateWireV1::NotAccepted
+        | DocketReconciliationRoundStateWireV1::Refused(_) => {}
+    }
+    Ok(())
+}
+
+#[test]
+fn reconciliation_round_corpus_exercises_actual_docket_types_and_identities() {
+    let corpus = reconciliation_corpus();
+    for name in [
+        "reconciliation_request_initial",
+        "reconciliation_request_later",
+    ] {
+        let vector = &corpus["records"][name];
+        let request: ReconciliationRoundRequestWireV1 = round_trip(vector, name);
+        validate_reconciliation_round_request(&request).unwrap();
+        assert_eq!(request.round, identity(vector, "round"));
+        assert_eq!(request.request, identity(vector, "request"));
+    }
+    let signed_vector = &corpus["records"]["signed_reconciliation_request_initial"];
+    let signed: SignedReconciliationRoundRequestEnvelopeWireV1 =
+        round_trip(signed_vector, "signed-reconciliation-request");
+    let trust = serde_jcs::to_vec(&AgIssuerTrustConfigV1 {
+        issuers: vec![TrustedAgIssuerV1 {
+            issuer_principal: signed.authentication.issuer_principal.clone(),
+            key_id: signed.authentication.signer_key_id.clone(),
+            public_key: signed.authentication.signer_public_key.clone(),
+        }],
+    })
+    .unwrap();
+    let (_, request) = verify_signed_reconciliation_round_request(
+        canonical_body(signed_vector).as_bytes(),
+        &trust,
+    )
+    .unwrap();
+    assert_eq!(
+        request.request,
+        identity(
+            &corpus["records"]["reconciliation_request_initial"],
+            "request"
+        )
+    );
+
+    for name in [
+        "reconciliation_reservation_initial",
+        "reconciliation_reservation_later",
+    ] {
+        let vector = &corpus["records"][name];
+        let reservation: ReconciliationRoundReservationWireV1 = round_trip(vector, name);
+        assert_eq!(
+            reservation_identity(&reservation).unwrap(),
+            identity(vector, "reservation")
+        );
+    }
+    for name in [
+        "reconciliation_completion_indeterminate",
+        "reconciliation_completion_settled",
+    ] {
+        let vector = &corpus["records"][name];
+        let completion: ReconciliationRoundCompletionWireV1 = round_trip(vector, name);
+        assert_eq!(
+            completion_identity(&completion).unwrap(),
+            identity(vector, "completion")
+        );
+    }
+    for name in [
+        "reconciliation_response_unresolved",
+        "reconciliation_response_completed_indeterminate",
+        "reconciliation_response_completed_settled",
+    ] {
+        let response: DocketReconciliationRoundResponseWireV1 =
+            round_trip(&corpus["records"][name], name);
+        validate_corpus_round_response(&response).unwrap();
+    }
+    let _: ExecutorReconciliationDispatchWireV1 = round_trip(
+        &corpus["records"]["executor_reconciliation_dispatch"],
+        "executor-reconciliation-dispatch",
+    );
 }
 
 #[test]
@@ -246,6 +376,85 @@ fn hostile_optional_unknown_integer_and_identity_mutations_refuse_in_docket() {
         assert!(
             result.is_err(),
             "hostile case passed Docket boundary: {name}"
+        );
+    }
+}
+
+fn apply_reconciliation_hostile(base: Value, case: &Value) -> Value {
+    let pointer = case["pointer"].as_str().unwrap();
+    let (parent, member) = pointer.rsplit_once('/').expect("non-root pointer");
+    let mut value = base;
+    let target = value
+        .pointer_mut(parent)
+        .expect("round hostile pointer names an exact member");
+    let object = target
+        .as_object_mut()
+        .expect("round hostile pointer parent is an object");
+    match case["operation"].as_str().unwrap() {
+        "remove" => {
+            object.remove(member).expect("member to remove");
+        }
+        "add" | "replace" => {
+            let replacement = if case["value_encoding"] == "json_integer_decimal" {
+                serde_json::from_str(case["value"].as_str().unwrap()).unwrap()
+            } else {
+                case["value"].clone()
+            };
+            object.insert(member.to_owned(), replacement);
+        }
+        operation => panic!("unknown round hostile operation {operation}"),
+    }
+    value
+}
+
+#[test]
+fn reconciliation_round_hostiles_owned_by_docket_refuse_at_their_exact_boundary() {
+    let corpus = reconciliation_corpus();
+    let signed: SignedReconciliationRoundRequestEnvelopeWireV1 = round_trip(
+        &corpus["records"]["signed_reconciliation_request_initial"],
+        "signed-reconciliation-request",
+    );
+    let trust = serde_jcs::to_vec(&AgIssuerTrustConfigV1 {
+        issuers: vec![TrustedAgIssuerV1 {
+            issuer_principal: signed.authentication.issuer_principal,
+            key_id: signed.authentication.signer_key_id,
+            public_key: signed.authentication.signer_public_key,
+        }],
+    })
+    .unwrap();
+    for case in corpus["hostiles"].as_array().unwrap() {
+        // Complete-envelope replay at the executor is intentionally owned by
+        // ag-effectd. Docket's positive corpus test proves it emits the exact
+        // base wrapper; AG's mirrored ordinary gate exercises those two
+        // executor-owned mutations against the actual adapter.
+        if case["refusal_owner"] == "executor-exact-replay" {
+            continue;
+        }
+        let name = case["name"].as_str().unwrap();
+        let base = case["base"].as_str().unwrap();
+        let mutated = apply_reconciliation_hostile(corpus["records"][base]["value"].clone(), case);
+        let bytes = serde_jcs::to_vec(&mutated).unwrap();
+        let result = match base {
+            "reconciliation_request_initial" | "reconciliation_request_later" => {
+                strict_json::<ReconciliationRoundRequestWireV1>(&bytes, name)
+                    .and_then(|request| validate_reconciliation_round_request(&request))
+            }
+            "signed_reconciliation_request_initial" => {
+                verify_signed_reconciliation_round_request(&bytes, &trust).map(|_| ())
+            }
+            "reconciliation_response_unresolved"
+            | "reconciliation_response_completed_indeterminate" => {
+                strict_json::<DocketReconciliationRoundResponseWireV1>(&bytes, name)
+                    .and_then(|response| validate_corpus_round_response(&response))
+            }
+            "executor_reconciliation_dispatch" => {
+                strict_json::<ExecutorReconciliationDispatchWireV1>(&bytes, name).map(|_| ())
+            }
+            other => panic!("unknown Docket-owned reconciliation hostile base {other}"),
+        };
+        assert!(
+            result.is_err(),
+            "round hostile passed Docket boundary: {name}"
         );
     }
 }
