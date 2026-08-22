@@ -91,6 +91,19 @@ an optional `cargo install --path` flow, clean state creation, provider configur
 supported versus unsupported invocation paths are recorded in
 [`source-install-and-bootstrap.md`](docs/governed-runtime/source-install-and-bootstrap.md).
 
+The canonical AG governed-loop custody record has one narrow read-only
+projection for the local operator inspector:
+
+```bash
+docket governed-loop inspect --state /absolute/state --issuance sha256:...
+```
+
+It opens the existing custody database read-only and emits
+`docket.governed-loop.inspection/v1`, including the exact authenticated AG
+issuance, issuer/key identity, custody, executor binding, and known or
+indeterminate outcome. It invokes no standing resolver or executor and does
+not reconcile or alter custody.
+
 ## Workspace
 
 - `crates/gwr-core` — pure deterministic types and transition rules. No I/O.

@@ -8,7 +8,7 @@
 //! the sole producer of the settlement AG may consume.
 
 use ring::signature::{UnparsedPublicKey, ED25519};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs::OpenOptions;
@@ -25,6 +25,7 @@ pub const SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
 pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-standing-request/v1";
 pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
+pub const INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
 
 const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
@@ -215,6 +216,36 @@ pub enum DocketReconciliationWireV1 {
         custody: DocketCustodyWireV1,
         indeterminate: IndeterminateOutcomeWireV1,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedRecordStatusV1 {
+    Accepted,
+    Settled,
+    Indeterminate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedRecordInspectionV1 {
+    pub issuance: AgIssuanceWireV1,
+    pub authentication: IssuanceAuthenticationWireV1,
+    pub custody: DocketCustodyWireV1,
+    pub status: GovernedRecordStatusV1,
+    pub settlement: Option<DocketSettlementWireV1>,
+    pub indeterminate: Option<IndeterminateOutcomeWireV1>,
+    pub executor_binding: String,
+    pub executor_program_digest: String,
+    pub executor_plan: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedLoopInspectionV1 {
+    pub schema: String,
+    pub requested_issuance: String,
+    pub record: Option<GovernedRecordInspectionV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +457,42 @@ pub fn reconcile(
     response(record)
 }
 
+/// Returns Docket's exact persisted governed-loop record for one issuance.
+/// This opens the existing database read-only, invokes no resolver or
+/// executor, and never creates or updates state.
+pub fn inspect(database: &Path, issuance: &str) -> Result<GovernedLoopInspectionV1, String> {
+    require_digest(issuance, "issuance")?;
+    let mut store = GovernedCustodyStoreV1::open_read_only(database)?;
+    let Some(record) = store.get(issuance)? else {
+        return Ok(GovernedLoopInspectionV1 {
+            schema: INSPECTION_SCHEMA_V1.to_owned(),
+            requested_issuance: issuance.to_owned(),
+            record: None,
+        });
+    };
+    let status = match record.status.as_str() {
+        "accepted" => GovernedRecordStatusV1::Accepted,
+        "settled" => GovernedRecordStatusV1::Settled,
+        "indeterminate" => GovernedRecordStatusV1::Indeterminate,
+        _ => return Err("governed-custody-status-corrupt".to_owned()),
+    };
+    Ok(GovernedLoopInspectionV1 {
+        schema: INSPECTION_SCHEMA_V1.to_owned(),
+        requested_issuance: issuance.to_owned(),
+        record: Some(GovernedRecordInspectionV1 {
+            issuance: record.issuance,
+            authentication: record.authentication,
+            custody: record.custody,
+            status,
+            settlement: record.settlement,
+            indeterminate: record.indeterminate,
+            executor_binding: record.executor_binding,
+            executor_program_digest: record.executor_program_digest,
+            executor_plan: record.executor_plan,
+        }),
+    })
+}
+
 fn response(record: CustodyRecordV1) -> Result<DocketReconciliationWireV1, String> {
     match record.status.as_str() {
         "accepted" => Ok(DocketReconciliationWireV1::Accepted(record.custody)),
@@ -473,6 +540,20 @@ impl GovernedCustodyStoreV1 {
         connection
             .pragma_update(None, "busy_timeout", 5_000_u32)
             .map_err(|error| format!("governed-custody-busy-timeout:{error}"))?;
+        Ok(Self { connection })
+    }
+
+    fn open_read_only(database: &Path) -> Result<Self, String> {
+        let connection = Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|error| format!("governed-custody-read-open:{error}"))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("governed-custody-read-timeout:{error}"))?;
         Ok(Self { connection })
     }
 
@@ -1437,6 +1518,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!((attempts, standing_uses), (1, 1));
+    }
+
+    #[test]
+    fn read_only_inspection_retains_issuer_custody_and_outcome_without_mutation() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let accepted = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+
+        let before = std::fs::metadata(&fixture.database).unwrap().len();
+        let inspection = inspect(&fixture.database, &fixture.issuance.issuance).unwrap();
+        let record = inspection.record.expect("accepted issuance is visible");
+        assert_eq!(inspection.schema, INSPECTION_SCHEMA_V1);
+        assert_eq!(inspection.requested_issuance, fixture.issuance.issuance);
+        assert_eq!(record.issuance, fixture.issuance);
+        assert_eq!(record.authentication.issuer_principal, "ag.test");
+        assert_eq!(record.authentication.signer_key_id, "ag-test-key");
+        assert_eq!(record.custody, accepted);
+        assert_eq!(record.status, GovernedRecordStatusV1::Settled);
+        assert!(record.settlement.is_some());
+        assert!(record.indeterminate.is_none());
+        assert_eq!(std::fs::metadata(&fixture.database).unwrap().len(), before);
+    }
+
+    #[test]
+    fn read_only_inspection_refuses_a_missing_store_instead_of_creating_it() {
+        let root = std::env::temp_dir().join(format!(
+            "docket-governed-inspect-missing-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let database = root.join("missing.sqlite");
+        let result = inspect(&database, &digest("missing-issuance"));
+        assert!(result.is_err());
+        assert!(!database.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

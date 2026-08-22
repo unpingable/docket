@@ -68,6 +68,7 @@ Repository identity:
   repository show             Inspect a registration [--json]
   repository migrate-attempt  Explicitly bind one legacy work request
   continuity subject          Export the exact Docket-owned subject [--json]
+  governed-loop inspect       Read one exact governed-loop issuance record
 
 Governed workflow:
   request create
@@ -436,6 +437,17 @@ fn run(args: &[String]) -> Result<(), String> {
                 "{}",
                 serde_json::to_string(&response)
                     .map_err(|error| format!("governed reconciliation response: {error}"))?
+            );
+            Ok(())
+        }
+        ["governed-loop", "inspect"] => {
+            let state = PathBuf::from(need(args, "--state")?);
+            let issuance = need(args, "--issuance")?;
+            let response = governed_loop::inspect(&state.join("state.sqlite"), &issuance)?;
+            println!(
+                "{}",
+                serde_json::to_string(&response)
+                    .map_err(|error| format!("governed inspection response: {error}"))?
             );
             Ok(())
         }
@@ -1540,7 +1552,7 @@ fn run(args: &[String]) -> Result<(), String> {
              candidate admit, grant standing, ratify, reserve, dispatch, observe, \
              rely review-queue, reconcile, recover fact, recover resolve, authz request, \
              authz accept, governed-loop accept, governed-loop reconcile-issuance, \
-             governed-loop reconcile-attempt, docket list, docket show, docket journal, continuity subject, \
+             governed-loop reconcile-attempt, governed-loop inspect, docket list, docket show, docket journal, continuity subject, \
              campaign propose-stage, campaign admit, campaign consume, campaign outcome, \
              campaign adjudicate, campaign export-repair-authority, \
              campaign verify-repair-authority, campaign show"
