@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std::fs::File;
 #[cfg(not(target_os = "freebsd"))]
 use std::io;
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct DescriptorExecOutput {
@@ -19,15 +20,141 @@ pub struct DescriptorExecOutput {
     pub exec_errno: Option<i32>,
 }
 
+/// One private executable vnode populated from bounded candidate bytes.
+///
+/// On FreeBSD the file is unlinked before population, reopened read-only
+/// through `O_EMPTY_PATH`, and returned only after every writable descriptor
+/// owned by this adapter has been closed. The caller must measure this exact
+/// descriptor before invoking it.
+#[derive(Debug)]
+pub struct ExecutionRepresentation {
+    pub executable: File,
+    pub method: &'static str,
+    pub device: u64,
+    pub inode: u64,
+    pub links: u64,
+}
+
+pub const PRIVATE_UNLINKED_REGULAR_VNODE_V1: &str = "freebsd_private_unlinked_regular_vnode_v1";
+
 #[cfg(target_os = "freebsd")]
 #[allow(unsafe_code)]
 mod platform {
-    use super::{CString, DescriptorExecOutput, File};
+    use super::{
+        CString, DescriptorExecOutput, ExecutionRepresentation, File, Path,
+        PRIVATE_UNLINKED_REGULAR_VNODE_V1,
+    };
     use std::ffi::OsStr;
+    use std::fs::{OpenOptions, Permissions};
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
     use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+
+    static REPRESENTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    pub fn prepare_execution_representation(
+        base_directory: &Path,
+        bytes: &[u8],
+    ) -> io::Result<ExecutionRepresentation> {
+        let directory = base_directory.join(".gwr-execution-representations");
+        match std::fs::create_dir(&directory) {
+            Ok(()) => std::fs::set_permissions(&directory, Permissions::from_mode(0o700))?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let directory_metadata = std::fs::symlink_metadata(&directory)?;
+        if !directory_metadata.is_dir()
+            || directory_metadata.file_type().is_symlink()
+            || directory_metadata.mode() & 0o077 != 0
+            || directory_metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "execution representation directory custody",
+            ));
+        }
+
+        let mut writer = loop {
+            let sequence = REPRESENTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = directory.join(format!(
+                ".representation.{}.{}",
+                std::process::id(),
+                sequence
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+            {
+                Ok(file) => {
+                    std::fs::remove_file(&path)?;
+                    break file;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+
+        writer.write_all(bytes)?;
+        writer.sync_all()?;
+        writer.set_permissions(Permissions::from_mode(0o500))?;
+
+        let executable_fd = unsafe {
+            libc::openat(
+                writer.as_raw_fd(),
+                c"".as_ptr(),
+                libc::O_EMPTY_PATH | libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if executable_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let executable = unsafe { File::from_raw_fd(executable_fd) };
+        let writer_metadata = writer.metadata()?;
+        let executable_metadata = executable.metadata()?;
+        if writer_metadata.dev() != executable_metadata.dev()
+            || writer_metadata.ino() != executable_metadata.ino()
+            || executable_metadata.nlink() != 0
+            || !executable_metadata.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution representation identity",
+            ));
+        }
+        drop(writer);
+        let mut rights = unsafe { std::mem::zeroed::<libc::cap_rights_t>() };
+        if unsafe {
+            libc::__cap_rights_init(
+                libc::CAP_RIGHTS_VERSION,
+                &mut rights,
+                libc::CAP_READ,
+                libc::CAP_SEEK,
+                libc::CAP_FSTAT,
+                libc::CAP_FEXECVE,
+                0_u64,
+            )
+        }
+        .is_null()
+            || unsafe { libc::cap_rights_limit(executable.as_raw_fd(), &rights) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(ExecutionRepresentation {
+            executable,
+            method: PRIVATE_UNLINKED_REGULAR_VNODE_V1,
+            device: executable_metadata.dev(),
+            inode: executable_metadata.ino(),
+            links: executable_metadata.nlink(),
+        })
+    }
 
     struct Pipes {
         stdin: [RawFd; 2],
@@ -229,7 +356,7 @@ mod platform {
 }
 
 #[cfg(target_os = "freebsd")]
-pub use platform::invoke;
+pub use platform::{invoke, prepare_execution_representation};
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn invoke(
@@ -241,4 +368,57 @@ pub fn invoke(
         io::ErrorKind::Unsupported,
         "descriptor executor is supported only on FreeBSD",
     ))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn prepare_execution_representation(
+    _base_directory: &Path,
+    _bytes: &[u8],
+) -> io::Result<ExecutionRepresentation> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "execution representations are supported only on FreeBSD",
+    ))
+}
+
+#[cfg(all(test, target_os = "freebsd"))]
+mod tests {
+    use super::prepare_execution_representation;
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn representation_is_unlinked_read_only_and_source_decoupled() {
+        let root =
+            std::env::temp_dir().join(format!("gwr-m6-representation-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = b"expected executable bytes".to_vec();
+        let mut representation = prepare_execution_representation(&root, &source).unwrap();
+        source.fill(b'B');
+        representation.executable.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained = Vec::new();
+        representation
+            .executable
+            .read_to_end(&mut retained)
+            .unwrap();
+        assert_eq!(retained, b"expected executable bytes");
+        assert_eq!(representation.links, 0);
+        assert!(representation.executable.write_all(b"B").is_err());
+        let empty = b"\0";
+        let reopened = unsafe {
+            libc::openat(
+                representation.executable.as_raw_fd(),
+                empty.as_ptr().cast(),
+                libc::O_EMPTY_PATH | libc::O_RDWR | libc::O_CLOEXEC,
+            )
+        };
+        assert_eq!(reopened, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTCAPABLE)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

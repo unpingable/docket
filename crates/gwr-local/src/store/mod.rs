@@ -42,6 +42,8 @@ const MIGRATION_0004: &str = include_str!("../../migrations/0004_repository_regi
 const MIGRATION_0005: &str = include_str!("../../migrations/0005_campaign_stage_standing.sql");
 const MIGRATION_0006: &str = include_str!("../../migrations/0006_governed_loop_custody.sql");
 const MIGRATION_0007: &str = include_str!("../../migrations/0007_governed_executor_custody.sql");
+const MIGRATION_0008: &str =
+    include_str!("../../migrations/0008_execution_representation_custody.sql");
 
 pub struct SqliteStore {
     conn: Connection,
@@ -158,6 +160,17 @@ impl SqliteStore {
             .map_err(backend)?;
         if has_descriptor_custody == 0 {
             conn.execute_batch(MIGRATION_0007).map_err(backend)?;
+        }
+        let has_representation_custody: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('governed_loop_attempt')
+                 WHERE name='executor_representation_content'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(backend)?;
+        if has_representation_custody == 0 {
+            conn.execute_batch(MIGRATION_0008).map_err(backend)?;
         }
         Ok(())
     }
