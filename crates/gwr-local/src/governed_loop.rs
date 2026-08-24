@@ -1520,15 +1520,18 @@ fn resolve_executor_selection(
         .get("schema")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "governed-executor-config-schema".to_owned())?;
-    if schema != expected_work_schema {
-        return Err("governed-executor-config-work-schema-substitution".to_owned());
+    if schema.is_empty() || schema.len() > 256 || !schema.is_ascii() {
+        return Err("governed-executor-config-schema".to_owned());
     }
     if value.get("governed_executor").is_none() {
         return Ok(None);
     }
     let canonical = serde_jcs::to_vec(&value)
         .map_err(|error| format!("governed-executor-config-canonical:{error}"))?;
-    if hash_domain(schema, &canonical) != expected_plan {
+    // The config's self-describing schema and AG's opaque work-identity domain
+    // are distinct contracts.  AG binds the canonical bytes in the latter;
+    // Docket interprets only the generic nested executor-selection envelope.
+    if hash_domain(expected_work_schema, &canonical) != expected_plan {
         return Err("governed-executor-plan-substitution".to_owned());
     }
     let selection: ExecutorSelectionWireV1 = serde_json::from_value(
@@ -2338,6 +2341,7 @@ mod tests {
         let actual = file_content_digest(&std::fs::read(&program).unwrap());
         let expected = digest("different-authorized-first-stage");
         let schema = "civil.managed-file.executor-plan/v3";
+        let work_schema = "civil.managed-file.docket-work/v1";
         let config_value = serde_json::json!({
             "governed_executor": {
                 "expected_content": expected,
@@ -2349,9 +2353,9 @@ mod tests {
         let config_bytes = serde_jcs::to_vec(&config_value).unwrap();
         let config = root.join("plan.json");
         std::fs::write(&config, &config_bytes).unwrap();
-        let work = hash_domain(schema, &config_bytes);
+        let work = hash_domain(work_schema, &config_bytes);
 
-        let resolved = resolve_executor_binding(&program, &config, schema, &work).unwrap();
+        let resolved = resolve_executor_binding(&program, &config, work_schema, &work).unwrap();
         assert_eq!(
             resolved.binding.program_content.as_deref(),
             Some(actual.as_str())
@@ -2369,7 +2373,7 @@ mod tests {
         let mut substituted = config_value;
         substituted["subject"] = serde_json::Value::String(digest("other-subject"));
         std::fs::write(&config, serde_jcs::to_vec(&substituted).unwrap()).unwrap();
-        assert!(resolve_executor_binding(&program, &config, schema, &work).is_err());
+        assert!(resolve_executor_binding(&program, &config, work_schema, &work).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
