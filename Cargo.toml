@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/gwr-core", "crates/gwr-runtime", "crates/gwr-local"]
+members = [
+    "crates/gwr-core",
+    "crates/gwr-runtime",
+    "crates/gwr-local",
+    "crates/gwr-freebsd-exec",
+]
 
 [workspace.package]
 version = "0.1.0"

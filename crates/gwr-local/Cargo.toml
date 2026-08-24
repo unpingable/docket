@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+fault-injection = []
+
 [dependencies]
+gwr-freebsd-exec = { path = "../gwr-freebsd-exec" }
 gwr-core = { path = "../gwr-core" }
 gwr-runtime = { path = "../gwr-runtime" }
 hmac = "0.12"
@@ -16,6 +20,7 @@ ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_jcs = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
