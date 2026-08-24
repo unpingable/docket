@@ -6,6 +6,7 @@
 
 use std::ffi::CString;
 use std::fs::File;
+#[cfg(not(target_os = "freebsd"))]
 use std::io;
 
 #[derive(Debug)]

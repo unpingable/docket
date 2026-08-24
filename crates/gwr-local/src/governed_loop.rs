@@ -462,6 +462,7 @@ pub fn accept(
         .to_str()
         .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
     let outcome = if let Some(opened) = executor.opened_program.as_ref() {
+        pause_after_executor_revalidation()?;
         invoke_descriptor_json(opened, &["execute", config], &dispatch).and_then(|invocation| {
             if invocation.descriptor_exec_accepted {
                 let dispatch_content = file_content_digest(&invocation.input);
@@ -1629,10 +1630,30 @@ fn file_content_digest(bytes: &[u8]) -> String {
 }
 
 fn pause_after_executor_custody() -> Result<(), String> {
+    pause_for_fault_injection(
+        "DOCKET_M5_EXECUTOR_READY_PATH",
+        "DOCKET_M5_EXECUTOR_RESUME_PATH",
+        "opened_and_measured",
+    )
+}
+
+fn pause_after_executor_revalidation() -> Result<(), String> {
+    pause_for_fault_injection(
+        "DOCKET_M5_REVALIDATED_READY_PATH",
+        "DOCKET_M5_REVALIDATED_RESUME_PATH",
+        "revalidated_before_descriptor_invoke",
+    )
+}
+
+fn pause_for_fault_injection(
+    ready_variable: &str,
+    resume_variable: &str,
+    witness: &str,
+) -> Result<(), String> {
     #[cfg(feature = "fault-injection")]
     {
-        let ready = std::env::var_os("DOCKET_M5_EXECUTOR_READY_PATH");
-        let resume = std::env::var_os("DOCKET_M5_EXECUTOR_RESUME_PATH");
+        let ready = std::env::var_os(ready_variable);
+        let resume = std::env::var_os(resume_variable);
         if ready.is_some() != resume.is_some() {
             return Err("M5 executor custody coordination is incomplete".to_owned());
         }
@@ -1648,7 +1669,8 @@ fn pause_after_executor_custody() -> Result<(), String> {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&ready)
                 .and_then(|mut file| {
-                    file.write_all(b"opened_and_measured\n")?;
+                    file.write_all(witness.as_bytes())?;
+                    file.write_all(b"\n")?;
                     file.sync_all()
                 })
                 .map_err(|error| format!("M5 executor custody ready witness:{error}"))?;
@@ -1661,6 +1683,8 @@ fn pause_after_executor_custody() -> Result<(), String> {
             return Err("M5 executor custody coordination timed out".to_owned());
         }
     }
+    #[cfg(not(feature = "fault-injection"))]
+    let _ = (ready_variable, resume_variable, witness);
     Ok(())
 }
 
