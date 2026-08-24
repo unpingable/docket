@@ -1478,7 +1478,7 @@ fn require_executor_binding(
 
 fn resolve_executor_selection(
     config: &Path,
-    expected_work_schema: &str,
+    _expected_work_schema: &str,
     expected_plan: &str,
 ) -> Result<Option<String>, String> {
     let metadata = std::fs::symlink_metadata(config)
@@ -1528,10 +1528,11 @@ fn resolve_executor_selection(
     }
     let canonical = serde_jcs::to_vec(&value)
         .map_err(|error| format!("governed-executor-config-canonical:{error}"))?;
-    // The config's self-describing schema and AG's opaque work-identity domain
-    // are distinct contracts.  AG binds the canonical bytes in the latter;
-    // Docket interprets only the generic nested executor-selection envelope.
-    if hash_domain(expected_work_schema, &canonical) != expected_plan {
+    // The config's self-describing identity domain and AG's opaque catalog
+    // work-schema are distinct contracts. AG binds the already-derived exact
+    // work identity; Docket independently reproduces that identity here and
+    // interprets only the generic nested executor-selection envelope.
+    if hash_domain(schema, &canonical) != expected_plan {
         return Err("governed-executor-plan-substitution".to_owned());
     }
     let selection: ExecutorSelectionWireV1 = serde_json::from_value(
@@ -2353,7 +2354,7 @@ mod tests {
         let config_bytes = serde_jcs::to_vec(&config_value).unwrap();
         let config = root.join("plan.json");
         std::fs::write(&config, &config_bytes).unwrap();
-        let work = hash_domain(work_schema, &config_bytes);
+        let work = hash_domain(schema, &config_bytes);
 
         let resolved = resolve_executor_binding(&program, &config, work_schema, &work).unwrap();
         assert_eq!(
