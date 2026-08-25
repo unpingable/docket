@@ -33,15 +33,42 @@ pub struct ExecutionRepresentation {
     pub device: u64,
     pub inode: u64,
     pub links: u64,
+    pub authority: ExecutionRepresentationAuthorityClosure,
 }
 
 pub const PRIVATE_UNLINKED_REGULAR_VNODE_V1: &str = "freebsd_private_unlinked_regular_vnode_v1";
+pub const AUTHORITY_CLOSURE_SCHEMA_V1: &str =
+    "civil.managed-file.execution-representation-authority-closure/v1";
+pub const FIRST_STAGE_RIGHTS_PROFILE_V1: &str = "read_seek_fstat_fexecve_v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionRepresentationAuthorityClosure {
+    pub schema: &'static str,
+    pub creator: &'static str,
+    pub representation_method: &'static str,
+    pub writer_descriptors_created: u16,
+    pub writer_descriptors_duplicated: u16,
+    pub writer_descriptors_closed_before_measurement: u16,
+    pub writable_descriptors_surviving_finalization: u16,
+    pub writable_descriptors_inherited: u16,
+    pub representation_links_at_finalization: u64,
+    pub surviving_descriptor_access: &'static str,
+    pub surviving_rights_profile: &'static str,
+    pub direct_write_probe_errno: i32,
+    pub write_reacquisition_method: &'static str,
+    pub write_reacquisition_errno: i32,
+    pub finalization_sequence: u8,
+    pub measurement_sequence: u8,
+    pub invocation_sequence: u8,
+    pub descriptor_transfer: &'static str,
+}
 
 #[cfg(target_os = "freebsd")]
 #[allow(unsafe_code)]
 mod platform {
     use super::{
         CString, DescriptorExecOutput, ExecutionRepresentation, File, Path,
+        AUTHORITY_CLOSURE_SCHEMA_V1, FIRST_STAGE_RIGHTS_PROFILE_V1,
         PRIVATE_UNLINKED_REGULAR_VNODE_V1,
     };
     use std::ffi::OsStr;
@@ -129,6 +156,20 @@ mod platform {
             ));
         }
         drop(writer);
+        let status = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFL) };
+        if status < 0 || status & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution representation reader is not read-only",
+            ));
+        }
+        let descriptor = unsafe { libc::fcntl(executable.as_raw_fd(), libc::F_GETFD) };
+        if descriptor < 0 || descriptor & libc::FD_CLOEXEC == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution representation reader is not close-on-exec before transfer",
+            ));
+        }
         let mut rights = unsafe { std::mem::zeroed::<libc::cap_rights_t>() };
         if unsafe {
             libc::__cap_rights_init(
@@ -147,12 +188,69 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
 
+        let byte = [0_u8];
+        if unsafe { libc::pwrite(executable.as_raw_fd(), byte.as_ptr().cast(), byte.len(), 0) } >= 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "rights-limited execution representation remained writable",
+            ));
+        }
+        let direct_write_probe_errno = io::Error::last_os_error()
+            .raw_os_error()
+            .ok_or_else(|| io::Error::other("direct write probe returned no errno"))?;
+        if direct_write_probe_errno != libc::EBADF && direct_write_probe_errno != libc::ENOTCAPABLE
+        {
+            return Err(io::Error::from_raw_os_error(direct_write_probe_errno));
+        }
+
+        let reopened = unsafe {
+            libc::openat(
+                executable.as_raw_fd(),
+                c"".as_ptr(),
+                libc::O_EMPTY_PATH | libc::O_RDWR | libc::O_CLOEXEC,
+            )
+        };
+        if reopened >= 0 {
+            unsafe { libc::close(reopened) };
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "rights-limited reader reacquired writable authority",
+            ));
+        }
+        let write_reacquisition_errno = io::Error::last_os_error()
+            .raw_os_error()
+            .ok_or_else(|| io::Error::other("write reacquisition returned no errno"))?;
+        if write_reacquisition_errno != libc::ENOTCAPABLE {
+            return Err(io::Error::from_raw_os_error(write_reacquisition_errno));
+        }
+
         Ok(ExecutionRepresentation {
             executable,
             method: PRIVATE_UNLINKED_REGULAR_VNODE_V1,
             device: executable_metadata.dev(),
             inode: executable_metadata.ino(),
             links: executable_metadata.nlink(),
+            authority: super::ExecutionRepresentationAuthorityClosure {
+                schema: AUTHORITY_CLOSURE_SCHEMA_V1,
+                creator: "docket_first_stage_adapter",
+                representation_method: PRIVATE_UNLINKED_REGULAR_VNODE_V1,
+                writer_descriptors_created: 1,
+                writer_descriptors_duplicated: 0,
+                writer_descriptors_closed_before_measurement: 1,
+                writable_descriptors_surviving_finalization: 0,
+                writable_descriptors_inherited: 0,
+                representation_links_at_finalization: executable_metadata.nlink(),
+                surviving_descriptor_access: "read_only",
+                surviving_rights_profile: FIRST_STAGE_RIGHTS_PROFILE_V1,
+                direct_write_probe_errno,
+                write_reacquisition_method: "openat_empty_path_rdwr",
+                write_reacquisition_errno,
+                finalization_sequence: 4,
+                measurement_sequence: 5,
+                invocation_sequence: 7,
+                descriptor_transfer: "read_only_reader_fork_inherited_for_fexecve",
+            },
         })
     }
 

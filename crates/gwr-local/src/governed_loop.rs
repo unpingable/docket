@@ -29,6 +29,7 @@ pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
 pub const INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
 pub const INSPECTION_SCHEMA_V2: &str = "docket.governed-loop.inspection/v2";
 pub const INSPECTION_SCHEMA_V3: &str = "docket.governed-loop.inspection/v3";
+pub const INSPECTION_SCHEMA_V4: &str = "docket.governed-loop.inspection/v4";
 pub const EXECUTOR_SELECTION_SCHEMA_V1: &str = "docket.governed-loop.executor-selection/v1";
 pub const DESCRIPTOR_INVOCATION_V1: &str = "freebsd_fexecve_preopened_descriptor";
 pub const REPRESENTATION_INVOCATION_V1: &str = "freebsd_fexecve_private_unlinked_regular_vnode_v1";
@@ -45,12 +46,43 @@ struct ExecutorBindingV1 {
     expected_content: Option<String>,
     representation_content: Option<String>,
     representation_method: Option<String>,
+    representation_authority: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionRepresentationAuthorityClosureWireV1 {
+    pub schema: String,
+    pub creator: String,
+    pub representation_method: String,
+    pub writer_descriptors_created: u16,
+    pub writer_descriptors_duplicated: u16,
+    pub writer_descriptors_closed_before_measurement: u16,
+    pub writable_descriptors_surviving_finalization: u16,
+    pub writable_descriptors_inherited: u16,
+    pub representation_links_at_finalization: u64,
+    pub surviving_descriptor_access: String,
+    pub surviving_rights_profile: String,
+    pub direct_write_probe_errno: i32,
+    pub write_reacquisition_method: String,
+    pub write_reacquisition_errno: i32,
+    pub finalization_sequence: u8,
+    pub measurement_sequence: u8,
+    pub invocation_sequence: u8,
+    pub descriptor_transfer: String,
 }
 
 #[derive(Debug)]
 struct ResolvedExecutorV1 {
     binding: ExecutorBindingV1,
     opened_program: Option<File>,
+}
+
+struct PreparedExecutionRepresentation {
+    executable: File,
+    content: Option<String>,
+    method: Option<String>,
+    authority: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -270,6 +302,8 @@ pub struct GovernedRecordInspectionV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_representation_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub executor_representation_authority: Option<ExecutionRepresentationAuthorityClosureWireV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_invocation_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_launch: Option<String>,
@@ -298,6 +332,7 @@ struct CustodyRecordV1 {
     executor_expected_content: Option<String>,
     executor_representation_content: Option<String>,
     executor_representation_method: Option<String>,
+    executor_representation_authority: Option<String>,
     executor_invocation_method: Option<String>,
     executor_launch: Option<String>,
     executor_dispatch_content: Option<String>,
@@ -549,6 +584,7 @@ pub fn reconcile(
         expected_content: record.executor_expected_content.clone(),
         representation_content: record.executor_representation_content.clone(),
         representation_method: record.executor_representation_method.clone(),
+        representation_authority: record.executor_representation_authority.clone(),
     };
     if executor.binding != expected_binding {
         return Err("governed-executor-binding-substitution".to_owned());
@@ -621,7 +657,9 @@ pub fn inspect(database: &Path, issuance: &str) -> Result<GovernedLoopInspection
         "indeterminate" => GovernedRecordStatusV1::Indeterminate,
         _ => return Err("governed-custody-status-corrupt".to_owned()),
     };
-    let schema = if record.executor_representation_content.is_some() {
+    let schema = if record.executor_representation_authority.is_some() {
+        INSPECTION_SCHEMA_V4
+    } else if record.executor_representation_content.is_some() {
         INSPECTION_SCHEMA_V3
     } else if record.executor_program_content.is_some() {
         INSPECTION_SCHEMA_V2
@@ -645,6 +683,11 @@ pub fn inspect(database: &Path, issuance: &str) -> Result<GovernedLoopInspection
             executor_expected_content: record.executor_expected_content,
             executor_representation_content: record.executor_representation_content,
             executor_representation_method: record.executor_representation_method,
+            executor_representation_authority: record
+                .executor_representation_authority
+                .as_deref()
+                .map(parse_authority_closure)
+                .transpose()?,
             executor_invocation_method: record.executor_invocation_method,
             executor_launch: record.executor_launch,
             executor_dispatch_content: record.executor_dispatch_content,
@@ -751,10 +794,11 @@ impl GovernedCustodyStoreV1 {
                   standing_currentness,attempt,executor_marker,executor_binding,
                   executor_program_digest,executor_plan,executor_program_content,
                   executor_expected_content,executor_representation_content,
-                  executor_representation_method,accepted_at,status)
+                  executor_representation_method,executor_representation_authority,
+                  accepted_at,status)
                  VALUES
                  (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
-                  ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,'accepted')",
+                  ?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,'accepted')",
                 params![
                     issuance.issuance,
                     envelope.body_b64,
@@ -785,6 +829,7 @@ impl GovernedCustodyStoreV1 {
                     executor_binding.expected_content,
                     executor_binding.representation_content,
                     executor_binding.representation_method,
+                    executor_binding.representation_authority,
                     u64_to_i64(custody.accepted_at_unix_ms)?
                 ],
             )
@@ -804,20 +849,21 @@ impl GovernedCustodyStoreV1 {
                         standing_currentness,attempt,executor_marker,executor_binding,
                         executor_program_digest,executor_plan,executor_program_content,
                         executor_expected_content,executor_representation_content,
-                        executor_representation_method,executor_invocation_method,executor_launch,
+                        executor_representation_method,executor_representation_authority,
+                        executor_invocation_method,executor_launch,
                         executor_dispatch_content,accepted_at,status,
                         settlement,receipt,outcome,settled_at,reconciliation,indeterminate_evidence
                  FROM governed_loop_attempt WHERE issuance=?1",
                 [issuance],
                 |row| {
-                    let accepted_at = read_u64(row.get::<_, i64>(31)?, 31)?;
-                    let status: String = row.get(32)?;
-                    let settlement_ref: Option<String> = row.get(33)?;
-                    let receipt: Option<String> = row.get(34)?;
-                    let outcome: Option<String> = row.get(35)?;
-                    let settled_at: Option<i64> = row.get(36)?;
-                    let reconciliation: Option<String> = row.get(37)?;
-                    let evidence: Option<String> = row.get(38)?;
+                    let accepted_at = read_u64(row.get::<_, i64>(32)?, 32)?;
+                    let status: String = row.get(33)?;
+                    let settlement_ref: Option<String> = row.get(34)?;
+                    let receipt: Option<String> = row.get(35)?;
+                    let outcome: Option<String> = row.get(36)?;
+                    let settled_at: Option<i64> = row.get(37)?;
+                    let reconciliation: Option<String> = row.get(38)?;
+                    let evidence: Option<String> = row.get(39)?;
                     let issuance_record = AgIssuanceWireV1 {
                         schema: AG_ISSUANCE_SCHEMA_V1.to_owned(),
                         issuance: issuance.to_owned(),
@@ -860,7 +906,7 @@ impl GovernedCustodyStoreV1 {
                                     "failure" => KnownOutcomeWireV1::Failure,
                                     _ => return Err(sql_decode("governed outcome")),
                                 },
-                                settled_at_unix_ms: read_u64(at, 36)?,
+                                settled_at_unix_ms: read_u64(at, 37)?,
                             })
                         }
                         (None, None, None, None) => None,
@@ -895,9 +941,10 @@ impl GovernedCustodyStoreV1 {
                         executor_expected_content: row.get(25)?,
                         executor_representation_content: row.get(26)?,
                         executor_representation_method: row.get(27)?,
-                        executor_invocation_method: row.get(28)?,
-                        executor_launch: row.get(29)?,
-                        executor_dispatch_content: row.get(30)?,
+                        executor_representation_authority: row.get(28)?,
+                        executor_invocation_method: row.get(29)?,
+                        executor_launch: row.get(30)?,
+                        executor_dispatch_content: row.get(31)?,
                         status,
                         settlement: known,
                         indeterminate,
@@ -1005,9 +1052,10 @@ impl GovernedCustodyStoreV1 {
         if method != expected_method {
             return Err("foreign executor invocation method".to_owned());
         }
-        let canonical = if let (Some(content), Some(representation_method)) = (
+        let canonical = if let (Some(content), Some(representation_method), Some(authority)) = (
             &binding.representation_content,
             &binding.representation_method,
+            &binding.representation_authority,
         ) {
             serde_json::to_vec(&serde_json::json!({
                 "attempt": custody.attempt,
@@ -1017,6 +1065,7 @@ impl GovernedCustodyStoreV1 {
                 "method": method,
                 "representation_content": content,
                 "representation_method": representation_method,
+                "representation_authority": authority,
             }))
             .map_err(|error| format!("executor-launch-canonical:{error}"))?
         } else {
@@ -1030,7 +1079,9 @@ impl GovernedCustodyStoreV1 {
             }))
             .map_err(|error| format!("executor-launch-canonical:{error}"))?
         };
-        let launch_domain = if binding.representation_content.is_some() {
+        let launch_domain = if binding.representation_authority.is_some() {
+            "docket.governed-loop.executor-launch/v3"
+        } else if binding.representation_content.is_some() {
             "docket.governed-loop.executor-launch/v2"
         } else {
             "docket.governed-loop.executor-launch/v1"
@@ -1157,8 +1208,9 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
         record.executor_expected_content.as_ref(),
         record.executor_representation_content.as_ref(),
         record.executor_representation_method.as_ref(),
+        record.executor_representation_authority.as_ref(),
     ) {
-        (None, None, None, None) => {
+        (None, None, None, None, None) => {
             if record.executor_invocation_method.is_some()
                 || record.executor_launch.is_some()
                 || record.executor_dispatch_content.is_some()
@@ -1176,7 +1228,7 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
                 return Err("governed-stored-executor-binding-substitution".to_owned());
             }
         }
-        (Some(program_content), Some(expected_content), None, None) => {
+        (Some(program_content), Some(expected_content), None, None, None) => {
             require_digest(program_content, "stored executor content")?;
             require_digest(expected_content, "stored expected executor content")?;
             let binding = serde_json::to_vec(&serde_json::json!({
@@ -1225,6 +1277,7 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
             Some(expected_content),
             Some(representation_content),
             Some(representation_method),
+            None,
         ) => {
             for (value, label) in [
                 (program_content, "stored source candidate content"),
@@ -1281,6 +1334,77 @@ fn validate_stored_record(record: &CustodyRecordV1) -> Result<(), String> {
                     }
                 }
                 _ => return Err("partial stored executor representation custody".to_owned()),
+            }
+        }
+        (
+            Some(program_content),
+            Some(expected_content),
+            Some(representation_content),
+            Some(representation_method),
+            Some(authority),
+        ) => {
+            for (value, label) in [
+                (program_content, "stored source candidate content"),
+                (expected_content, "stored expected executor content"),
+                (
+                    representation_content,
+                    "stored execution representation content",
+                ),
+            ] {
+                require_digest(value, label)?;
+            }
+            if representation_method != gwr_freebsd_exec::PRIVATE_UNLINKED_REGULAR_VNODE_V1 {
+                return Err("stored executor representation method".to_owned());
+            }
+            validate_authority_closure_text(authority)?;
+            let binding = serde_json::to_vec(&serde_json::json!({
+                "expected_content": expected_content,
+                "plan": record.executor_plan,
+                "program_content": program_content,
+                "program_digest": record.executor_program_digest,
+                "representation_content": representation_content,
+                "representation_method": representation_method,
+                "representation_authority": authority,
+            }))
+            .map_err(|error| format!("stored-executor-binding-canonical:{error}"))?;
+            if record.executor_binding
+                != hash_domain("docket.governed-loop.executor-binding/v4", &binding)
+            {
+                return Err("governed-stored-executor-binding-substitution".to_owned());
+            }
+            match (
+                record.executor_invocation_method.as_deref(),
+                record.executor_launch.as_ref(),
+                record.executor_dispatch_content.as_ref(),
+            ) {
+                (None, None, None) => {}
+                (Some(method), Some(launch), Some(dispatch_content)) => {
+                    if method != REPRESENTATION_INVOCATION_V1 {
+                        return Err("stored executor invocation method".to_owned());
+                    }
+                    require_digest(launch, "stored executor launch")?;
+                    require_digest(dispatch_content, "stored executor dispatch content")?;
+                    let canonical = serde_json::to_vec(&serde_json::json!({
+                        "attempt": record.custody.attempt,
+                        "binding": record.executor_binding,
+                        "dispatch_content": dispatch_content,
+                        "marker": record.custody.executor_marker,
+                        "method": method,
+                        "representation_content": representation_content,
+                        "representation_method": representation_method,
+                        "representation_authority": authority,
+                    }))
+                    .map_err(|error| format!("stored-executor-launch-canonical:{error}"))?;
+                    if launch != &hash_domain("docket.governed-loop.executor-launch/v3", &canonical)
+                    {
+                        return Err("governed-stored-executor-launch-substitution".to_owned());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "partial stored finalized executor representation custody".to_owned()
+                    )
+                }
             }
         }
         _ => return Err("partial stored executor content selection".to_owned()),
@@ -1461,6 +1585,87 @@ fn strict_json<T: DeserializeOwned>(bytes: &[u8], label: &str) -> Result<T, Stri
     serde_json::from_slice(bytes).map_err(|error| format!("{label}-json:{error}"))
 }
 
+fn validate_authority_closure(
+    authority: &ExecutionRepresentationAuthorityClosureWireV1,
+) -> Result<(), String> {
+    if authority.schema != gwr_freebsd_exec::AUTHORITY_CLOSURE_SCHEMA_V1
+        || authority.creator != "docket_first_stage_adapter"
+        || authority.representation_method != gwr_freebsd_exec::PRIVATE_UNLINKED_REGULAR_VNODE_V1
+        || authority.writer_descriptors_created != 1
+        || authority.writer_descriptors_duplicated != 0
+        || authority.writer_descriptors_closed_before_measurement != 1
+        || authority.writable_descriptors_surviving_finalization != 0
+        || authority.writable_descriptors_inherited != 0
+        || authority.representation_links_at_finalization != 0
+        || authority.surviving_descriptor_access != "read_only"
+        || authority.surviving_rights_profile != gwr_freebsd_exec::FIRST_STAGE_RIGHTS_PROFILE_V1
+        || (authority.direct_write_probe_errno != libc::EBADF
+            && authority.direct_write_probe_errno != 93)
+        || authority.write_reacquisition_method != "openat_empty_path_rdwr"
+        || authority.write_reacquisition_errno != 93
+        || authority.finalization_sequence >= authority.measurement_sequence
+        || authority.measurement_sequence >= authority.invocation_sequence
+        || authority.descriptor_transfer != "read_only_reader_fork_inherited_for_fexecve"
+    {
+        return Err("execution-representation-authority-closure-invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn authority_closure_text(
+    authority: &ExecutionRepresentationAuthorityClosureWireV1,
+) -> Result<String, String> {
+    validate_authority_closure(authority)?;
+    String::from_utf8(
+        serde_jcs::to_vec(authority)
+            .map_err(|error| format!("execution-representation-authority-canonical:{error}"))?,
+    )
+    .map_err(|_| "execution-representation-authority-not-utf8".to_owned())
+}
+
+fn parse_authority_closure(
+    text: &str,
+) -> Result<ExecutionRepresentationAuthorityClosureWireV1, String> {
+    let authority: ExecutionRepresentationAuthorityClosureWireV1 =
+        strict_json(text.as_bytes(), "execution-representation-authority")?;
+    if authority_closure_text(&authority)? != text {
+        return Err("execution-representation-authority-not-canonical".to_owned());
+    }
+    Ok(authority)
+}
+
+fn validate_authority_closure_text(text: &str) -> Result<(), String> {
+    parse_authority_closure(text).map(|_| ())
+}
+
+#[cfg(target_os = "freebsd")]
+fn platform_authority_closure(
+    authority: &gwr_freebsd_exec::ExecutionRepresentationAuthorityClosure,
+) -> Result<String, String> {
+    authority_closure_text(&ExecutionRepresentationAuthorityClosureWireV1 {
+        schema: authority.schema.to_owned(),
+        creator: authority.creator.to_owned(),
+        representation_method: authority.representation_method.to_owned(),
+        writer_descriptors_created: authority.writer_descriptors_created,
+        writer_descriptors_duplicated: authority.writer_descriptors_duplicated,
+        writer_descriptors_closed_before_measurement: authority
+            .writer_descriptors_closed_before_measurement,
+        writable_descriptors_surviving_finalization: authority
+            .writable_descriptors_surviving_finalization,
+        writable_descriptors_inherited: authority.writable_descriptors_inherited,
+        representation_links_at_finalization: authority.representation_links_at_finalization,
+        surviving_descriptor_access: authority.surviving_descriptor_access.to_owned(),
+        surviving_rights_profile: authority.surviving_rights_profile.to_owned(),
+        direct_write_probe_errno: authority.direct_write_probe_errno,
+        write_reacquisition_method: authority.write_reacquisition_method.to_owned(),
+        write_reacquisition_errno: authority.write_reacquisition_errno,
+        finalization_sequence: authority.finalization_sequence,
+        measurement_sequence: authority.measurement_sequence,
+        invocation_sequence: authority.invocation_sequence,
+        descriptor_transfer: authority.descriptor_transfer.to_owned(),
+    })
+}
+
 fn resolve_executor_binding(
     program: &Path,
     config: &Path,
@@ -1506,11 +1711,16 @@ fn resolve_executor_binding(
     let selection = resolve_executor_selection(config, expected_work_schema, expected_plan)?;
     match selection {
         Some(expected_content) => {
-            let (opened_program, representation_content, representation_method) =
-                execution_representation(executable, representation_base, &bytes)?;
-            let canonical = if let (Some(content), Some(method)) =
-                (&representation_content, &representation_method)
-            {
+            let representation = execution_representation(executable, representation_base, &bytes)?;
+            let opened_program = representation.executable;
+            let representation_content = representation.content;
+            let representation_method = representation.method;
+            let representation_authority = representation.authority;
+            let canonical = if let (Some(content), Some(method), Some(authority)) = (
+                &representation_content,
+                &representation_method,
+                &representation_authority,
+            ) {
                 serde_json::to_vec(&serde_json::json!({
                     "expected_content": expected_content,
                     "plan": expected_plan,
@@ -1518,6 +1728,7 @@ fn resolve_executor_binding(
                     "program_digest": program_digest,
                     "representation_content": content,
                     "representation_method": method,
+                    "representation_authority": authority,
                 }))
                 .map_err(|error| format!("governed-executor-binding-canonical:{error}"))?
             } else {
@@ -1529,7 +1740,9 @@ fn resolve_executor_binding(
                 }))
                 .map_err(|error| format!("governed-executor-binding-canonical:{error}"))?
             };
-            let identity_domain = if representation_content.is_some() {
+            let identity_domain = if representation_authority.is_some() {
+                "docket.governed-loop.executor-binding/v4"
+            } else if representation_content.is_some() {
                 "docket.governed-loop.executor-binding/v3"
             } else {
                 "docket.governed-loop.executor-binding/v2"
@@ -1543,6 +1756,7 @@ fn resolve_executor_binding(
                     expected_content: Some(expected_content),
                     representation_content,
                     representation_method,
+                    representation_authority,
                 },
                 opened_program: Some(opened_program),
             })
@@ -1566,6 +1780,7 @@ fn resolve_executor_binding(
                     expected_content: None,
                     representation_content: None,
                     representation_method: None,
+                    representation_authority: None,
                 },
                 opened_program: None,
             })
@@ -1632,7 +1847,7 @@ fn execution_representation(
     _source: File,
     representation_base: &Path,
     bytes: &[u8],
-) -> Result<(File, Option<String>, Option<String>), String> {
+) -> Result<PreparedExecutionRepresentation, String> {
     let mut representation =
         gwr_freebsd_exec::prepare_execution_representation(representation_base, bytes)
             .map_err(|error| format!("governed-executor-representation:{error}"))?;
@@ -1655,11 +1870,13 @@ fn execution_representation(
         .executable
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("governed-executor-representation-rewind:{error}"))?;
-    Ok((
-        representation.executable,
-        Some(file_content_digest(&measured)),
-        Some(representation.method.to_owned()),
-    ))
+    let authority = platform_authority_closure(&representation.authority)?;
+    Ok(PreparedExecutionRepresentation {
+        executable: representation.executable,
+        content: Some(file_content_digest(&measured)),
+        method: Some(representation.method.to_owned()),
+        authority: Some(authority),
+    })
 }
 
 #[cfg(not(target_os = "freebsd"))]
@@ -1667,11 +1884,16 @@ fn execution_representation(
     mut source: File,
     _representation_base: &Path,
     _bytes: &[u8],
-) -> Result<(File, Option<String>, Option<String>), String> {
+) -> Result<PreparedExecutionRepresentation, String> {
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("governed-executor-rewind:{error}"))?;
-    Ok((source, None, None))
+    Ok(PreparedExecutionRepresentation {
+        executable: source,
+        content: None,
+        method: None,
+        authority: None,
+    })
 }
 
 fn executor_invocation_method(binding: &ExecutorBindingV1) -> &'static str {
