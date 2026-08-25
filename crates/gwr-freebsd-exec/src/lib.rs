@@ -483,8 +483,32 @@ pub fn prepare_execution_representation(
 mod tests {
     use super::prepare_execution_representation;
     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::PermissionsExt as _;
+
+    fn assert_no_write_or_reacquisition(fd: libc::c_int) {
+        let byte = [0_u8];
+        assert_eq!(
+            unsafe { libc::pwrite(fd, byte.as_ptr().cast(), byte.len(), 0) },
+            -1
+        );
+        assert!(matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF) | Some(libc::ENOTCAPABLE)
+        ));
+        let reopened = unsafe {
+            libc::openat(
+                fd,
+                c"".as_ptr(),
+                libc::O_EMPTY_PATH | libc::O_RDWR | libc::O_CLOEXEC,
+            )
+        };
+        assert_eq!(reopened, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTCAPABLE)
+        );
+    }
 
     #[test]
     fn representation_is_unlinked_read_only_and_source_decoupled() {
@@ -517,6 +541,66 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ENOTCAPABLE)
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicated_and_fork_inherited_readers_cannot_reacquire_writing() {
+        let root = std::env::temp_dir().join(format!(
+            "gwr-m7-representation-authority-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let representation =
+            prepare_execution_representation(&root, b"finalized representation").unwrap();
+        assert_no_write_or_reacquisition(representation.executable.as_raw_fd());
+
+        let duplicate_fd = unsafe {
+            libc::fcntl(
+                representation.executable.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                3,
+            )
+        };
+        assert!(duplicate_fd >= 0);
+        let duplicate = unsafe { std::fs::File::from_raw_fd(duplicate_fd) };
+        assert_no_write_or_reacquisition(duplicate.as_raw_fd());
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let byte = [0_u8];
+            let write_result = unsafe {
+                libc::pwrite(
+                    representation.executable.as_raw_fd(),
+                    byte.as_ptr().cast(),
+                    byte.len(),
+                    0,
+                )
+            };
+            let write_errno = std::io::Error::last_os_error().raw_os_error();
+            let reopened = unsafe {
+                libc::openat(
+                    representation.executable.as_raw_fd(),
+                    c"".as_ptr(),
+                    libc::O_EMPTY_PATH | libc::O_RDWR | libc::O_CLOEXEC,
+                )
+            };
+            let reopen_errno = std::io::Error::last_os_error().raw_os_error();
+            let accepted = write_result == -1
+                && matches!(write_errno, Some(libc::EBADF) | Some(libc::ENOTCAPABLE))
+                && reopened == -1
+                && reopen_errno == Some(libc::ENOTCAPABLE);
+            unsafe { libc::_exit(if accepted { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        drop(duplicate);
+        drop(representation);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
