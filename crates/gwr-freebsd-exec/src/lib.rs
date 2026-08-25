@@ -529,8 +529,14 @@ mod platform {
         };
 
         let mut status = 0;
-        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
-            return Err(io::Error::last_os_error());
+        loop {
+            if unsafe { libc::waitpid(child, &mut status, 0) } >= 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
         write_result?;
         let stdout = stdout_reader
