@@ -508,6 +508,22 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ENOTCAPABLE)
         );
+
+        for base in ["/dev/fd", "/proc/curproc/fd"] {
+            if !std::path::Path::new(base).is_dir() {
+                continue;
+            }
+            let alias = format!("{base}/{fd}");
+            let error = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(alias)
+                .expect_err("descriptor alias reacquired writable authority");
+            println!(
+                "M7_PATH_REACQUISITION_REFUSED {base} errno={:?}",
+                error.raw_os_error()
+            );
+        }
     }
 
     #[test]
@@ -552,17 +568,11 @@ mod tests {
         ));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let representation =
+        let mut representation =
             prepare_execution_representation(&root, b"finalized representation").unwrap();
         assert_no_write_or_reacquisition(representation.executable.as_raw_fd());
 
-        let duplicate_fd = unsafe {
-            libc::fcntl(
-                representation.executable.as_raw_fd(),
-                libc::F_DUPFD_CLOEXEC,
-                3,
-            )
-        };
+        let duplicate_fd = unsafe { libc::dup(representation.executable.as_raw_fd()) };
         assert!(duplicate_fd >= 0);
         let duplicate = unsafe { std::fs::File::from_raw_fd(duplicate_fd) };
         assert_no_write_or_reacquisition(duplicate.as_raw_fd());
@@ -598,6 +608,14 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
+
+        representation.executable.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained = Vec::new();
+        representation
+            .executable
+            .read_to_end(&mut retained)
+            .unwrap();
+        assert_eq!(retained, b"finalized representation");
 
         drop(duplicate);
         drop(representation);
