@@ -11,12 +11,12 @@ if [ "$(uname -m)" != "amd64" ]; then
 fi
 
 if [ "${GWR_BOOTSTRAP_FAULT_INJECTION:-0}" = "1" ]; then
-    RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
-        cargo build --locked --release -p gwr-docket-bootstrap \
-        --features fault-injection
+    cargo rustc --locked --release -p gwr-docket-bootstrap \
+        --bin gwr-docket-bootstrap --features fault-injection -- \
+        -C target-feature=+crt-static
 else
-    RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
-        cargo build --locked --release -p gwr-docket-bootstrap
+    cargo rustc --locked --release -p gwr-docket-bootstrap \
+        --bin gwr-docket-bootstrap -- -C target-feature=+crt-static
 fi
 binary=target/release/gwr-docket-bootstrap
 file "$binary"
