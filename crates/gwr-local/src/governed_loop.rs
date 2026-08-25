@@ -2299,6 +2299,7 @@ mod tests {
     use crate::store::SqliteStore;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
