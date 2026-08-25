@@ -3672,7 +3672,7 @@ mod tests {
                 object_type: "directory".to_owned(),
                 device: 7,
                 inode,
-                mode: libc::S_IFDIR | 0o700,
+                mode: u32::from(libc::S_IFDIR) | 0o700,
                 uid: 1001,
                 gid: 1001,
                 links: 2,
