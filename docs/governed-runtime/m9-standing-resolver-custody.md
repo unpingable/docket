@@ -76,3 +76,29 @@ effect causation. Static linkage is a separate native qualification obligation:
 the retained resolver artifact must have neither an ELF interpreter nor an
 ordinary `DT_NEEDED` dependency. Offline evidence verifies retained identities
 and journal structure; it cannot replay historical kernel enforcement.
+
+## Qualification closeout
+
+M9 closed **QUALIFIED WITH EXPLICIT DEPLOYMENT LIMITATION**. On stock FreeBSD
+15.1-RELEASE-p2, the qualified static resolver content was
+`sha256:d5c29db25899c9a130581ad8c667154e3e4fbefc4be96027ea2c676903ba28ab`.
+The matching occurrence finalized, measured, and descriptor-invoked that exact
+private representation. A valid static alternative
+`sha256:a5e1d95c3d20db934842c91b58dc18380204f7b0dd458c73a2fb32200511af6c`
+was measured and refused before application entry. Post-custody pathname
+replacement and source-content change did not redirect execution; a distinct
+object with byte-identical content was accepted.
+
+One preliminary occurrence established an important receipt-loss boundary:
+`waitpid(2)` was interrupted after the native effect completed, and the outer
+bootstrap therefore retained no completion record. The consumed occurrence was
+not reused. Commit `7371b637b0b39d4a80a7b7c07b981edf78c01964` makes the shared
+descriptor-child wait retry `EINTR`; all fresh qualified occurrences and exact
+replay controls used that correction. The later
+`bbd7829109efdd46c16a39566d28e0da5bf6c908` change is test-only warning cleanup.
+
+The retained verifier binds one exact query, resolver program, launch journal,
+response, and Docket attempt. It deliberately does not establish the truth of
+the standing response or that executable and stdin content are its sole inputs:
+the frozen custody-directory and TTL environment inputs remain runtime inputs.
+The bootstrap's initial invocation remains the declared root TCB.
