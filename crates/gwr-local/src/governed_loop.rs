@@ -2142,32 +2142,59 @@ fn invoke_json<I: Serialize + ?Sized, O: DeserializeOwned>(
     input: &I,
 ) -> Result<O, String> {
     let bytes = serde_json::to_vec(input).map_err(|error| format!("process-request:{error}"))?;
-    let mut child = Command::new(program)
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("process-spawn:{}:{error}", program.display()))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "process-stdin-unavailable".to_owned())?
-        .write_all(&bytes)
-        .map_err(|error| format!("process-stdin:{error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("process-wait:{error}"))?;
-    if !output.status.success() {
+
+    #[cfg(target_os = "freebsd")]
+    let (stdout, stderr, success) = {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut argv = Vec::with_capacity(arguments.len() + 1);
+        argv.push(
+            CString::new(program.as_os_str().as_bytes())
+                .map_err(|_| "process program path contains NUL".to_owned())?,
+        );
+        for argument in arguments {
+            argv.push(
+                CString::new(argument.as_bytes())
+                    .map_err(|_| "process argument contains NUL".to_owned())?,
+            );
+        }
+        let output = gwr_freebsd_exec::invoke_path(program, &argv, &bytes)
+            .map_err(|error| format!("process-spawn:{}:{error}", program.display()))?;
+        let success = output.exit_code == Some(0) && output.signal.is_none();
+        (output.stdout, output.stderr, success)
+    };
+
+    #[cfg(not(target_os = "freebsd"))]
+    let (stdout, stderr, success) = {
+        let mut child = Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("process-spawn:{}:{error}", program.display()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "process-stdin-unavailable".to_owned())?
+            .write_all(&bytes)
+            .map_err(|error| format!("process-stdin:{error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("process-wait:{error}"))?;
+        (output.stdout, output.stderr, output.status.success())
+    };
+
+    if !success {
         return Err(format!(
             "process-refused:{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stderr)
                 .chars()
                 .take(512)
                 .collect::<String>()
         ));
     }
-    strict_json(&output.stdout, "process-response")
+    strict_json(&stdout, "process-response")
 }
 
 fn b64_decode(value: &str) -> Result<Vec<u8>, String> {

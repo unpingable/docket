@@ -75,6 +75,7 @@ mod platform {
     use std::fs::{OpenOptions, Permissions};
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -352,6 +353,27 @@ mod platform {
         invoke_with_exec_observer(executable, argv, stdin, || Ok(()))
     }
 
+    /// Invoke one exact absolute path with explicit argv/environment custody.
+    ///
+    /// This preserves Docket's pre-existing standing-resolver process boundary
+    /// while avoiding Rust's generic static-FreeBSD `Command` bootstrap.
+    pub fn invoke_path(
+        program: &Path,
+        argv: &[CString],
+        stdin: &[u8],
+    ) -> io::Result<DescriptorExecOutput> {
+        let program = CString::new(program.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "program path contains NUL")
+        })?;
+        invoke_target_with_exec_observer(ExecutionTarget::Path(&program), argv, stdin, || Ok(()))
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExecutionTarget<'a> {
+        Descriptor(&'a File),
+        Path(&'a CString),
+    }
+
     /// Invoke an executable descriptor and call `on_exec_accepted` after the
     /// kernel has accepted `fexecve(2)`, but before waiting for child exit.
     ///
@@ -359,6 +381,23 @@ mod platform {
     /// reaped and its output is drained before the callback error is returned.
     pub fn invoke_with_exec_observer<F>(
         executable: &File,
+        argv: &[CString],
+        stdin: &[u8],
+        on_exec_accepted: F,
+    ) -> io::Result<DescriptorExecOutput>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        invoke_target_with_exec_observer(
+            ExecutionTarget::Descriptor(executable),
+            argv,
+            stdin,
+            on_exec_accepted,
+        )
+    }
+
+    fn invoke_target_with_exec_observer<F>(
+        target: ExecutionTarget<'_>,
         argv: &[CString],
         stdin: &[u8],
         on_exec_accepted: F,
@@ -419,11 +458,16 @@ mod platform {
             close(pipes.stdout[1]);
             close(pipes.stderr[1]);
             unsafe {
-                libc::fexecve(
-                    executable.as_raw_fd(),
-                    argv_ptrs.as_ptr(),
-                    env_ptrs.as_ptr(),
-                );
+                match target {
+                    ExecutionTarget::Descriptor(executable) => libc::fexecve(
+                        executable.as_raw_fd(),
+                        argv_ptrs.as_ptr(),
+                        env_ptrs.as_ptr(),
+                    ),
+                    ExecutionTarget::Path(program) => {
+                        libc::execve(program.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
+                    }
+                };
             }
             let errno = io::Error::last_os_error()
                 .raw_os_error()
@@ -521,7 +565,7 @@ mod platform {
 
 #[cfg(target_os = "freebsd")]
 pub use platform::{
-    inherited_environment_bytes, invoke, invoke_with_exec_observer,
+    inherited_environment_bytes, invoke, invoke_path, invoke_with_exec_observer,
     prepare_execution_representation, prepare_execution_representation_for,
 };
 
@@ -548,6 +592,18 @@ pub fn invoke(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "descriptor executor is supported only on FreeBSD",
+    ))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn invoke_path(
+    _program: &Path,
+    _argv: &[CString],
+    _stdin: &[u8],
+) -> io::Result<DescriptorExecOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "path executor is supported only on FreeBSD",
     ))
 }
 
