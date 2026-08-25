@@ -1068,6 +1068,20 @@ impl GovernedCustodyStoreV1 {
                 "representation_authority": authority,
             }))
             .map_err(|error| format!("executor-launch-canonical:{error}"))?
+        } else if let (Some(content), Some(representation_method)) = (
+            &binding.representation_content,
+            &binding.representation_method,
+        ) {
+            serde_json::to_vec(&serde_json::json!({
+                "attempt": custody.attempt,
+                "binding": binding.identity,
+                "dispatch_content": dispatch_content,
+                "marker": custody.executor_marker,
+                "method": method,
+                "representation_content": content,
+                "representation_method": representation_method,
+            }))
+            .map_err(|error| format!("executor-launch-canonical:{error}"))?
         } else {
             serde_json::to_vec(&serde_json::json!({
                 "attempt": custody.attempt,
