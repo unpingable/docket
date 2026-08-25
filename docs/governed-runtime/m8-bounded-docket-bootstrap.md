@@ -76,3 +76,23 @@ native `file(1)`, `ldd(1)`, and `sha256(1)` witnesses.
 
 Non-FreeBSD execution refuses explicitly. The existing Docket domain, attempt,
 transaction, and replay semantics are unchanged.
+
+## Qualification closeout
+
+M8 closed **QUALIFIED WITH EXPLICIT DEPLOYMENT LIMITATION**. On FreeBSD
+15.1-RELEASE-p2 the retained static bootstrap was
+`sha256:1b23782ad784d551e32dab01284e2a2786d87035d6e004c567f340309d7177ca`
+and the expected, measured, and descriptor-invoked static Docket payload was
+`sha256:c7ae8a0c367ab4620e8a4bd5f37ed60e94af9259ea4acd3439b02648661b7d2d`.
+A valid static alternative at
+`sha256:a5e1d95c3d20db934842c91b58dc18380204f7b0dd458c73a2fb32200511af6c`
+was refused before Docket application entry. Path and source-content changes
+after custody continued to execute the retained Docket representation.
+
+The qualified statement begins at static-bootstrap application entry. It does
+not custody that bootstrap's initial invocation, Docket's later dynamic
+standing-resolver transition, or qualification-only process ancestry. Expected
+Docket content is deployment custody input, not AG authorization. The complete
+retained evidence and offline verifier are owned by absd
+`qualification/m8/`; controller closeout is owned by civild
+`research/bounded-docket-bootstrap/`.
