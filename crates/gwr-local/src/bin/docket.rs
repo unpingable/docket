@@ -378,33 +378,74 @@ fn run(args: &[String]) -> Result<(), String> {
             let envelope = read_stdin_bounded()?;
             let trust = std::fs::read(need(args, "--trust")?)
                 .map_err(|error| format!("reading governed-loop trust: {error}"))?;
-            let resolver_custody = match (
-                flag(args, "--standing-resolver-content"),
-                flag(args, "--standing-resolver-journal"),
-            ) {
-                (None, None) => None,
-                (Some(expected_content), Some(journal)) => {
-                    Some(governed_loop::StandingResolverExactCustodyV1 {
+            let expected_content = flag(args, "--standing-resolver-content");
+            let journal = flag(args, "--standing-resolver-journal");
+            let ttl_ms = flag(args, "--standing-resolver-ttl-ms");
+            let custody_directory = flag(args, "--standing-resolver-custody-directory");
+            let resolver = PathBuf::from(need(args, "--standing-resolver")?);
+            let executor = PathBuf::from(need(args, "--executor")?);
+            let executor_config = PathBuf::from(need(args, "--executor-config")?);
+            let custody = match (expected_content, journal, ttl_ms, custody_directory) {
+                (None, None, None, None) => governed_loop::accept_with_standing_resolver_custody(
+                    &st.dir.join("state.sqlite"),
+                    &envelope,
+                    &trust,
+                    &resolver,
+                    None,
+                    &executor,
+                    &executor_config,
+                ),
+                (Some(expected_content), Some(journal), None, None) => {
+                    let exact = governed_loop::StandingResolverExactCustodyV1 {
                         expected_content,
                         journal: PathBuf::from(journal),
-                    })
-                }
-                _ => {
-                    return Err(
-                        "--standing-resolver-content and --standing-resolver-journal must be supplied together"
-                            .to_owned(),
+                    };
+                    governed_loop::accept_with_standing_resolver_custody(
+                        &st.dir.join("state.sqlite"),
+                        &envelope,
+                        &trust,
+                        &resolver,
+                        Some(&exact),
+                        &executor,
+                        &executor_config,
                     )
                 }
-            };
-            let custody = governed_loop::accept_with_standing_resolver_custody(
-                &st.dir.join("state.sqlite"),
-                &envelope,
-                &trust,
-                &PathBuf::from(need(args, "--standing-resolver")?),
-                resolver_custody.as_ref(),
-                &PathBuf::from(need(args, "--executor")?),
-                &PathBuf::from(need(args, "--executor-config")?),
-            )?;
+                (
+                    Some(expected_content),
+                    Some(journal),
+                    Some(ttl_ms),
+                    Some(custody_directory),
+                ) => {
+                    let ttl_ms = ttl_ms.parse::<u64>().map_err(|_| {
+                        "--standing-resolver-ttl-ms must be a positive decimal integer".to_owned()
+                    })?;
+                    if ttl_ms == 0 {
+                        return Err(
+                            "--standing-resolver-ttl-ms must be a positive decimal integer"
+                                .to_owned(),
+                        );
+                    }
+                    let exact = governed_loop::StandingResolverExactCustodyV2 {
+                        expected_content,
+                        journal: PathBuf::from(journal),
+                        ttl_ms,
+                        custody_directory: PathBuf::from(custody_directory),
+                    };
+                    governed_loop::accept_with_standing_resolver_input_closure(
+                        &st.dir.join("state.sqlite"),
+                        &envelope,
+                        &trust,
+                        &resolver,
+                        &exact,
+                        &executor,
+                        &executor_config,
+                    )
+                }
+                _ => Err(
+                    "standing resolver exact mode requires content+journal, with ttl-ms+custody-directory either both absent (v1) or both present (v2)"
+                        .to_owned(),
+                ),
+            }?;
             println!(
                 "{}",
                 serde_json::to_string(&custody)

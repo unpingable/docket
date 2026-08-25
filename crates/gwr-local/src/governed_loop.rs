@@ -37,6 +37,10 @@ pub const DESCRIPTOR_INVOCATION_V1: &str = "freebsd_fexecve_preopened_descriptor
 pub const REPRESENTATION_INVOCATION_V1: &str = "freebsd_fexecve_private_unlinked_regular_vnode_v1";
 pub const STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V1: &str =
     "civil.docket.standing-resolver-launch-record/v1";
+pub const STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V2: &str =
+    "civil.docket.standing-resolver-launch-record/v2";
+pub const STANDING_RESOLVER_INPUT_SET_SCHEMA_V1: &str =
+    "civil.docket.standing-resolver-input-set/v1";
 
 const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
@@ -56,6 +60,54 @@ const MAX_STANDING_RESOLVER_BYTES: u64 = 16 * 1024 * 1024;
 pub struct StandingResolverExactCustodyV1 {
     pub expected_content: String,
     pub journal: PathBuf,
+}
+
+/// M10 exact semantic-input closure for the already-custodied resolver.
+///
+/// TTL and custody directory are deployment/runtime inputs. They do not
+/// become AG work semantics: Docket binds and transports their exact values to
+/// the external standing authority without interpreting the standing result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandingResolverExactCustodyV2 {
+    pub expected_content: String,
+    pub journal: PathBuf,
+    pub ttl_ms: u64,
+    pub custody_directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingResolverCustodyDirectoryProjectionV1 {
+    pub object_type: String,
+    pub device: u64,
+    pub inode: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub links: u64,
+    pub semantic_role: String,
+    pub access_method: String,
+    pub inherited_fd: i32,
+    pub request_entry: String,
+    pub response_entry: String,
+    pub update_semantics: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingResolverInputSetV1 {
+    pub schema: String,
+    pub request_sha256: String,
+    pub now_unix_ms: u64,
+    pub ttl_ms: u64,
+    pub time_source: String,
+    pub custody_directory_locator: String,
+    pub custody_directory_projection: StandingResolverCustodyDirectoryProjectionV1,
+    pub argv: Vec<String>,
+    pub environment: Vec<String>,
+    pub working_directory: String,
+    pub inherited_descriptor_profile: String,
+    pub umask_octal: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -79,6 +131,10 @@ struct StandingResolverLaunchRecordV1 {
     prior_record_sha256: Option<String>,
     issuance: String,
     request_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_input_set_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing_input_set: Option<StandingResolverInputSetV1>,
     expected_resolver_content: String,
     source_candidate_content: Option<String>,
     private_representation_content: Option<String>,
@@ -108,6 +164,9 @@ struct StandingResolverJournalV1 {
     launch: String,
     issuance: String,
     request_sha256: String,
+    schema: String,
+    standing_input_set_sha256: Option<String>,
+    standing_input_set: Option<StandingResolverInputSetV1>,
     expected_resolver_content: String,
     sequence: u8,
     prior_record_sha256: Option<String>,
@@ -124,6 +183,14 @@ struct StandingResolverInvocationV1 {
     representation_links: u64,
     representation_authority: ExecutionRepresentationAuthorityClosureWireV1,
     output: gwr_freebsd_exec::DescriptorExecOutput,
+}
+
+#[cfg(target_os = "freebsd")]
+struct PreparedStandingResolverInputsV1 {
+    input_set: StandingResolverInputSetV1,
+    input_set_sha256: String,
+    custody_directory: File,
+    environment: Vec<CString>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,21 +562,49 @@ impl StandingResolverJournalV1 {
             launch,
             issuance,
             request_sha256,
+            schema: STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V1.to_owned(),
+            standing_input_set_sha256: None,
+            standing_input_set: None,
             expected_resolver_content,
             sequence: 0,
             prior_record_sha256: None,
         })
     }
 
+    #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+    fn create_v2(
+        path: &Path,
+        launch: String,
+        issuance: String,
+        request_sha256: String,
+        expected_resolver_content: String,
+        standing_input_set_sha256: String,
+        standing_input_set: StandingResolverInputSetV1,
+    ) -> Result<Self, String> {
+        let mut journal = Self::create(
+            path,
+            launch,
+            issuance,
+            request_sha256,
+            expected_resolver_content,
+        )?;
+        journal.schema = STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V2.to_owned();
+        journal.standing_input_set_sha256 = Some(standing_input_set_sha256);
+        journal.standing_input_set = Some(standing_input_set);
+        Ok(journal)
+    }
+
     fn base_record(&self, stage: StandingResolverLaunchStageV1) -> StandingResolverLaunchRecordV1 {
         StandingResolverLaunchRecordV1 {
-            schema: STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V1.to_owned(),
+            schema: self.schema.clone(),
             launch: self.launch.clone(),
             sequence: 0,
             stage,
             prior_record_sha256: None,
             issuance: self.issuance.clone(),
             request_sha256: self.request_sha256.clone(),
+            standing_input_set_sha256: self.standing_input_set_sha256.clone(),
+            standing_input_set: self.standing_input_set.clone(),
             expected_resolver_content: self.expected_resolver_content.clone(),
             source_candidate_content: None,
             private_representation_content: None,
@@ -761,36 +856,192 @@ fn pause_after_standing_resolver_custody(_launch: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "freebsd")]
-fn invoke_exact_standing_resolver(
+fn prepare_standing_resolver_inputs(
+    custody: &StandingResolverExactCustodyV2,
+    request: &ExecutionStandingRequestV1,
+    request_sha256: &str,
+) -> Result<PreparedStandingResolverInputsV1, String> {
+    if custody.ttl_ms == 0 {
+        return Err("standing-resolver-ttl-must-be-positive".to_owned());
+    }
+    let locator = exact_standing_custody_locator(&custody.custody_directory)?;
+    let before = std::fs::symlink_metadata(&custody.custody_directory)
+        .map_err(|error| format!("standing-resolver-custody-directory-metadata:{error}"))?;
+    if before.file_type().is_symlink() || !before.is_dir() || before.mode() & 0o077 != 0 {
+        return Err("standing-resolver-custody-directory-not-private-directory".to_owned());
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&custody.custody_directory)
+        .map_err(|error| format!("standing-resolver-custody-directory-open:{error}"))?;
+    let observed = directory
+        .metadata()
+        .map_err(|error| format!("standing-resolver-custody-directory-fstat:{error}"))?;
+    if !observed.is_dir()
+        || before.dev() != observed.dev()
+        || before.ino() != observed.ino()
+        || before.mode() != observed.mode()
+        || before.uid() != observed.uid()
+        || before.gid() != observed.gid()
+        || before.nlink() != observed.nlink()
+    {
+        return Err("standing-resolver-custody-directory-changed-while-open".to_owned());
+    }
+
+    let environment_values = vec![
+        format!(
+            "CIVIL_M3_DOCKET_STANDING_CUSTODY_FD={}",
+            gwr_freebsd_exec::EXACT_CUSTODY_DIRECTORY_FD_V1
+        ),
+        format!("CIVIL_M3_STANDING_TTL_MS={}", custody.ttl_ms),
+    ];
+    let environment = environment_values
+        .iter()
+        .map(|value| {
+            CString::new(value.as_bytes())
+                .map_err(|_| "standing-resolver-exact-environment-contains-nul".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let input_set = StandingResolverInputSetV1 {
+        schema: STANDING_RESOLVER_INPUT_SET_SCHEMA_V1.to_owned(),
+        request_sha256: request_sha256.to_owned(),
+        now_unix_ms: request.now_unix_ms,
+        ttl_ms: custody.ttl_ms,
+        time_source: "docket_system_time_unix_epoch_ms".to_owned(),
+        custody_directory_locator: locator,
+        custody_directory_projection: StandingResolverCustodyDirectoryProjectionV1 {
+            object_type: "directory".to_owned(),
+            device: observed.dev(),
+            inode: observed.ino(),
+            mode: observed.mode(),
+            uid: observed.uid(),
+            gid: observed.gid(),
+            links: observed.nlink(),
+            semantic_role: "exact_request_response_custody".to_owned(),
+            access_method: "fixed_inherited_directory_fd_openat_nofollow_v1".to_owned(),
+            inherited_fd: gwr_freebsd_exec::EXACT_CUSTODY_DIRECTORY_FD_V1,
+            request_entry: "docket-standing-request.json".to_owned(),
+            response_entry: "docket-standing-response.json".to_owned(),
+            update_semantics: "create_exclusive_or_byte_identical_v1".to_owned(),
+        },
+        argv: vec!["docket-standing-resolver".to_owned()],
+        environment: environment_values,
+        working_directory: "/".to_owned(),
+        inherited_descriptor_profile:
+            "stdio_exact_custody_directory_plus_unobserved_inherited_descriptors_v1".to_owned(),
+        umask_octal: "0077".to_owned(),
+    };
+    let input_set_sha256 = standing_resolver_input_set_digest(&input_set)?;
+    Ok(PreparedStandingResolverInputsV1 {
+        input_set,
+        input_set_sha256,
+        custody_directory: directory,
+        environment,
+    })
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+fn exact_standing_custody_locator(path: &Path) -> Result<String, String> {
+    if !path.is_absolute() {
+        return Err("standing-resolver-custody-directory-path-not-absolute".to_owned());
+    }
+    let locator = path
+        .to_str()
+        .ok_or_else(|| "standing-resolver-custody-directory-path-not-utf8".to_owned())?;
+    if locator
+        .split('/')
+        .any(|component| matches!(component, "." | ".."))
+    {
+        return Err("standing-resolver-custody-directory-path-has-dot-component".to_owned());
+    }
+    Ok(locator.to_owned())
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+fn standing_resolver_input_set_digest(
+    input_set: &StandingResolverInputSetV1,
+) -> Result<String, String> {
+    let input_set_bytes = serde_jcs::to_vec(input_set)
+        .map_err(|error| format!("standing-resolver-input-set-canonical:{error}"))?;
+    Ok(file_content_digest(&input_set_bytes))
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+fn standing_resolver_launch_identity_v2(
+    expected_content: &str,
+    issuance: &str,
+    request_sha256: &str,
+    standing_input_set_sha256: &str,
+) -> Result<String, String> {
+    let launch_basis = serde_jcs::to_vec(&serde_json::json!({
+        "expected_resolver_content": expected_content,
+        "issuance": issuance,
+        "request_sha256": request_sha256,
+        "standing_input_set_sha256": standing_input_set_sha256,
+    }))
+    .map_err(|error| format!("standing-resolver-launch-basis:{error}"))?;
+    Ok(hash_domain(
+        "docket.governed-loop.standing-resolver-launch/v2",
+        &launch_basis,
+    ))
+}
+
+#[cfg(target_os = "freebsd")]
+fn invoke_exact_standing_resolver_common(
     program: &Path,
     representation_base: &Path,
-    custody: &StandingResolverExactCustodyV1,
+    expected_content: &str,
+    journal_path: &Path,
+    exact_inputs: Option<&StandingResolverExactCustodyV2>,
     request: &ExecutionStandingRequestV1,
 ) -> Result<StandingResolverInvocationV1, String> {
-    require_digest(
-        &custody.expected_content,
-        "standing resolver expected content",
-    )?;
+    require_digest(expected_content, "standing resolver expected content")?;
     let request_bytes = serde_json::to_vec(request)
         .map_err(|error| format!("standing-resolver-request:{error}"))?;
     let request_sha256 = file_content_digest(&request_bytes);
-    let launch_basis = serde_jcs::to_vec(&serde_json::json!({
-        "expected_resolver_content": custody.expected_content,
-        "issuance": request.issuance.issuance,
-        "request_sha256": request_sha256,
-    }))
-    .map_err(|error| format!("standing-resolver-launch-basis:{error}"))?;
-    let launch = hash_domain(
-        "docket.governed-loop.standing-resolver-launch/v1",
-        &launch_basis,
-    );
-    let mut journal = StandingResolverJournalV1::create(
-        &custody.journal,
-        launch,
-        request.issuance.issuance.clone(),
-        request_sha256,
-        custody.expected_content.clone(),
-    )?;
+    let prepared_inputs = exact_inputs
+        .map(|custody| prepare_standing_resolver_inputs(custody, request, &request_sha256))
+        .transpose()?;
+    let (launch, journal) = if let Some(prepared) = prepared_inputs.as_ref() {
+        let launch = standing_resolver_launch_identity_v2(
+            expected_content,
+            &request.issuance.issuance,
+            &request_sha256,
+            &prepared.input_set_sha256,
+        )?;
+        let journal = StandingResolverJournalV1::create_v2(
+            journal_path,
+            launch.clone(),
+            request.issuance.issuance.clone(),
+            request_sha256.clone(),
+            expected_content.to_owned(),
+            prepared.input_set_sha256.clone(),
+            prepared.input_set.clone(),
+        )?;
+        (launch, journal)
+    } else {
+        let launch_basis = serde_jcs::to_vec(&serde_json::json!({
+            "expected_resolver_content": expected_content,
+            "issuance": request.issuance.issuance,
+            "request_sha256": request_sha256,
+        }))
+        .map_err(|error| format!("standing-resolver-launch-basis:{error}"))?;
+        let launch = hash_domain(
+            "docket.governed-loop.standing-resolver-launch/v1",
+            &launch_basis,
+        );
+        let journal = StandingResolverJournalV1::create(
+            journal_path,
+            launch.clone(),
+            request.issuance.issuance.clone(),
+            request_sha256.clone(),
+            expected_content.to_owned(),
+        )?;
+        (launch, journal)
+    };
+    debug_assert_eq!(journal.launch, launch);
+    let mut journal = journal;
     let source_bytes = match read_standing_resolver_candidate(program) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -854,7 +1105,7 @@ fn invoke_exact_standing_resolver(
         },
     };
     let content_match = invocation.source_candidate_content == invocation.representation_content
-        && invocation.representation_content == custody.expected_content;
+        && invocation.representation_content == expected_content;
     let mut prepared = invocation
         .journal
         .base_record(StandingResolverLaunchStageV1::Prepared);
@@ -879,22 +1130,34 @@ fn invoke_exact_standing_resolver(
         return Err(error);
     }
     let argv = [CString::new("docket-standing-resolver").expect("static argv has no NUL")];
-    let output = gwr_freebsd_exec::invoke_with_exec_observer(
-        &representation.executable,
-        &argv,
-        &request_bytes,
-        || {
-            let mut entered = invocation
-                .journal
-                .base_record(StandingResolverLaunchStageV1::Entered);
-            add_representation_to_record(&mut entered, &invocation);
-            entered.descriptor_exec_accepted = Some(true);
-            invocation
-                .journal
-                .append(entered)
-                .map_err(std::io::Error::other)
-        },
-    )
+    let mut on_exec_accepted = || {
+        let mut entered = invocation
+            .journal
+            .base_record(StandingResolverLaunchStageV1::Entered);
+        add_representation_to_record(&mut entered, &invocation);
+        entered.descriptor_exec_accepted = Some(true);
+        invocation
+            .journal
+            .append(entered)
+            .map_err(std::io::Error::other)
+    };
+    let output = if let Some(prepared) = prepared_inputs.as_ref() {
+        gwr_freebsd_exec::invoke_with_exact_process_inputs_and_exec_observer(
+            &representation.executable,
+            &argv,
+            &request_bytes,
+            &prepared.environment,
+            &prepared.custody_directory,
+            &mut on_exec_accepted,
+        )
+    } else {
+        gwr_freebsd_exec::invoke_with_exec_observer(
+            &representation.executable,
+            &argv,
+            &request_bytes,
+            &mut on_exec_accepted,
+        )
+    }
     .map_err(|error| format!("standing-resolver-descriptor-invoke:{error}"))?;
     invocation.output = output;
     let stage = if invocation.output.descriptor_exec_accepted {
@@ -917,6 +1180,40 @@ fn invoke_exact_standing_resolver(
     Ok(invocation)
 }
 
+#[cfg(target_os = "freebsd")]
+fn invoke_exact_standing_resolver(
+    program: &Path,
+    representation_base: &Path,
+    custody: &StandingResolverExactCustodyV1,
+    request: &ExecutionStandingRequestV1,
+) -> Result<StandingResolverInvocationV1, String> {
+    invoke_exact_standing_resolver_common(
+        program,
+        representation_base,
+        &custody.expected_content,
+        &custody.journal,
+        None,
+        request,
+    )
+}
+
+#[cfg(target_os = "freebsd")]
+fn invoke_exact_standing_resolver_v2(
+    program: &Path,
+    representation_base: &Path,
+    custody: &StandingResolverExactCustodyV2,
+    request: &ExecutionStandingRequestV1,
+) -> Result<StandingResolverInvocationV1, String> {
+    invoke_exact_standing_resolver_common(
+        program,
+        representation_base,
+        &custody.expected_content,
+        &custody.journal,
+        Some(custody),
+        request,
+    )
+}
+
 #[cfg(not(target_os = "freebsd"))]
 fn invoke_exact_standing_resolver(
     _program: &Path,
@@ -925,6 +1222,16 @@ fn invoke_exact_standing_resolver(
     _request: &ExecutionStandingRequestV1,
 ) -> Result<StandingResolverInvocationV1, String> {
     Err("standing-resolver-exact-content-mode-requires-freebsd".to_owned())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn invoke_exact_standing_resolver_v2(
+    _program: &Path,
+    _representation_base: &Path,
+    _custody: &StandingResolverExactCustodyV2,
+    _request: &ExecutionStandingRequestV1,
+) -> Result<StandingResolverInvocationV1, String> {
+    Err("standing-resolver-exact-input-mode-requires-freebsd".to_owned())
 }
 
 /// Accepts one exact issuance, consumes fresh Docket standing transactionally,
@@ -960,6 +1267,55 @@ pub fn accept_with_standing_resolver_custody(
     executor_program: &Path,
     executor_config: &Path,
 ) -> Result<DocketCustodyWireV1, String> {
+    accept_with_standing_resolver_mode(
+        database,
+        envelope_bytes,
+        trust_bytes,
+        standing_resolver,
+        standing_resolver_custody.map(StandingResolverCustodyMode::V1),
+        executor_program,
+        executor_config,
+    )
+}
+
+/// Accept with M10 exact semantic-input closure around the external standing
+/// authority. Standing request/response v1 and Docket attempt semantics remain
+/// unchanged; this version binds the exact runtime inputs to launch v2.
+pub fn accept_with_standing_resolver_input_closure(
+    database: &Path,
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+    standing_resolver: &Path,
+    standing_resolver_custody: &StandingResolverExactCustodyV2,
+    executor_program: &Path,
+    executor_config: &Path,
+) -> Result<DocketCustodyWireV1, String> {
+    accept_with_standing_resolver_mode(
+        database,
+        envelope_bytes,
+        trust_bytes,
+        standing_resolver,
+        Some(StandingResolverCustodyMode::V2(standing_resolver_custody)),
+        executor_program,
+        executor_config,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StandingResolverCustodyMode<'a> {
+    V1(&'a StandingResolverExactCustodyV1),
+    V2(&'a StandingResolverExactCustodyV2),
+}
+
+fn accept_with_standing_resolver_mode(
+    database: &Path,
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+    standing_resolver: &Path,
+    standing_resolver_custody: Option<StandingResolverCustodyMode<'_>>,
+    executor_program: &Path,
+    executor_config: &Path,
+) -> Result<DocketCustodyWireV1, String> {
     let (envelope, issuance) = verify_signed_issuance(envelope_bytes, trust_bytes)?;
     let mut store = GovernedCustodyStoreV1::open(database)?;
     if let Some(existing) = store.get(&issuance.issuance)? {
@@ -982,18 +1338,39 @@ pub fn accept_with_standing_resolver_custody(
         now_unix_ms: now,
     };
     let mut standing_invocation = None;
-    let standing: ExecutionStandingResolutionV1 = if let Some(custody) = standing_resolver_custody {
-        let mut invocation = invoke_exact_standing_resolver(
-            standing_resolver,
-            database.parent().unwrap_or_else(|| Path::new(".")),
-            custody,
-            &standing_request,
-        )?;
-        let parsed = decode_exact_standing_response(&mut invocation, &issuance, now)?;
-        standing_invocation = Some(invocation);
-        parsed
-    } else {
-        invoke_json(standing_resolver, &[], &standing_request)?
+    let standing: ExecutionStandingResolutionV1 = match standing_resolver_custody {
+        Some(StandingResolverCustodyMode::V1(custody)) => {
+            let mut invocation = invoke_exact_standing_resolver(
+                standing_resolver,
+                database.parent().unwrap_or_else(|| Path::new(".")),
+                custody,
+                &standing_request,
+            )?;
+            let parsed = decode_exact_standing_response(&mut invocation, &issuance, now)?;
+            standing_invocation = Some(invocation);
+            parsed
+        }
+        Some(StandingResolverCustodyMode::V2(custody)) => {
+            let mut invocation = invoke_exact_standing_resolver_v2(
+                standing_resolver,
+                database.parent().unwrap_or_else(|| Path::new(".")),
+                custody,
+                &standing_request,
+            )?;
+            let parsed = decode_exact_standing_response(&mut invocation, &issuance, now)?;
+            let expected_expiry = now
+                .checked_add(custody.ttl_ms)
+                .ok_or_else(|| "standing-resolver-ttl-expiry-overflow".to_owned())?;
+            if parsed.resolved_at_unix_ms != now || parsed.expires_at_unix_ms != expected_expiry {
+                invocation
+                    .journal
+                    .append_refusal("resolver_exact_time_input_mismatch")?;
+                return Err("standing-resolver-exact-time-input-mismatch".to_owned());
+            }
+            standing_invocation = Some(invocation);
+            parsed
+        }
+        None => invoke_json(standing_resolver, &[], &standing_request)?,
     };
     validate_standing(&issuance, &standing, now)?;
     let attempt = digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance)?;
@@ -3278,6 +3655,113 @@ mod tests {
         assert_eq!(
             value["execution_standing"],
             fixture.standing.execution_standing
+        );
+        assert!(value.get("standing_input_set").is_none());
+        assert!(value.get("standing_input_set_sha256").is_none());
+    }
+
+    fn exact_input_set(ttl_ms: u64, inode: u64) -> StandingResolverInputSetV1 {
+        StandingResolverInputSetV1 {
+            schema: STANDING_RESOLVER_INPUT_SET_SCHEMA_V1.to_owned(),
+            request_sha256: digest("resolver-request"),
+            now_unix_ms: 1_787_463_534_049,
+            ttl_ms,
+            time_source: "docket_system_time_unix_epoch_ms".to_owned(),
+            custody_directory_locator: "/var/db/civild-standing/example".to_owned(),
+            custody_directory_projection: StandingResolverCustodyDirectoryProjectionV1 {
+                object_type: "directory".to_owned(),
+                device: 7,
+                inode,
+                mode: libc::S_IFDIR | 0o700,
+                uid: 1001,
+                gid: 1001,
+                links: 2,
+                semantic_role: "exact_request_response_custody".to_owned(),
+                access_method: "fixed_inherited_directory_fd_openat_nofollow_v1".to_owned(),
+                inherited_fd: gwr_freebsd_exec::EXACT_CUSTODY_DIRECTORY_FD_V1,
+                request_entry: "docket-standing-request.json".to_owned(),
+                response_entry: "docket-standing-response.json".to_owned(),
+                update_semantics: "create_exclusive_or_byte_identical_v1".to_owned(),
+            },
+            argv: vec!["docket-standing-resolver".to_owned()],
+            environment: vec![
+                "CIVIL_M3_DOCKET_STANDING_CUSTODY_FD=64".to_owned(),
+                format!("CIVIL_M3_STANDING_TTL_MS={ttl_ms}"),
+            ],
+            working_directory: "/".to_owned(),
+            inherited_descriptor_profile:
+                "stdio_exact_custody_directory_plus_unobserved_inherited_descriptors_v1".to_owned(),
+            umask_octal: "0077".to_owned(),
+        }
+    }
+
+    #[test]
+    fn exact_custody_locator_refuses_relative_and_dot_component_paths() {
+        assert_eq!(
+            exact_standing_custody_locator(Path::new("/var/db/civild-standing/occurrence"))
+                .unwrap(),
+            "/var/db/civild-standing/occurrence"
+        );
+        for refused in [
+            "var/db/civild-standing/occurrence",
+            "/var/db/./civild-standing/occurrence",
+            "/var/db/civild-standing/../other",
+        ] {
+            assert!(exact_standing_custody_locator(Path::new(refused)).is_err());
+        }
+    }
+
+    #[test]
+    fn launch_v2_binds_exact_material_input_set_without_reinterpreting_v1() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let input = exact_input_set(60_000, 41);
+        let digest_a = standing_resolver_input_set_digest(&input).unwrap();
+        let ttl_changed = standing_resolver_input_set_digest(&exact_input_set(60_001, 41)).unwrap();
+        let directory_changed =
+            standing_resolver_input_set_digest(&exact_input_set(60_000, 42)).unwrap();
+        assert_ne!(digest_a, ttl_changed);
+        assert_ne!(digest_a, directory_changed);
+
+        let launch = standing_resolver_launch_identity_v2(
+            &digest("resolver-content"),
+            &fixture.issuance.issuance,
+            &input.request_sha256,
+            &digest_a,
+        )
+        .unwrap();
+        let substituted = standing_resolver_launch_identity_v2(
+            &digest("resolver-content"),
+            &fixture.issuance.issuance,
+            &input.request_sha256,
+            &ttl_changed,
+        )
+        .unwrap();
+        assert_ne!(launch, substituted);
+
+        let path = fixture.root.join("resolver-input-set-v2.jsonl");
+        let mut journal = StandingResolverJournalV1::create_v2(
+            &path,
+            launch.clone(),
+            fixture.issuance.issuance.clone(),
+            input.request_sha256.clone(),
+            digest("resolver-content"),
+            digest_a.clone(),
+            input.clone(),
+        )
+        .unwrap();
+        journal
+            .append(journal.base_record(StandingResolverLaunchStageV1::Prepared))
+            .unwrap();
+        drop(journal);
+        let record: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(record["schema"], STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V2);
+        assert_eq!(record["launch"], launch);
+        assert_eq!(record["standing_input_set_sha256"], digest_a);
+        assert_eq!(record["standing_input_set"]["ttl_ms"], 60_000);
+        assert_eq!(
+            record["standing_input_set"]["custody_directory_projection"]["inode"],
+            41
         );
     }
 

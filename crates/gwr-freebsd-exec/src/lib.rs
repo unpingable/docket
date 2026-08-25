@@ -40,6 +40,14 @@ pub const PRIVATE_UNLINKED_REGULAR_VNODE_V1: &str = "freebsd_private_unlinked_re
 pub const AUTHORITY_CLOSURE_SCHEMA_V1: &str =
     "civil.managed-file.execution-representation-authority-closure/v1";
 pub const FIRST_STAGE_RIGHTS_PROFILE_V1: &str = "read_seek_fstat_fexecve_v1";
+/// Fixed descriptor used by the exact standing-resolver process contract.
+///
+/// The launch adapter installs the already-opened directory object at this
+/// descriptor immediately before `fexecve(2)`. The number is protocol, not a
+/// discovery mechanism.
+pub const EXACT_CUSTODY_DIRECTORY_FD_V1: i32 = 64;
+/// Fixed child umask used by the exact process-input launch profile.
+pub const EXACT_PROCESS_UMASK_V1: u32 = 0o077;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRepresentationAuthorityClosure {
@@ -365,7 +373,9 @@ mod platform {
         let program = CString::new(program.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "program path contains NUL")
         })?;
-        invoke_target_with_exec_observer(ExecutionTarget::Path(&program), argv, stdin, || Ok(()))
+        invoke_target_with_exec_observer(ExecutionTarget::Path(&program), argv, stdin, None, || {
+            Ok(())
+        })
     }
 
     #[derive(Clone, Copy)]
@@ -392,14 +402,52 @@ mod platform {
             ExecutionTarget::Descriptor(executable),
             argv,
             stdin,
+            None,
             on_exec_accepted,
         )
+    }
+
+    /// Invoke one executable descriptor with an exact child environment and
+    /// one already-opened custody directory installed at a fixed descriptor.
+    ///
+    /// This is intentionally narrower than a general process sandbox. It
+    /// makes the two semantic environment inputs and the directory-object
+    /// handoff explicit, fixes the child umask, and leaves legacy invocation
+    /// behavior unchanged.
+    pub fn invoke_with_exact_process_inputs_and_exec_observer<F>(
+        executable: &File,
+        argv: &[CString],
+        stdin: &[u8],
+        environment: &[CString],
+        custody_directory: &File,
+        on_exec_accepted: F,
+    ) -> io::Result<DescriptorExecOutput>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
+        invoke_target_with_exec_observer(
+            ExecutionTarget::Descriptor(executable),
+            argv,
+            stdin,
+            Some(ExactProcessInputs {
+                environment,
+                custody_directory,
+            }),
+            on_exec_accepted,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct ExactProcessInputs<'a> {
+        environment: &'a [CString],
+        custody_directory: &'a File,
     }
 
     fn invoke_target_with_exec_observer<F>(
         target: ExecutionTarget<'_>,
         argv: &[CString],
         stdin: &[u8],
+        exact_inputs: Option<ExactProcessInputs<'_>>,
         on_exec_accepted: F,
     ) -> io::Result<DescriptorExecOutput>
     where
@@ -408,7 +456,13 @@ mod platform {
         if argv.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
         }
-        let environment = environment()?;
+        let inherited_environment;
+        let environment = if let Some(exact) = exact_inputs {
+            exact.environment
+        } else {
+            inherited_environment = environment()?;
+            &inherited_environment
+        };
         let argv_ptrs: Vec<*const libc::c_char> = argv
             .iter()
             .map(|value| value.as_ptr())
@@ -420,6 +474,35 @@ mod platform {
             .chain(std::iter::once(std::ptr::null()))
             .collect();
         let pipes = Pipes::create()?;
+        if let Some(exact) = exact_inputs {
+            let fixed_fd = super::EXACT_CUSTODY_DIRECTORY_FD_V1;
+            let target_collision =
+                matches!(target, ExecutionTarget::Descriptor(file) if file.as_raw_fd() == fixed_fd);
+            let pipe_collision = pipes
+                .stdin
+                .into_iter()
+                .chain(pipes.stdout)
+                .chain(pipes.stderr)
+                .chain(pipes.exec)
+                .any(|fd| fd == fixed_fd);
+            if exact.custody_directory.as_raw_fd() != fixed_fd
+                && (target_collision || pipe_collision)
+            {
+                for fd in pipes
+                    .stdin
+                    .into_iter()
+                    .chain(pipes.stdout)
+                    .chain(pipes.stderr)
+                    .chain(pipes.exec)
+                {
+                    close(fd);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    "fixed custody-directory descriptor collides with launch descriptor",
+                ));
+            }
+        }
         let child = unsafe { libc::fork() };
         if child < 0 {
             for fd in pipes
@@ -438,6 +521,52 @@ mod platform {
             close(pipes.stdout[0]);
             close(pipes.stderr[0]);
             close(pipes.exec[0]);
+            if let Some(exact) = exact_inputs {
+                let custody_fd = exact.custody_directory.as_raw_fd();
+                let fixed_fd = super::EXACT_CUSTODY_DIRECTORY_FD_V1;
+                if custody_fd != fixed_fd && unsafe { libc::dup2(custody_fd, fixed_fd) } < 0 {
+                    let errno = io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    unsafe {
+                        libc::write(
+                            pipes.exec[1],
+                            (&errno as *const i32).cast(),
+                            std::mem::size_of::<i32>(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+                if unsafe { libc::fcntl(fixed_fd, libc::F_SETFD, 0) } < 0 {
+                    let errno = io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    unsafe {
+                        libc::write(
+                            pipes.exec[1],
+                            (&errno as *const i32).cast(),
+                            std::mem::size_of::<i32>(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+                unsafe {
+                    libc::umask(super::EXACT_PROCESS_UMASK_V1 as libc::mode_t);
+                }
+                if unsafe { libc::chdir(c"/".as_ptr()) } < 0 {
+                    let errno = io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO);
+                    unsafe {
+                        libc::write(
+                            pipes.exec[1],
+                            (&errno as *const i32).cast(),
+                            std::mem::size_of::<i32>(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+            }
             if unsafe { libc::dup2(pipes.stdin[0], libc::STDIN_FILENO) } < 0
                 || unsafe { libc::dup2(pipes.stdout[1], libc::STDOUT_FILENO) } < 0
                 || unsafe { libc::dup2(pipes.stderr[1], libc::STDERR_FILENO) } < 0
@@ -571,7 +700,8 @@ mod platform {
 
 #[cfg(target_os = "freebsd")]
 pub use platform::{
-    inherited_environment_bytes, invoke, invoke_path, invoke_with_exec_observer,
+    inherited_environment_bytes, invoke, invoke_path,
+    invoke_with_exact_process_inputs_and_exec_observer, invoke_with_exec_observer,
     prepare_execution_representation, prepare_execution_representation_for,
 };
 
@@ -649,6 +779,24 @@ where
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "descriptor executor is supported only on FreeBSD",
+    ))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn invoke_with_exact_process_inputs_and_exec_observer<F>(
+    _executable: &File,
+    _argv: &[CString],
+    _stdin: &[u8],
+    _environment: &[CString],
+    _custody_directory: &File,
+    _on_exec_accepted: F,
+) -> io::Result<DescriptorExecOutput>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "exact process-input descriptor executor is supported only on FreeBSD",
     ))
 }
 
