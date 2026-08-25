@@ -378,11 +378,30 @@ fn run(args: &[String]) -> Result<(), String> {
             let envelope = read_stdin_bounded()?;
             let trust = std::fs::read(need(args, "--trust")?)
                 .map_err(|error| format!("reading governed-loop trust: {error}"))?;
-            let custody = governed_loop::accept(
+            let resolver_custody = match (
+                flag(args, "--standing-resolver-content"),
+                flag(args, "--standing-resolver-journal"),
+            ) {
+                (None, None) => None,
+                (Some(expected_content), Some(journal)) => {
+                    Some(governed_loop::StandingResolverExactCustodyV1 {
+                        expected_content,
+                        journal: PathBuf::from(journal),
+                    })
+                }
+                _ => {
+                    return Err(
+                        "--standing-resolver-content and --standing-resolver-journal must be supplied together"
+                            .to_owned(),
+                    )
+                }
+            };
+            let custody = governed_loop::accept_with_standing_resolver_custody(
                 &st.dir.join("state.sqlite"),
                 &envelope,
                 &trust,
                 &PathBuf::from(need(args, "--standing-resolver")?),
+                resolver_custody.as_ref(),
                 &PathBuf::from(need(args, "--executor")?),
                 &PathBuf::from(need(args, "--executor-config")?),
             )?;

@@ -13,11 +13,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-#[cfg(any(not(target_os = "freebsd"), feature = "fault-injection"))]
-use std::io::Write as _;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(target_os = "freebsd")]
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,9 +35,96 @@ pub const INSPECTION_SCHEMA_V4: &str = "docket.governed-loop.inspection/v4";
 pub const EXECUTOR_SELECTION_SCHEMA_V1: &str = "docket.governed-loop.executor-selection/v1";
 pub const DESCRIPTOR_INVOCATION_V1: &str = "freebsd_fexecve_preopened_descriptor";
 pub const REPRESENTATION_INVOCATION_V1: &str = "freebsd_fexecve_private_unlinked_regular_vnode_v1";
+pub const STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V1: &str =
+    "civil.docket.standing-resolver-launch-record/v1";
 
 const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
+// The qualified external resolver is a narrowly scoped static helper. 16 MiB
+// leaves ample native-build headroom without importing the executor's broader
+// 512 MiB bound into this bootstrap surface.
+#[cfg(target_os = "freebsd")]
+const MAX_STANDING_RESOLVER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// FreeBSD-only exact-content custody for the external standing authority.
+///
+/// This is deployment/runtime configuration, not an AG work field and not a
+/// judgment that the selected resolver is trustworthy. The expected digest
+/// identifies the exact resolver content Docket is willing to invoke for this
+/// runtime; the upstream process retains all standing semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StandingResolverExactCustodyV1 {
+    pub expected_content: String,
+    pub journal: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+enum StandingResolverLaunchStageV1 {
+    Prepared,
+    Refused,
+    Entered,
+    Completed,
+    Accepted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandingResolverLaunchRecordV1 {
+    schema: String,
+    launch: String,
+    sequence: u8,
+    stage: StandingResolverLaunchStageV1,
+    prior_record_sha256: Option<String>,
+    issuance: String,
+    request_sha256: String,
+    expected_resolver_content: String,
+    source_candidate_content: Option<String>,
+    private_representation_content: Option<String>,
+    representation_method: Option<String>,
+    representation_device: Option<u64>,
+    representation_inode: Option<u64>,
+    representation_links: Option<u64>,
+    representation_authority: Option<ExecutionRepresentationAuthorityClosureWireV1>,
+    invocation_method: String,
+    content_match: Option<bool>,
+    descriptor_exec_accepted: Option<bool>,
+    stdout_sha256: Option<String>,
+    stderr_sha256: Option<String>,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    exec_errno: Option<i32>,
+    standing_resolution: Option<String>,
+    standing_currentness: Option<String>,
+    execution_standing: Option<String>,
+    docket_attempt: Option<String>,
+    executor_marker: Option<String>,
+    refusal: Option<String>,
+}
+
+struct StandingResolverJournalV1 {
+    file: File,
+    launch: String,
+    issuance: String,
+    request_sha256: String,
+    expected_resolver_content: String,
+    sequence: u8,
+    prior_record_sha256: Option<String>,
+}
+
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+struct StandingResolverInvocationV1 {
+    journal: StandingResolverJournalV1,
+    source_candidate_content: String,
+    representation_content: String,
+    representation_method: String,
+    representation_device: u64,
+    representation_inode: u64,
+    representation_links: u64,
+    representation_authority: ExecutionRepresentationAuthorityClosureWireV1,
+    output: gwr_freebsd_exec::DescriptorExecOutput,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExecutorBindingV1 {
@@ -384,6 +471,464 @@ pub fn verify_signed_issuance(
     Ok((envelope, issuance))
 }
 
+impl StandingResolverJournalV1 {
+    #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+    fn create(
+        path: &Path,
+        launch: String,
+        issuance: String,
+        request_sha256: String,
+        expected_resolver_content: String,
+    ) -> Result<Self, String> {
+        if !path.is_absolute() {
+            return Err("standing-resolver-journal-path-not-absolute".to_owned());
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| format!("standing-resolver-journal-create:{error}"))?;
+        Ok(Self {
+            file,
+            launch,
+            issuance,
+            request_sha256,
+            expected_resolver_content,
+            sequence: 0,
+            prior_record_sha256: None,
+        })
+    }
+
+    fn base_record(&self, stage: StandingResolverLaunchStageV1) -> StandingResolverLaunchRecordV1 {
+        StandingResolverLaunchRecordV1 {
+            schema: STANDING_RESOLVER_LAUNCH_RECORD_SCHEMA_V1.to_owned(),
+            launch: self.launch.clone(),
+            sequence: 0,
+            stage,
+            prior_record_sha256: None,
+            issuance: self.issuance.clone(),
+            request_sha256: self.request_sha256.clone(),
+            expected_resolver_content: self.expected_resolver_content.clone(),
+            source_candidate_content: None,
+            private_representation_content: None,
+            representation_method: None,
+            representation_device: None,
+            representation_inode: None,
+            representation_links: None,
+            representation_authority: None,
+            invocation_method: REPRESENTATION_INVOCATION_V1.to_owned(),
+            content_match: None,
+            descriptor_exec_accepted: None,
+            stdout_sha256: None,
+            stderr_sha256: None,
+            exit_code: None,
+            signal: None,
+            exec_errno: None,
+            standing_resolution: None,
+            standing_currentness: None,
+            execution_standing: None,
+            docket_attempt: None,
+            executor_marker: None,
+            refusal: None,
+        }
+    }
+
+    fn append(&mut self, mut record: StandingResolverLaunchRecordV1) -> Result<(), String> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "standing-resolver-journal-sequence-overflow".to_owned())?;
+        if self.sequence > 8 {
+            return Err("standing-resolver-journal-record-bound".to_owned());
+        }
+        record.sequence = self.sequence;
+        record.prior_record_sha256 = self.prior_record_sha256.clone();
+        let bytes = serde_jcs::to_vec(&record)
+            .map_err(|error| format!("standing-resolver-journal-canonical:{error}"))?;
+        if bytes.len() > 128 * 1024 {
+            return Err("standing-resolver-journal-record-size".to_owned());
+        }
+        self.file
+            .write_all(&bytes)
+            .and_then(|()| self.file.write_all(b"\n"))
+            .and_then(|()| self.file.sync_all())
+            .map_err(|error| format!("standing-resolver-journal-write:{error}"))?;
+        self.prior_record_sha256 = Some(file_content_digest(&bytes));
+        Ok(())
+    }
+
+    fn append_refusal(&mut self, refusal: &str) -> Result<(), String> {
+        let mut record = self.base_record(StandingResolverLaunchStageV1::Refused);
+        record.refusal = Some(refusal.to_owned());
+        self.append(record)
+    }
+
+    fn append_accepted(
+        &mut self,
+        standing: &ExecutionStandingResolutionV1,
+        custody: &DocketCustodyWireV1,
+    ) -> Result<(), String> {
+        let mut record = self.base_record(StandingResolverLaunchStageV1::Accepted);
+        record.standing_resolution = Some(standing.resolution.clone());
+        record.standing_currentness = Some(standing.currentness.clone());
+        record.execution_standing = Some(standing.execution_standing.clone());
+        record.docket_attempt = Some(custody.attempt.clone());
+        record.executor_marker = Some(custody.executor_marker.clone());
+        self.append(record)
+    }
+}
+
+fn decode_exact_standing_response(
+    invocation: &mut StandingResolverInvocationV1,
+    issuance: &AgIssuanceWireV1,
+    now: u64,
+) -> Result<ExecutionStandingResolutionV1, String> {
+    if !invocation.output.descriptor_exec_accepted {
+        return Err(format!(
+            "standing-resolver-descriptor-invocation-refused:{}",
+            invocation.output.exec_errno.unwrap_or(libc::EIO)
+        ));
+    }
+    if invocation.output.exit_code != Some(0) || invocation.output.signal.is_some() {
+        invocation
+            .journal
+            .append_refusal("resolver_process_refused")?;
+        return Err(format!(
+            "standing-resolver-refused:exit={:?}:signal={:?}:{}",
+            invocation.output.exit_code,
+            invocation.output.signal,
+            String::from_utf8_lossy(&invocation.output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        ));
+    }
+    let standing = match strict_json(&invocation.output.stdout, "process-response") {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            invocation
+                .journal
+                .append_refusal("resolver_response_decode_refused")?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_standing(issuance, &standing, now) {
+        invocation
+            .journal
+            .append_refusal("resolver_response_semantics_refused")?;
+        return Err(error);
+    }
+    Ok(standing)
+}
+
+#[cfg(target_os = "freebsd")]
+fn read_standing_resolver_candidate(path: &Path) -> Result<Vec<u8>, String> {
+    if !path.is_absolute() {
+        return Err("standing-resolver-path-not-absolute".to_owned());
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("standing-resolver-metadata:{error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_STANDING_RESOLVER_BYTES
+        || metadata.mode() & 0o111 == 0
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err("standing-resolver-candidate-custody".to_owned());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("standing-resolver-open:{error}"))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("standing-resolver-opened-metadata:{error}"))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(before.len()).map_err(|_| "standing-resolver-size-overflow".to_owned())?,
+    );
+    file.by_ref()
+        .take(MAX_STANDING_RESOLVER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("standing-resolver-read:{error}"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("standing-resolver-reread-metadata:{error}"))?;
+    if bytes.len() as u64 != before.len()
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+    {
+        return Err("standing-resolver-candidate-changed-while-read".to_owned());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "freebsd")]
+fn resolver_authority_wire(
+    authority: &gwr_freebsd_exec::ExecutionRepresentationAuthorityClosure,
+) -> Result<ExecutionRepresentationAuthorityClosureWireV1, String> {
+    let wire = authority_wire(authority);
+    if wire.schema != gwr_freebsd_exec::AUTHORITY_CLOSURE_SCHEMA_V1
+        || wire.creator != "docket_standing_resolver"
+        || wire.representation_method != gwr_freebsd_exec::PRIVATE_UNLINKED_REGULAR_VNODE_V1
+        || wire.writer_descriptors_created != 1
+        || wire.writer_descriptors_duplicated != 0
+        || wire.writer_descriptors_closed_before_measurement != 1
+        || wire.writable_descriptors_surviving_finalization != 0
+        || wire.writable_descriptors_inherited != 0
+        || wire.representation_links_at_finalization != 0
+        || wire.surviving_descriptor_access != "read_only"
+        || wire.surviving_rights_profile != gwr_freebsd_exec::FIRST_STAGE_RIGHTS_PROFILE_V1
+        || (wire.direct_write_probe_errno != libc::EBADF
+            && wire.direct_write_probe_errno != libc::ENOTCAPABLE)
+        || wire.write_reacquisition_method != "openat_empty_path_rdwr"
+        || wire.write_reacquisition_errno != libc::ENOTCAPABLE
+        || wire.finalization_sequence >= wire.measurement_sequence
+        || wire.measurement_sequence >= wire.invocation_sequence
+        || wire.descriptor_transfer != "read_only_reader_fork_inherited_for_fexecve"
+    {
+        return Err("standing-resolver-authority-closure-invalid".to_owned());
+    }
+    Ok(wire)
+}
+
+#[cfg(target_os = "freebsd")]
+fn add_representation_to_record(
+    record: &mut StandingResolverLaunchRecordV1,
+    invocation: &StandingResolverInvocationV1,
+) {
+    record.source_candidate_content = Some(invocation.source_candidate_content.clone());
+    record.private_representation_content = Some(invocation.representation_content.clone());
+    record.representation_method = Some(invocation.representation_method.clone());
+    record.representation_device = Some(invocation.representation_device);
+    record.representation_inode = Some(invocation.representation_inode);
+    record.representation_links = Some(invocation.representation_links);
+    record.representation_authority = Some(invocation.representation_authority.clone());
+    record.content_match = Some(
+        invocation.source_candidate_content == invocation.representation_content
+            && invocation.representation_content == invocation.journal.expected_resolver_content,
+    );
+}
+
+#[cfg(all(target_os = "freebsd", feature = "fault-injection"))]
+fn pause_after_standing_resolver_custody(launch: &str) -> Result<(), String> {
+    let ready = std::env::var_os("GWR_M9_STANDING_RESOLVER_READY");
+    let resume = std::env::var_os("GWR_M9_STANDING_RESOLVER_RESUME");
+    if ready.is_some() != resume.is_some() {
+        return Err("standing-resolver-custody-coordination-incomplete".to_owned());
+    }
+    let Some((ready, resume)) = ready.zip(resume) else {
+        return Ok(());
+    };
+    let ready = PathBuf::from(ready);
+    let resume = PathBuf::from(resume);
+    if !ready.is_absolute() || !resume.is_absolute() {
+        return Err("standing-resolver-custody-coordination-path-not-absolute".to_owned());
+    }
+    let witness = format!("{launch}\n");
+    let mut ready_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&ready)
+        .map_err(|error| format!("standing-resolver-custody-ready:{error}"))?;
+    ready_file
+        .write_all(witness.as_bytes())
+        .and_then(|()| ready_file.sync_all())
+        .map_err(|error| format!("standing-resolver-custody-ready:{error}"))?;
+    for _ in 0..6_000 {
+        match std::fs::read(&resume) {
+            Ok(bytes) if bytes == witness.as_bytes() => return Ok(()),
+            Ok(_) => return Err("standing-resolver-custody-resume-mismatch".to_owned()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("standing-resolver-custody-resume:{error}")),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err("standing-resolver-custody-coordination-timeout".to_owned())
+}
+
+#[cfg(all(target_os = "freebsd", not(feature = "fault-injection")))]
+fn pause_after_standing_resolver_custody(_launch: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+fn invoke_exact_standing_resolver(
+    program: &Path,
+    representation_base: &Path,
+    custody: &StandingResolverExactCustodyV1,
+    request: &ExecutionStandingRequestV1,
+) -> Result<StandingResolverInvocationV1, String> {
+    require_digest(
+        &custody.expected_content,
+        "standing resolver expected content",
+    )?;
+    let request_bytes = serde_json::to_vec(request)
+        .map_err(|error| format!("standing-resolver-request:{error}"))?;
+    let request_sha256 = file_content_digest(&request_bytes);
+    let launch_basis = serde_jcs::to_vec(&serde_json::json!({
+        "expected_resolver_content": custody.expected_content,
+        "issuance": request.issuance.issuance,
+        "request_sha256": request_sha256,
+    }))
+    .map_err(|error| format!("standing-resolver-launch-basis:{error}"))?;
+    let launch = hash_domain(
+        "docket.governed-loop.standing-resolver-launch/v1",
+        &launch_basis,
+    );
+    let mut journal = StandingResolverJournalV1::create(
+        &custody.journal,
+        launch,
+        request.issuance.issuance.clone(),
+        request_sha256,
+        custody.expected_content.clone(),
+    )?;
+    let source_bytes = match read_standing_resolver_candidate(program) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            journal.append_refusal("candidate_acquisition_refused")?;
+            return Err(error);
+        }
+    };
+    let source_candidate_content = file_content_digest(&source_bytes);
+    let mut representation = match gwr_freebsd_exec::prepare_execution_representation_for(
+        representation_base,
+        &source_bytes,
+        "docket_standing_resolver",
+    ) {
+        Ok(representation) => representation,
+        Err(error) => {
+            journal.append_refusal("representation_establishment_refused")?;
+            return Err(format!("standing-resolver-representation:{error}"));
+        }
+    };
+    representation
+        .executable
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("standing-resolver-representation-rewind:{error}"))?;
+    let mut measured = Vec::new();
+    representation
+        .executable
+        .by_ref()
+        .take(MAX_STANDING_RESOLVER_BYTES + 1)
+        .read_to_end(&mut measured)
+        .map_err(|error| format!("standing-resolver-representation-read:{error}"))?;
+    representation
+        .executable
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("standing-resolver-representation-rewind:{error}"))?;
+    if measured.len() as u64 > MAX_STANDING_RESOLVER_BYTES {
+        journal.append_refusal("representation_size_refused")?;
+        return Err("standing-resolver-representation-too-large".to_owned());
+    }
+    let representation_content = file_content_digest(&measured);
+    let representation_authority = match resolver_authority_wire(&representation.authority) {
+        Ok(authority) => authority,
+        Err(error) => {
+            journal.append_refusal("representation_authority_closure_refused")?;
+            return Err(error);
+        }
+    };
+    let mut invocation = StandingResolverInvocationV1 {
+        journal,
+        source_candidate_content,
+        representation_content,
+        representation_method: representation.method.to_owned(),
+        representation_device: representation.device,
+        representation_inode: representation.inode,
+        representation_links: representation.links,
+        representation_authority,
+        output: gwr_freebsd_exec::DescriptorExecOutput {
+            descriptor_exec_accepted: false,
+            exit_code: None,
+            signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exec_errno: None,
+        },
+    };
+    let content_match = invocation.source_candidate_content == invocation.representation_content
+        && invocation.representation_content == custody.expected_content;
+    let mut prepared = invocation
+        .journal
+        .base_record(StandingResolverLaunchStageV1::Prepared);
+    add_representation_to_record(&mut prepared, &invocation);
+    invocation.journal.append(prepared)?;
+    if !content_match {
+        let mut refused = invocation
+            .journal
+            .base_record(StandingResolverLaunchStageV1::Refused);
+        add_representation_to_record(&mut refused, &invocation);
+        refused.refusal = Some("resolver_content_identity_mismatch".to_owned());
+        invocation.journal.append(refused)?;
+        return Err("standing-resolver-content-identity-mismatch".to_owned());
+    }
+    if let Err(error) = pause_after_standing_resolver_custody(&invocation.journal.launch) {
+        let mut refused = invocation
+            .journal
+            .base_record(StandingResolverLaunchStageV1::Refused);
+        add_representation_to_record(&mut refused, &invocation);
+        refused.refusal = Some(error.clone());
+        invocation.journal.append(refused)?;
+        return Err(error);
+    }
+    let argv = [CString::new("docket-standing-resolver").expect("static argv has no NUL")];
+    let output = gwr_freebsd_exec::invoke_with_exec_observer(
+        &representation.executable,
+        &argv,
+        &request_bytes,
+        || {
+            let mut entered = invocation
+                .journal
+                .base_record(StandingResolverLaunchStageV1::Entered);
+            add_representation_to_record(&mut entered, &invocation);
+            entered.descriptor_exec_accepted = Some(true);
+            invocation
+                .journal
+                .append(entered)
+                .map_err(std::io::Error::other)
+        },
+    )
+    .map_err(|error| format!("standing-resolver-descriptor-invoke:{error}"))?;
+    invocation.output = output;
+    let stage = if invocation.output.descriptor_exec_accepted {
+        StandingResolverLaunchStageV1::Completed
+    } else {
+        StandingResolverLaunchStageV1::Refused
+    };
+    let mut completed = invocation.journal.base_record(stage);
+    add_representation_to_record(&mut completed, &invocation);
+    completed.descriptor_exec_accepted = Some(invocation.output.descriptor_exec_accepted);
+    completed.stdout_sha256 = Some(file_content_digest(&invocation.output.stdout));
+    completed.stderr_sha256 = Some(file_content_digest(&invocation.output.stderr));
+    completed.exit_code = invocation.output.exit_code;
+    completed.signal = invocation.output.signal;
+    completed.exec_errno = invocation.output.exec_errno;
+    if !invocation.output.descriptor_exec_accepted {
+        completed.refusal = Some("descriptor_invocation_refused".to_owned());
+    }
+    invocation.journal.append(completed)?;
+    Ok(invocation)
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn invoke_exact_standing_resolver(
+    _program: &Path,
+    _representation_base: &Path,
+    _custody: &StandingResolverExactCustodyV1,
+    _request: &ExecutionStandingRequestV1,
+) -> Result<StandingResolverInvocationV1, String> {
+    Err("standing-resolver-exact-content-mode-requires-freebsd".to_owned())
+}
+
 /// Accepts one exact issuance, consumes fresh Docket standing transactionally,
 /// persists custody, and then invokes exactly one executor delivery.
 pub fn accept(
@@ -391,6 +936,29 @@ pub fn accept(
     envelope_bytes: &[u8],
     trust_bytes: &[u8],
     standing_resolver: &Path,
+    executor_program: &Path,
+    executor_config: &Path,
+) -> Result<DocketCustodyWireV1, String> {
+    accept_with_standing_resolver_custody(
+        database,
+        envelope_bytes,
+        trust_bytes,
+        standing_resolver,
+        None,
+        executor_program,
+        executor_config,
+    )
+}
+
+/// Accept with an optional FreeBSD exact-content custody boundary around the
+/// external standing authority. The legacy path remains the default so host
+/// behavior and already-qualified deployments are unchanged.
+pub fn accept_with_standing_resolver_custody(
+    database: &Path,
+    envelope_bytes: &[u8],
+    trust_bytes: &[u8],
+    standing_resolver: &Path,
+    standing_resolver_custody: Option<&StandingResolverExactCustodyV1>,
     executor_program: &Path,
     executor_config: &Path,
 ) -> Result<DocketCustodyWireV1, String> {
@@ -410,15 +978,25 @@ pub fn accept(
     )?;
 
     let now = now_unix_ms()?;
-    let standing: ExecutionStandingResolutionV1 = invoke_json(
-        standing_resolver,
-        &[],
-        &ExecutionStandingRequestV1 {
-            schema: STANDING_REQUEST_SCHEMA_V1.to_owned(),
-            issuance: issuance.clone(),
-            now_unix_ms: now,
-        },
-    )?;
+    let standing_request = ExecutionStandingRequestV1 {
+        schema: STANDING_REQUEST_SCHEMA_V1.to_owned(),
+        issuance: issuance.clone(),
+        now_unix_ms: now,
+    };
+    let mut standing_invocation = None;
+    let standing: ExecutionStandingResolutionV1 = if let Some(custody) = standing_resolver_custody {
+        let mut invocation = invoke_exact_standing_resolver(
+            standing_resolver,
+            database.parent().unwrap_or_else(|| Path::new(".")),
+            custody,
+            &standing_request,
+        )?;
+        let parsed = decode_exact_standing_response(&mut invocation, &issuance, now)?;
+        standing_invocation = Some(invocation);
+        parsed
+    } else {
+        invoke_json(standing_resolver, &[], &standing_request)?
+    };
     validate_standing(&issuance, &standing, now)?;
     let attempt = digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance)?;
     let marker = hash_domain(
@@ -432,6 +1010,11 @@ pub fn accept(
         || issuance.spend.as_str() == marker.as_str()
         || attempt.as_str() == marker.as_str()
     {
+        if let Some(invocation) = standing_invocation.as_mut() {
+            invocation
+                .journal
+                .append_refusal("governed_instrument_substitution")?;
+        }
         return Err("governed-instrument-substitution".to_owned());
     }
     let custody = DocketCustodyWireV1 {
@@ -445,11 +1028,25 @@ pub fn accept(
         accepted_at_unix_ms: now,
     };
     match store.insert_custody(&envelope, &issuance, &standing, &custody, &executor.binding) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some(invocation) = standing_invocation.as_mut() {
+                invocation.journal.append_accepted(&standing, &custody)?;
+            }
+        }
         Err(error) => {
             if let Some(existing) = store.get(&issuance.issuance)? {
                 require_same_envelope(&existing, &envelope, &issuance)?;
+                if let Some(invocation) = standing_invocation.as_mut() {
+                    invocation
+                        .journal
+                        .append_refusal("custody_already_inserted")?;
+                }
                 return Ok(existing.custody);
+            }
+            if let Some(invocation) = standing_invocation.as_mut() {
+                invocation
+                    .journal
+                    .append_refusal("custody_insertion_refused")?;
             }
             return Err(error);
         }
@@ -1655,10 +2252,10 @@ fn validate_authority_closure_text(text: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "freebsd")]
-fn platform_authority_closure(
+fn authority_wire(
     authority: &gwr_freebsd_exec::ExecutionRepresentationAuthorityClosure,
-) -> Result<String, String> {
-    authority_closure_text(&ExecutionRepresentationAuthorityClosureWireV1 {
+) -> ExecutionRepresentationAuthorityClosureWireV1 {
+    ExecutionRepresentationAuthorityClosureWireV1 {
         schema: authority.schema.to_owned(),
         creator: authority.creator.to_owned(),
         representation_method: authority.representation_method.to_owned(),
@@ -1679,7 +2276,14 @@ fn platform_authority_closure(
         measurement_sequence: authority.measurement_sequence,
         invocation_sequence: authority.invocation_sequence,
         descriptor_transfer: authority.descriptor_transfer.to_owned(),
-    })
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn platform_authority_closure(
+    authority: &gwr_freebsd_exec::ExecutionRepresentationAuthorityClosure,
+) -> Result<String, String> {
+    authority_closure_text(&authority_wire(authority))
 }
 
 fn resolve_executor_binding(
@@ -2313,6 +2917,7 @@ mod tests {
         envelope: Vec<u8>,
         issuance: AgIssuanceWireV1,
         custody: DocketCustodyWireV1,
+        standing: ExecutionStandingResolutionV1,
         standing_program: std::path::PathBuf,
         executor_program: std::path::PathBuf,
     }
@@ -2445,6 +3050,7 @@ mod tests {
             envelope: serde_json::to_vec(&envelope).unwrap(),
             issuance,
             custody,
+            standing,
             standing_program,
             executor_program,
         }
@@ -2502,6 +3108,213 @@ mod tests {
             )
             .unwrap();
         assert_eq!((attempts, standing_uses), (1, 1));
+    }
+
+    #[test]
+    fn exact_resolver_mode_replay_returns_existing_custody_before_new_journal_or_launch() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let accepted = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let journal = fixture.root.join("must-not-exist.jsonl");
+        let replay = accept_with_standing_resolver_custody(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.root.join("missing-standing-resolver"),
+            Some(&StandingResolverExactCustodyV1 {
+                expected_content: digest("not-consulted-on-replay"),
+                journal: journal.clone(),
+            }),
+            &fixture.root.join("missing-executor"),
+            &fixture.root.join("missing-config"),
+        )
+        .unwrap();
+        assert_eq!(replay, accepted);
+        assert!(!journal.exists());
+    }
+
+    fn test_exact_resolver_invocation(
+        fixture: &Fixture,
+        journal_name: &str,
+        output: gwr_freebsd_exec::DescriptorExecOutput,
+    ) -> StandingResolverInvocationV1 {
+        let expected = digest("resolver-content");
+        StandingResolverInvocationV1 {
+            journal: StandingResolverJournalV1::create(
+                &fixture.root.join(journal_name),
+                digest("resolver-launch"),
+                fixture.issuance.issuance.clone(),
+                digest("resolver-request"),
+                expected.clone(),
+            )
+            .unwrap(),
+            source_candidate_content: expected.clone(),
+            representation_content: expected,
+            representation_method: gwr_freebsd_exec::PRIVATE_UNLINKED_REGULAR_VNODE_V1.to_owned(),
+            representation_device: 1,
+            representation_inode: 2,
+            representation_links: 0,
+            representation_authority: ExecutionRepresentationAuthorityClosureWireV1 {
+                schema: gwr_freebsd_exec::AUTHORITY_CLOSURE_SCHEMA_V1.to_owned(),
+                creator: "docket_standing_resolver".to_owned(),
+                representation_method: gwr_freebsd_exec::PRIVATE_UNLINKED_REGULAR_VNODE_V1
+                    .to_owned(),
+                writer_descriptors_created: 1,
+                writer_descriptors_duplicated: 0,
+                writer_descriptors_closed_before_measurement: 1,
+                writable_descriptors_surviving_finalization: 0,
+                writable_descriptors_inherited: 0,
+                representation_links_at_finalization: 0,
+                surviving_descriptor_access: "read_only".to_owned(),
+                surviving_rights_profile: gwr_freebsd_exec::FIRST_STAGE_RIGHTS_PROFILE_V1
+                    .to_owned(),
+                direct_write_probe_errno: libc::EBADF,
+                write_reacquisition_method: "openat_empty_path_rdwr".to_owned(),
+                write_reacquisition_errno: 93,
+                finalization_sequence: 4,
+                measurement_sequence: 5,
+                invocation_sequence: 7,
+                descriptor_transfer: "read_only_reader_fork_inherited_for_fexecve".to_owned(),
+            },
+            output,
+        }
+    }
+
+    #[test]
+    fn exact_resolver_nonzero_and_malformed_responses_append_explicit_refusals() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let mut nonzero = test_exact_resolver_invocation(
+            &fixture,
+            "resolver-nonzero.jsonl",
+            gwr_freebsd_exec::DescriptorExecOutput {
+                descriptor_exec_accepted: true,
+                exit_code: Some(78),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: b"resolver refused".to_vec(),
+                exec_errno: None,
+            },
+        );
+        assert!(
+            decode_exact_standing_response(&mut nonzero, &fixture.issuance, u64::MAX - 1)
+                .unwrap_err()
+                .starts_with("standing-resolver-refused")
+        );
+        drop(nonzero);
+        let nonzero_journal =
+            std::fs::read_to_string(fixture.root.join("resolver-nonzero.jsonl")).unwrap();
+        assert!(nonzero_journal.contains("\"refusal\":\"resolver_process_refused\""));
+        assert!(!nonzero_journal.contains("\"stage\":\"accepted\""));
+
+        let mut malformed = test_exact_resolver_invocation(
+            &fixture,
+            "resolver-malformed.jsonl",
+            gwr_freebsd_exec::DescriptorExecOutput {
+                descriptor_exec_accepted: true,
+                exit_code: Some(0),
+                signal: None,
+                stdout: b"{".to_vec(),
+                stderr: Vec::new(),
+                exec_errno: None,
+            },
+        );
+        assert!(
+            decode_exact_standing_response(&mut malformed, &fixture.issuance, u64::MAX - 1)
+                .unwrap_err()
+                .starts_with("process-response-json")
+        );
+        drop(malformed);
+        let malformed_journal =
+            std::fs::read_to_string(fixture.root.join("resolver-malformed.jsonl")).unwrap();
+        assert!(malformed_journal.contains("\"refusal\":\"resolver_response_decode_refused\""));
+        assert!(!malformed_journal.contains("\"stage\":\"accepted\""));
+    }
+
+    #[test]
+    fn accepted_journal_record_exactly_binds_committed_attempt_and_standing() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let custody = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        let stored_attempt: String = connection
+            .query_row(
+                "SELECT attempt FROM governed_loop_attempt WHERE issuance=?1",
+                [&fixture.issuance.issuance],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_attempt, custody.attempt);
+        drop(connection);
+
+        let path = fixture.root.join("resolver-accepted.jsonl");
+        let mut journal = StandingResolverJournalV1::create(
+            &path,
+            digest("resolver-launch"),
+            fixture.issuance.issuance.clone(),
+            digest("resolver-request"),
+            digest("resolver-content"),
+        )
+        .unwrap();
+        journal
+            .append_accepted(&fixture.standing, &custody)
+            .unwrap();
+        drop(journal);
+        let value: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(value["stage"], "accepted");
+        assert_eq!(value["docket_attempt"], custody.attempt);
+        assert_eq!(value["executor_marker"], custody.executor_marker);
+        assert_eq!(value["standing_resolution"], fixture.standing.resolution);
+        assert_eq!(
+            value["execution_standing"],
+            fixture.standing.execution_standing
+        );
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn exact_resolver_content_mismatch_refuses_before_attempt_custody() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let journal = fixture.root.join("resolver-mismatch.jsonl");
+        let error = accept_with_standing_resolver_custody(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            Some(&StandingResolverExactCustodyV1 {
+                expected_content: digest("different-valid-resolver"),
+                journal: journal.clone(),
+            }),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "standing-resolver-content-identity-mismatch");
+        let records = std::fs::read_to_string(journal).unwrap();
+        assert_eq!(records.lines().count(), 2);
+        assert!(records.contains("\"stage\":\"prepared\""));
+        assert!(records.contains("\"stage\":\"refused\""));
+        let connection = Connection::open(&fixture.database).unwrap();
+        let attempts: i64 = connection
+            .query_row("SELECT COUNT(*) FROM governed_loop_attempt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 
     #[test]
