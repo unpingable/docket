@@ -1,6 +1,6 @@
 # M8 bounded Docket bootstrap
 
-M8 introduces `gwr-docket-bootstrap`, a deliberately small native FreeBSD
+M8 introduces `gwr-docket-bootstrap`, a deliberately bounded native FreeBSD
 bootstrap around the existing Docket application. It is deployment-custody
 plumbing, not a Docket domain service and not an authorization authority.
 
@@ -42,10 +42,22 @@ The bootstrap must be built and natively verified as static. Its initial code,
 configuration, candidate open, input opens, private-representation creation,
 and evidence-output setup remain a declared privileged initial TCB. Static
 linkage does not make that code self-authenticating or self-custodied. The
-dynamic Docket payload's runtime loader and shared libraries execute only after
-the payload object has been selected and descriptor-invoked, and remain an
-explicit post-custody runtime TCB. Host truth, provenance, causation, and
-protection from unrelated privileged host activity are not established.
+qualified Docket payload is also static: the retained native profile has no ELF
+program interpreter or ordinary `DT_NEEDED` shared-library startup dependency.
+This removes that startup dependency class; it does not make executable bytes
+the sole determinant of later process behavior.
+
+Docket later pathname-executes the frozen standing-resolver fixture. That
+interpreter/runtime transition is governance-support plumbing, not a native
+effect-executor transition, and M8 does not claim content custody for it. The
+qualification harness also uses outer SSH, `su`, Python, `truss`, and `env`
+instrumentation before bootstrap application entry. Those processes do not
+become part of the qualified effect-executable chain: the M8 result is
+conditional on the retained static bootstrap profile having entered at the
+declared outer launch boundary. It is not a claim that every executable in the
+qualification process tree is descriptor-custodied. Host truth, provenance,
+causation, and protection from unrelated privileged host activity are not
+established.
 
 The `fault-injection` feature exposes one bounded native qualification point
 after private-representation finalization and measurement and immediately
