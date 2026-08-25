@@ -116,6 +116,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gwr-docket-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "gwr-freebsd-exec",
+ "libc",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "gwr-freebsd-exec"
 version = "0.1.0"
 dependencies = [

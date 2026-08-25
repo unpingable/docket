@@ -5,6 +5,7 @@ members = [
     "crates/gwr-runtime",
     "crates/gwr-local",
     "crates/gwr-freebsd-exec",
+    "crates/gwr-docket-bootstrap",
 ]
 
 [workspace.package]

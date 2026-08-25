@@ -86,6 +86,20 @@ mod platform {
         base_directory: &Path,
         bytes: &[u8],
     ) -> io::Result<ExecutionRepresentation> {
+        prepare_execution_representation_for(base_directory, bytes, "docket_first_stage_adapter")
+    }
+
+    /// Create one finalized execution representation and identify its governed
+    /// creator in the authority-closure receipt.
+    ///
+    /// The creator is a schema value selected by the caller, not a source of
+    /// authority. It must be a compile-time constant so runtime input cannot
+    /// relabel the authority holder.
+    pub fn prepare_execution_representation_for(
+        base_directory: &Path,
+        bytes: &[u8],
+        creator: &'static str,
+    ) -> io::Result<ExecutionRepresentation> {
         let directory = base_directory.join(".gwr-execution-representations");
         match std::fs::create_dir(&directory) {
             Ok(()) => std::fs::set_permissions(&directory, Permissions::from_mode(0o700))?,
@@ -233,7 +247,7 @@ mod platform {
             links: executable_metadata.nlink(),
             authority: super::ExecutionRepresentationAuthorityClosure {
                 schema: AUTHORITY_CLOSURE_SCHEMA_V1,
-                creator: "docket_first_stage_adapter",
+                creator,
                 representation_method: PRIVATE_UNLINKED_REGULAR_VNODE_V1,
                 writer_descriptors_created: 1,
                 writer_descriptors_duplicated: 0,
@@ -308,6 +322,23 @@ mod platform {
         argv: &[CString],
         stdin: &[u8],
     ) -> io::Result<DescriptorExecOutput> {
+        invoke_with_exec_observer(executable, argv, stdin, || Ok(()))
+    }
+
+    /// Invoke an executable descriptor and call `on_exec_accepted` after the
+    /// kernel has accepted `fexecve(2)`, but before waiting for child exit.
+    ///
+    /// The callback is an evidence hook only: if it fails, the child is still
+    /// reaped and its output is drained before the callback error is returned.
+    pub fn invoke_with_exec_observer<F>(
+        executable: &File,
+        argv: &[CString],
+        stdin: &[u8],
+        on_exec_accepted: F,
+    ) -> io::Result<DescriptorExecOutput>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         if argv.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
         }
@@ -406,18 +437,6 @@ mod platform {
         let mut exec_bytes = Vec::new();
         exec_pipe.read_to_end(&mut exec_bytes)?;
 
-        let mut status = 0;
-        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        write_result?;
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| io::Error::other("stdout reader panicked"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| io::Error::other("stderr reader panicked"))??;
-
         let exec_errno = match exec_bytes.as_slice() {
             [] => None,
             bytes if bytes.len() == std::mem::size_of::<i32>() => {
@@ -432,6 +451,24 @@ mod platform {
                 ))
             }
         };
+        let observer_result = if exec_errno.is_none() {
+            on_exec_accepted()
+        } else {
+            Ok(())
+        };
+
+        let mut status = 0;
+        if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        write_result?;
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| io::Error::other("stdout reader panicked"))??;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| io::Error::other("stderr reader panicked"))??;
+
         let exit_code = if libc::WIFEXITED(status) {
             Some(libc::WEXITSTATUS(status))
         } else {
@@ -442,19 +479,24 @@ mod platform {
         } else {
             None
         };
-        Ok(DescriptorExecOutput {
+        let output = DescriptorExecOutput {
             descriptor_exec_accepted: exec_errno.is_none(),
             exit_code,
             signal,
             stdout,
             stderr,
             exec_errno,
-        })
+        };
+        observer_result?;
+        Ok(output)
     }
 }
 
 #[cfg(target_os = "freebsd")]
-pub use platform::{invoke, prepare_execution_representation};
+pub use platform::{
+    invoke, invoke_with_exec_observer, prepare_execution_representation,
+    prepare_execution_representation_for,
+};
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn invoke(
@@ -476,6 +518,34 @@ pub fn prepare_execution_representation(
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "execution representations are supported only on FreeBSD",
+    ))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn prepare_execution_representation_for(
+    _base_directory: &Path,
+    _bytes: &[u8],
+    _creator: &'static str,
+) -> io::Result<ExecutionRepresentation> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "execution representations are supported only on FreeBSD",
+    ))
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn invoke_with_exec_observer<F>(
+    _executable: &File,
+    _argv: &[CString],
+    _stdin: &[u8],
+    _on_exec_accepted: F,
+) -> io::Result<DescriptorExecOutput>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor executor is supported only on FreeBSD",
     ))
 }
 
