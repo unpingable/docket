@@ -71,16 +71,46 @@ mod platform {
         AUTHORITY_CLOSURE_SCHEMA_V1, FIRST_STAGE_RIGHTS_PROFILE_V1,
         PRIVATE_UNLINKED_REGULAR_VNODE_V1,
     };
-    use std::ffi::OsStr;
+    use std::ffi::CStr;
     use std::fs::{OpenOptions, Permissions};
     use std::io::{self, Read as _, Write as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
-    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     static REPRESENTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    /// Copy the process environment directly from FreeBSD libc.
+    ///
+    /// Rust's standard-library environment iterator faults in a statically
+    /// linked FreeBSD process before application logic on the qualified 15.1
+    /// substrate.  The kernel/libc process ABI still exposes the ordinary
+    /// null-terminated `environ` vector, which is also what `fexecve(2)`
+    /// consumes.  This bootstrap is single-threaded while taking the copy.
+    pub fn inherited_environment_bytes() -> io::Result<Vec<Vec<u8>>> {
+        unsafe extern "C" {
+            static mut environ: *mut *mut libc::c_char;
+        }
+
+        let mut cursor = unsafe { environ };
+        if cursor.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FreeBSD process environment is unavailable",
+            ));
+        }
+        let mut values = Vec::new();
+        loop {
+            let entry = unsafe { *cursor };
+            if entry.is_null() {
+                break;
+            }
+            values.push(unsafe { CStr::from_ptr(entry) }.to_bytes().to_vec());
+            cursor = unsafe { cursor.add(1) };
+        }
+        Ok(values)
+    }
 
     pub fn prepare_execution_representation(
         base_directory: &Path,
@@ -304,12 +334,9 @@ mod platform {
     }
 
     fn environment() -> io::Result<Vec<CString>> {
-        std::env::vars_os()
-            .map(|(name, value)| {
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(OsStr::new(&name).as_bytes());
-                bytes.push(b'=');
-                bytes.extend_from_slice(OsStr::new(&value).as_bytes());
+        inherited_environment_bytes()?
+            .into_iter()
+            .map(|bytes| {
                 CString::new(bytes).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "environment contains NUL")
                 })
@@ -494,9 +521,23 @@ mod platform {
 
 #[cfg(target_os = "freebsd")]
 pub use platform::{
-    invoke, invoke_with_exec_observer, prepare_execution_representation,
-    prepare_execution_representation_for,
+    inherited_environment_bytes, invoke, invoke_with_exec_observer,
+    prepare_execution_representation, prepare_execution_representation_for,
 };
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn inherited_environment_bytes() -> io::Result<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    Ok(std::env::vars_os()
+        .map(|(name, value)| {
+            let mut bytes = name.as_os_str().as_bytes().to_vec();
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_os_str().as_bytes());
+            bytes
+        })
+        .collect())
+}
 
 #[cfg(not(target_os = "freebsd"))]
 pub fn invoke(

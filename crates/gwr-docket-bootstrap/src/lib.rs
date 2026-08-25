@@ -9,7 +9,7 @@
 #![cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
 
 use gwr_freebsd_exec::{
-    invoke_with_exec_observer, prepare_execution_representation_for,
+    inherited_environment_bytes, invoke_with_exec_observer, prepare_execution_representation_for,
     ExecutionRepresentationAuthorityClosure,
 };
 use serde::{Deserialize, Serialize};
@@ -349,17 +349,10 @@ fn argv_digest(argv: &[OsString]) -> String {
     )
 }
 
-fn environment_digest() -> String {
-    let mut values = std::env::vars_os()
-        .map(|(name, value)| {
-            let mut bytes = name.as_os_str().as_bytes().to_vec();
-            bytes.push(b'=');
-            bytes.extend_from_slice(value.as_os_str().as_bytes());
-            bytes
-        })
-        .collect::<Vec<_>>();
+fn environment_digest() -> io::Result<String> {
+    let mut values = inherited_environment_bytes()?;
     values.sort();
-    framed_digest(&values)
+    Ok(framed_digest(&values))
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -481,7 +474,7 @@ fn run(options: Options) -> Result<i32, BootstrapError> {
     let stdin = read_regular_no_follow(&options.stdin, MAX_STDIN_BYTES, false)?;
     let stdin_sha256 = digest(&stdin);
     let argv_sha256 = argv_digest(&options.docket_argv);
-    let environment_sha256 = environment_digest();
+    let environment_sha256 = environment_digest()?;
     let mut journal = Journal::create(&options.journal)?;
     let base_record = |sequence, stage| LaunchRecord {
         schema: LAUNCH_RECORD_SCHEMA_V1,
