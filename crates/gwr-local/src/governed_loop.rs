@@ -650,7 +650,7 @@ fn read_standing_resolver_candidate(path: &Path) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(
         usize::try_from(before.len()).map_err(|_| "standing-resolver-size-overflow".to_owned())?,
     );
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(MAX_STANDING_RESOLVER_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("standing-resolver-read:{error}"))?;
@@ -815,9 +815,7 @@ fn invoke_exact_standing_resolver(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("standing-resolver-representation-rewind:{error}"))?;
     let mut measured = Vec::new();
-    representation
-        .executable
-        .by_ref()
+    std::io::Read::by_ref(&mut representation.executable)
         .take(MAX_STANDING_RESOLVER_BYTES + 1)
         .read_to_end(&mut measured)
         .map_err(|error| format!("standing-resolver-representation-read:{error}"))?;
