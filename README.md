@@ -104,6 +104,17 @@ issuance, issuer/key identity, custody, executor binding, and known or
 indeterminate outcome. It invokes no standing resolver or executor and does
 not reconcile or alter custody.
 
+### Governed-executor transport ownership
+
+Docket owns the generic, versioned dispatch/outcome/reconcile transport law.
+Its independent specification, closed V1 schemas, and conformance vectors are
+[`executor-transport-v1.md`](docs/governed-runtime/executor-transport-v1.md)
+and [`conformance/executor-transport-v1/`](conformance/executor-transport-v1/).
+Executors retain ownership of their sealed plans, mechanics, journals, and
+receipt formats; AG retains governed occurrence and authorization semantics.
+Consumers intentionally keep independent implementations rather than sharing
+Docket runtime code.
+
 ## Workspace
 
 - `crates/gwr-core` — pure deterministic types and transition rules. No I/O.
