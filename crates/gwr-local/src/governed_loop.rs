@@ -26,6 +26,14 @@ pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-sta
 pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
     "docket.governed-loop.execution-standing-resolution/v1";
 pub const INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
+/// Canonical external identity of the Docket-owned executor transport law.
+pub const EXECUTOR_TRANSPORT_SCHEMA_V1: &str = "docket.governed-executor-transport/v1";
+/// Canonical external identity of the closed, untagged V1 dispatch shape.
+pub const EXECUTOR_DISPATCH_SCHEMA_V1: &str = "docket.governed-executor-dispatch/v1";
+/// Canonical external identity of the closed, untagged V1 outcome shape.
+pub const EXECUTOR_OUTCOME_SCHEMA_V1: &str = "docket.governed-executor-outcome/v1";
+/// Exact V1 bound for an executor stdin dispatch or stdout outcome document.
+pub const MAX_EXECUTOR_DOCUMENT_BYTES: usize = 1024 * 1024;
 
 const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
@@ -331,6 +339,7 @@ pub fn accept(
             issuance: issuance.clone(),
             now_unix_ms: now,
         },
+        usize::MAX,
     )?;
     validate_standing(&issuance, &standing, now)?;
     let attempt = digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance)?;
@@ -386,7 +395,12 @@ pub fn accept(
     let config = executor_config
         .to_str()
         .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
-    match invoke_json::<_, ExecutorOutcomeWireV1>(executor, &["execute", config], &dispatch) {
+    match invoke_json::<_, ExecutorOutcomeWireV1>(
+        executor,
+        &["execute", config],
+        &dispatch,
+        MAX_EXECUTOR_DOCUMENT_BYTES,
+    ) {
         Ok(outcome) => {
             store.record_executor_outcome(&issuance.issuance, &custody, outcome, now_unix_ms()?)?
         }
@@ -437,7 +451,12 @@ pub fn reconcile(
     let config = executor_config
         .to_str()
         .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
-    match invoke_json::<_, ExecutorOutcomeWireV1>(executor, &["reconcile", config], &dispatch) {
+    match invoke_json::<_, ExecutorOutcomeWireV1>(
+        executor,
+        &["reconcile", config],
+        &dispatch,
+        MAX_EXECUTOR_DOCUMENT_BYTES,
+    ) {
         Ok(outcome) => {
             store.record_executor_outcome(issuance, &record.custody, outcome, now_unix_ms()?)?
         }
@@ -1187,6 +1206,7 @@ fn invoke_json<I: Serialize + ?Sized, O: DeserializeOwned>(
     program: &Path,
     arguments: &[&str],
     input: &I,
+    stdout_limit: usize,
 ) -> Result<O, String> {
     let bytes = serde_json::to_vec(input).map_err(|error| format!("process-request:{error}"))?;
     let mut child = Command::new(program)
@@ -1202,19 +1222,60 @@ fn invoke_json<I: Serialize + ?Sized, O: DeserializeOwned>(
         .ok_or_else(|| "process-stdin-unavailable".to_owned())?
         .write_all(&bytes)
         .map_err(|error| format!("process-stdin:{error}"))?;
-    let output = child
-        .wait_with_output()
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "process-stdout-unavailable".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "process-stderr-unavailable".to_owned())?;
+    let stdout_reader = std::thread::spawn(move || read_bounded_draining(stdout, stdout_limit));
+    let stderr_reader = std::thread::spawn(move || read_bounded_draining(stderr, 2048));
+    let status = child
+        .wait()
         .map_err(|error| format!("process-wait:{error}"))?;
-    if !output.status.success() {
+    let (stdout, stdout_overflow) = stdout_reader
+        .join()
+        .map_err(|_| "process-stdout-reader-panicked".to_owned())?
+        .map_err(|error| format!("process-stdout:{error}"))?;
+    let (stderr, _) = stderr_reader
+        .join()
+        .map_err(|_| "process-stderr-reader-panicked".to_owned())?
+        .map_err(|error| format!("process-stderr:{error}"))?;
+    if !status.success() {
         return Err(format!(
             "process-refused:{}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stderr)
                 .chars()
                 .take(512)
                 .collect::<String>()
         ));
     }
-    strict_json(&output.stdout, "process-response")
+    if stdout_overflow {
+        return Err("process-response-exceeds-1-mib".to_owned());
+    }
+    strict_json(&stdout, "process-response")
+}
+
+fn read_bounded_draining<R: std::io::Read>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut overflow = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(count);
+        retained.extend_from_slice(&buffer[..keep]);
+        overflow |= keep != count;
+    }
+    Ok((retained, overflow))
 }
 
 fn b64_decode(value: &str) -> Result<Vec<u8>, String> {
@@ -1817,6 +1878,105 @@ mod tests {
                 "{label} substitution must fail closed"
             );
         }
+    }
+
+    #[test]
+    fn docket_owned_executor_transport_corpus_matches_the_v1_wire_projection() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../conformance/executor-transport-v1/corpus.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            corpus["transport"],
+            serde_json::Value::String(EXECUTOR_TRANSPORT_SCHEMA_V1.to_owned())
+        );
+        assert_eq!(
+            corpus["dispatch_schema"],
+            serde_json::Value::String(EXECUTOR_DISPATCH_SCHEMA_V1.to_owned())
+        );
+        assert_eq!(
+            corpus["outcome_schema"],
+            serde_json::Value::String(EXECUTOR_OUTCOME_SCHEMA_V1.to_owned())
+        );
+        assert_eq!(
+            corpus["max_document_bytes"],
+            serde_json::Value::from(MAX_EXECUTOR_DOCUMENT_BYTES)
+        );
+
+        for case in corpus["decode_cases"].as_array().unwrap() {
+            let input = case["input"].as_str().unwrap().as_bytes();
+            let canonical = match case["kind"].as_str().unwrap() {
+                "dispatch" => strict_json::<ExecutorDispatchWireV1>(input, "corpus-dispatch")
+                    .and_then(|dispatch| {
+                        for value in [
+                            &dispatch.attempt,
+                            &dispatch.marker,
+                            &dispatch.work,
+                            &dispatch.subject,
+                            &dispatch.scope,
+                        ] {
+                            require_digest(value, "corpus dispatch digest")?;
+                        }
+                        if dispatch.work_schema.is_empty() {
+                            return Err("corpus dispatch work schema empty".to_owned());
+                        }
+                        serde_json::to_vec(&serde_json::to_value(dispatch).unwrap())
+                            .map_err(|error| error.to_string())
+                    }),
+                "outcome" => strict_json::<ExecutorOutcomeWireV1>(input, "corpus-outcome")
+                    .and_then(|outcome| {
+                        for value in [&outcome.attempt, &outcome.marker, &outcome.receipt] {
+                            require_digest(value, "corpus outcome digest")?;
+                        }
+                        serde_json::to_vec(&serde_json::to_value(outcome).unwrap())
+                            .map_err(|error| error.to_string())
+                    }),
+                other => panic!("unknown corpus document kind {other}"),
+            };
+            assert_eq!(
+                canonical.is_ok(),
+                case["expect"] == "accept",
+                "corpus case {}",
+                case["id"].as_str().unwrap()
+            );
+            if let (Ok(actual), Some(expected)) = (canonical, case["canonical_output"].as_str()) {
+                assert_eq!(actual, expected.as_bytes(), "corpus case {}", case["id"]);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_executor_stdout_is_transport_refusal_and_docket_indeterminate() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        std::fs::write(
+            fixture.executor_program.with_extension("response"),
+            vec![b'x'; MAX_EXECUTOR_DOCUMENT_BYTES + 1],
+        )
+        .unwrap();
+
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+
+        let inspection = inspect(&fixture.database, &fixture.issuance.issuance).unwrap();
+        let record = inspection.record.unwrap();
+        assert_eq!(record.status, GovernedRecordStatusV1::Indeterminate);
+        assert!(record.settlement.is_none());
+        assert!(record.indeterminate.is_some());
+    }
+
+    #[test]
+    fn bounded_reader_drains_but_retains_no_more_than_the_contract_limit() {
+        let input = vec![b'x'; 32];
+        let (retained, overflow) = read_bounded_draining(input.as_slice(), 16).unwrap();
+        assert_eq!(retained, vec![b'x'; 16]);
+        assert!(overflow);
     }
 
     fn digest(label: &str) -> String {
