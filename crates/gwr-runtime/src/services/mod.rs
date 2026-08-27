@@ -5,6 +5,7 @@ pub mod authz_standing;
 pub mod campaign;
 pub mod dispatch;
 pub mod dossier;
+pub mod governed_loop;
 pub mod journal;
 pub mod list;
 pub mod preparation;

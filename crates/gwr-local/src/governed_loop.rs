@@ -7,10 +7,29 @@
 //! one canonical attempt, persists custody before invoking mechanics, and is
 //! the sole producer of the settlement AG may consume.
 
+use gwr_runtime::governed_loop::{
+    digest_json_string, hash_domain, require_digest, validate_issuance,
+};
+pub use gwr_runtime::governed_loop::{
+    AgIssuanceWireV1, AgIssuerTrustConfigV1, CustodyRecordV1, DocketCustodyWireV1,
+    DocketReconciliationWireV1, DocketSettlementWireV1, ExecutionStandingRequestV1,
+    ExecutionStandingResolutionV1, ExecutionStandingStatusV1, ExecutorBindingV1,
+    ExecutorDispatchWireV1, ExecutorOutcomeClassWireV1, ExecutorOutcomeWireV1,
+    GovernedLoopInspectionV1, GovernedRecordInspectionV1, GovernedRecordStatusV1,
+    IndeterminateOutcomeWireV1, IssuanceAuthenticationWireV1, KnownOutcomeWireV1,
+    OccurrenceKeyWireV1, SignedIssuanceEnvelopeWireV1, TrustedAgIssuerV1, AG_ISSUANCE_SCHEMA_V1,
+    CUSTODY_SCHEMA_V1, EXECUTOR_DISPATCH_SCHEMA_V1, EXECUTOR_OUTCOME_SCHEMA_V1,
+    EXECUTOR_TRANSPORT_SCHEMA_V1, INSPECTION_SCHEMA_V1, MAX_EXECUTOR_DOCUMENT_BYTES,
+    SETTLEMENT_SCHEMA_V1, SIGNED_ISSUANCE_SCHEMA_V1, STANDING_REQUEST_SCHEMA_V1,
+    STANDING_RESOLUTION_SCHEMA_V1,
+};
+use gwr_runtime::ports::governed_loop::{
+    ExecutionStandingResolverV1, GovernedClockV1, GovernedCustodyStoreV1, GovernedExecutorV1,
+};
+use gwr_runtime::services::governed_loop as governed_service;
 use ring::signature::{UnparsedPublicKey, ED25519};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
+use serde::{de::DeserializeOwned, Serialize};
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -18,257 +37,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SIGNED_ISSUANCE_SCHEMA_V1: &str = "ag.governed-loop.signed-issuance/v1";
-pub const AG_ISSUANCE_SCHEMA_V1: &str = "ag.governed-loop.issuance/v1";
-pub const CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
-pub const SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
-pub const STANDING_REQUEST_SCHEMA_V1: &str = "docket.governed-loop.execution-standing-request/v1";
-pub const STANDING_RESOLUTION_SCHEMA_V1: &str =
-    "docket.governed-loop.execution-standing-resolution/v1";
-pub const INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
-/// Canonical external identity of the Docket-owned executor transport law.
-pub const EXECUTOR_TRANSPORT_SCHEMA_V1: &str = "docket.governed-executor-transport/v1";
-/// Canonical external identity of the closed, untagged V1 dispatch shape.
-pub const EXECUTOR_DISPATCH_SCHEMA_V1: &str = "docket.governed-executor-dispatch/v1";
-/// Canonical external identity of the closed, untagged V1 outcome shape.
-pub const EXECUTOR_OUTCOME_SCHEMA_V1: &str = "docket.governed-executor-outcome/v1";
-/// Exact V1 bound for an executor stdin dispatch or stdout outcome document.
-pub const MAX_EXECUTOR_DOCUMENT_BYTES: usize = 1024 * 1024;
-
 const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
 const MAX_EXECUTOR_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ExecutorBindingV1 {
-    identity: String,
-    program_digest: String,
-    plan: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OccurrenceKeyWireV1 {
-    pub campaign: String,
-    pub occurrence: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgIssuanceWireV1 {
-    pub schema: String,
-    pub issuance: String,
-    pub key: OccurrenceKeyWireV1,
-    pub program: String,
-    pub proposal: String,
-    pub work_schema: String,
-    pub work: String,
-    pub subject: String,
-    pub scope: String,
-    pub observation: String,
-    pub standing_resolution: String,
-    pub mandate: String,
-    pub spend: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IssuanceAuthenticationWireV1 {
-    pub issuer_principal: String,
-    pub signer_key_id: String,
-    pub signer_public_key: String,
-    pub signature: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedIssuanceEnvelopeWireV1 {
-    pub schema: String,
-    pub body_b64: String,
-    pub authentication: IssuanceAuthenticationWireV1,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TrustedAgIssuerV1 {
-    pub issuer_principal: String,
-    pub key_id: String,
-    pub public_key: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgIssuerTrustConfigV1 {
-    pub issuers: Vec<TrustedAgIssuerV1>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionStandingStatusV1 {
-    Current,
-    Absent,
-    Revoked,
-    Superseded,
-    Expired,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionStandingRequestV1 {
-    pub schema: String,
-    pub issuance: AgIssuanceWireV1,
-    pub now_unix_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionStandingResolutionV1 {
-    pub schema: String,
-    pub resolution: String,
-    pub currentness: String,
-    pub execution_standing: String,
-    pub issuance: String,
-    pub campaign: String,
-    pub occurrence: String,
-    pub subject: String,
-    pub scope: String,
-    pub status: ExecutionStandingStatusV1,
-    pub resolved_at_unix_ms: u64,
-    pub expires_at_unix_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DocketCustodyWireV1 {
-    pub schema: String,
-    pub issuance: String,
-    pub ag_spend: String,
-    pub execution_standing: String,
-    pub standing_currentness: String,
-    pub attempt: String,
-    pub executor_marker: String,
-    pub accepted_at_unix_ms: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutorDispatchWireV1 {
-    pub attempt: String,
-    pub marker: String,
-    pub work_schema: String,
-    pub work: String,
-    pub subject: String,
-    pub scope: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutorOutcomeClassWireV1 {
-    Success,
-    Failure,
-    Indeterminate,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutorOutcomeWireV1 {
-    pub attempt: String,
-    pub marker: String,
-    pub receipt: String,
-    pub outcome: ExecutorOutcomeClassWireV1,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DocketSettlementWireV1 {
-    pub schema: String,
-    pub settlement: String,
-    pub issuance: String,
-    pub attempt: String,
-    pub executor_marker: String,
-    pub receipt: String,
-    pub outcome: KnownOutcomeWireV1,
-    pub settled_at_unix_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KnownOutcomeWireV1 {
-    Success,
-    Failure,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndeterminateOutcomeWireV1 {
-    pub issuance: String,
-    pub attempt: String,
-    pub reconciliation: String,
-    pub evidence: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "status",
-    content = "record",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum DocketReconciliationWireV1 {
-    NotAccepted,
-    Accepted(DocketCustodyWireV1),
-    Settled {
-        custody: DocketCustodyWireV1,
-        settlement: DocketSettlementWireV1,
-    },
-    Indeterminate {
-        custody: DocketCustodyWireV1,
-        indeterminate: IndeterminateOutcomeWireV1,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GovernedRecordStatusV1 {
-    Accepted,
-    Settled,
-    Indeterminate,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GovernedRecordInspectionV1 {
-    pub issuance: AgIssuanceWireV1,
-    pub authentication: IssuanceAuthenticationWireV1,
-    pub custody: DocketCustodyWireV1,
-    pub status: GovernedRecordStatusV1,
-    pub settlement: Option<DocketSettlementWireV1>,
-    pub indeterminate: Option<IndeterminateOutcomeWireV1>,
-    pub executor_binding: String,
-    pub executor_program_digest: String,
-    pub executor_plan: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GovernedLoopInspectionV1 {
-    pub schema: String,
-    pub requested_issuance: String,
-    pub record: Option<GovernedRecordInspectionV1>,
-}
-
-#[derive(Clone, Debug)]
-struct CustodyRecordV1 {
-    issuance: AgIssuanceWireV1,
-    custody: DocketCustodyWireV1,
-    signed_body_b64: String,
-    authentication: IssuanceAuthenticationWireV1,
-    executor_binding: String,
-    executor_program_digest: String,
-    executor_plan: String,
-    status: String,
-    settlement: Option<DocketSettlementWireV1>,
-    indeterminate: Option<IndeterminateOutcomeWireV1>,
-}
 
 /// Authenticates the exact AG issuance bytes against explicit Docket trust.
 pub fn verify_signed_issuance(
@@ -322,98 +92,23 @@ pub fn accept(
     executor_config: &Path,
 ) -> Result<DocketCustodyWireV1, String> {
     let (envelope, issuance) = verify_signed_issuance(envelope_bytes, trust_bytes)?;
-    let mut store = GovernedCustodyStoreV1::open(database)?;
-    if let Some(existing) = store.get(&issuance.issuance)? {
-        require_same_envelope(&existing, &envelope, &issuance)?;
-        return Ok(existing.custody);
-    }
-
-    let executor_binding = resolve_executor_binding(executor, executor_config, &issuance.work)?;
-
-    let now = now_unix_ms()?;
-    let standing: ExecutionStandingResolutionV1 = invoke_json(
-        standing_resolver,
-        &[],
-        &ExecutionStandingRequestV1 {
-            schema: STANDING_REQUEST_SCHEMA_V1.to_owned(),
-            issuance: issuance.clone(),
-            now_unix_ms: now,
-        },
-        usize::MAX,
-    )?;
-    validate_standing(&issuance, &standing, now)?;
-    let attempt = digest_json_string("ag.governed-loop.docket-attempt/v1", &issuance.issuance)?;
-    let marker = hash_domain(
-        "docket.governed-loop.executor-marker/v1",
-        attempt.as_bytes(),
-    );
-    if standing.execution_standing.as_str() == issuance.spend.as_str()
-        || standing.execution_standing.as_str() == attempt.as_str()
-        || standing.execution_standing.as_str() == marker.as_str()
-        || issuance.spend.as_str() == attempt.as_str()
-        || issuance.spend.as_str() == marker.as_str()
-        || attempt.as_str() == marker.as_str()
-    {
-        return Err("governed-instrument-substitution".to_owned());
-    }
-    let custody = DocketCustodyWireV1 {
-        schema: CUSTODY_SCHEMA_V1.to_owned(),
-        issuance: issuance.issuance.clone(),
-        ag_spend: issuance.spend.clone(),
-        execution_standing: standing.execution_standing.clone(),
-        standing_currentness: standing.currentness.clone(),
-        attempt,
-        executor_marker: marker,
-        accepted_at_unix_ms: now,
+    let mut store = SqliteGovernedCustodyStoreV1::open(database)?;
+    let mut resolver = LocalStandingResolverV1 {
+        program: standing_resolver,
     };
-    match store.insert_custody(&envelope, &issuance, &standing, &custody, &executor_binding) {
-        Ok(()) => {}
-        Err(error) => {
-            if let Some(existing) = store.get(&issuance.issuance)? {
-                require_same_envelope(&existing, &envelope, &issuance)?;
-                return Ok(existing.custody);
-            }
-            return Err(error);
-        }
-    }
-
-    // The custody transaction above is committed before any mechanics call.
-    // A process loss here leaves an exact accepted attempt and can never make
-    // this issuance dispatchable as a second attempt.
-    if let Err(error) = require_executor_binding(executor, executor_config, &executor_binding) {
-        store.record_indeterminate(
-            &issuance.issuance,
-            &custody,
-            &hash_domain(
-                "docket.governed-loop.executor-binding-changed/v1",
-                error.as_bytes(),
-            ),
-        )?;
-        return Ok(custody);
-    }
-    let dispatch = executor_dispatch(&issuance, &custody);
-    let config = executor_config
-        .to_str()
-        .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
-    match invoke_json::<_, ExecutorOutcomeWireV1>(
-        executor,
-        &["execute", config],
-        &dispatch,
-        MAX_EXECUTOR_DOCUMENT_BYTES,
-    ) {
-        Ok(outcome) => {
-            store.record_executor_outcome(&issuance.issuance, &custody, outcome, now_unix_ms()?)?
-        }
-        Err(error) => store.record_indeterminate(
-            &issuance.issuance,
-            &custody,
-            &hash_domain(
-                "docket.governed-loop.executor-unavailable/v1",
-                error.as_bytes(),
-            ),
-        )?,
-    }
-    Ok(custody)
+    let mut executor = LocalGovernedExecutorV1 {
+        program: executor,
+        config: executor_config,
+    };
+    let mut clock = SystemGovernedClockV1;
+    governed_service::accept(
+        &mut store,
+        &envelope,
+        &issuance,
+        &mut resolver,
+        &mut executor,
+        &mut clock,
+    )
 }
 
 /// Reconciles one already-custodied issuance.  The executor command receives
@@ -426,54 +121,19 @@ pub fn reconcile(
     executor_config: &Path,
 ) -> Result<DocketReconciliationWireV1, String> {
     require_digest(issuance, "issuance")?;
-    let mut store = GovernedCustodyStoreV1::open(database)?;
-    let Some(mut record) = store.get(issuance)? else {
-        return Ok(DocketReconciliationWireV1::NotAccepted);
+    let mut store = SqliteGovernedCustodyStoreV1::open(database)?;
+    let mut executor = LocalGovernedExecutorV1 {
+        program: executor,
+        config: executor_config,
     };
-    if expected_attempt.is_some_and(|expected| expected != record.custody.attempt) {
-        return Err("governed-reconciliation-attempt-substitution".to_owned());
-    }
-    if record.status == "settled" {
-        return response(record);
-    }
-
-    require_executor_binding(
-        executor,
-        executor_config,
-        &ExecutorBindingV1 {
-            identity: record.executor_binding.clone(),
-            program_digest: record.executor_program_digest.clone(),
-            plan: record.executor_plan.clone(),
-        },
-    )?;
-
-    let dispatch = executor_dispatch(&record.issuance, &record.custody);
-    let config = executor_config
-        .to_str()
-        .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
-    match invoke_json::<_, ExecutorOutcomeWireV1>(
-        executor,
-        &["reconcile", config],
-        &dispatch,
-        MAX_EXECUTOR_DOCUMENT_BYTES,
-    ) {
-        Ok(outcome) => {
-            store.record_executor_outcome(issuance, &record.custody, outcome, now_unix_ms()?)?
-        }
-        Err(error) if record.status == "accepted" => store.record_indeterminate(
-            issuance,
-            &record.custody,
-            &hash_domain(
-                "docket.governed-loop.reconciliation-unavailable/v1",
-                error.as_bytes(),
-            ),
-        )?,
-        Err(_) => {}
-    }
-    record = store
-        .get(issuance)?
-        .ok_or_else(|| "governed-custody-disappeared".to_owned())?;
-    response(record)
+    let mut clock = SystemGovernedClockV1;
+    governed_service::reconcile(
+        &mut store,
+        issuance,
+        expected_attempt,
+        &mut executor,
+        &mut clock,
+    )
 }
 
 /// Returns Docket's exact persisted governed-loop record for one issuance.
@@ -481,75 +141,84 @@ pub fn reconcile(
 /// executor, and never creates or updates state.
 pub fn inspect(database: &Path, issuance: &str) -> Result<GovernedLoopInspectionV1, String> {
     require_digest(issuance, "issuance")?;
-    let mut store = GovernedCustodyStoreV1::open_read_only(database)?;
-    let Some(record) = store.get(issuance)? else {
-        return Ok(GovernedLoopInspectionV1 {
-            schema: INSPECTION_SCHEMA_V1.to_owned(),
-            requested_issuance: issuance.to_owned(),
-            record: None,
-        });
-    };
-    let status = match record.status.as_str() {
-        "accepted" => GovernedRecordStatusV1::Accepted,
-        "settled" => GovernedRecordStatusV1::Settled,
-        "indeterminate" => GovernedRecordStatusV1::Indeterminate,
-        _ => return Err("governed-custody-status-corrupt".to_owned()),
-    };
-    Ok(GovernedLoopInspectionV1 {
-        schema: INSPECTION_SCHEMA_V1.to_owned(),
-        requested_issuance: issuance.to_owned(),
-        record: Some(GovernedRecordInspectionV1 {
-            issuance: record.issuance,
-            authentication: record.authentication,
-            custody: record.custody,
-            status,
-            settlement: record.settlement,
-            indeterminate: record.indeterminate,
-            executor_binding: record.executor_binding,
-            executor_program_digest: record.executor_program_digest,
-            executor_plan: record.executor_plan,
-        }),
-    })
+    let mut store = SqliteGovernedCustodyStoreV1::open_read_only(database)?;
+    governed_service::inspect(&mut store, issuance)
 }
 
-fn response(record: CustodyRecordV1) -> Result<DocketReconciliationWireV1, String> {
-    match record.status.as_str() {
-        "accepted" => Ok(DocketReconciliationWireV1::Accepted(record.custody)),
-        "settled" => Ok(DocketReconciliationWireV1::Settled {
-            custody: record.custody,
-            settlement: record
-                .settlement
-                .ok_or_else(|| "governed-settlement-columns-missing".to_owned())?,
-        }),
-        "indeterminate" => Ok(DocketReconciliationWireV1::Indeterminate {
-            custody: record.custody,
-            indeterminate: record
-                .indeterminate
-                .ok_or_else(|| "governed-indeterminate-columns-missing".to_owned())?,
-        }),
-        _ => Err("governed-custody-status-corrupt".to_owned()),
+struct LocalStandingResolverV1<'a> {
+    program: &'a Path,
+}
+
+impl ExecutionStandingResolverV1 for LocalStandingResolverV1<'_> {
+    fn resolve(
+        &mut self,
+        request: &ExecutionStandingRequestV1,
+    ) -> Result<ExecutionStandingResolutionV1, String> {
+        invoke_json(self.program, &[], request, usize::MAX)
     }
 }
 
-fn executor_dispatch(
-    issuance: &AgIssuanceWireV1,
-    custody: &DocketCustodyWireV1,
-) -> ExecutorDispatchWireV1 {
-    ExecutorDispatchWireV1 {
-        attempt: custody.attempt.clone(),
-        marker: custody.executor_marker.clone(),
-        work_schema: issuance.work_schema.clone(),
-        work: issuance.work.clone(),
-        subject: issuance.subject.clone(),
-        scope: issuance.scope.clone(),
+struct LocalGovernedExecutorV1<'a> {
+    program: &'a Path,
+    config: &'a Path,
+}
+
+impl GovernedExecutorV1 for LocalGovernedExecutorV1<'_> {
+    fn resolve_binding(&mut self, expected_plan: &str) -> Result<ExecutorBindingV1, String> {
+        resolve_executor_binding(self.program, self.config, expected_plan)
+    }
+
+    fn require_binding(&mut self, expected: &ExecutorBindingV1) -> Result<(), String> {
+        require_executor_binding(self.program, self.config, expected)
+    }
+
+    fn execute(
+        &mut self,
+        dispatch: &ExecutorDispatchWireV1,
+    ) -> Result<ExecutorOutcomeWireV1, String> {
+        self.invoke("execute", dispatch)
+    }
+
+    fn reconcile(
+        &mut self,
+        dispatch: &ExecutorDispatchWireV1,
+    ) -> Result<ExecutorOutcomeWireV1, String> {
+        self.invoke("reconcile", dispatch)
     }
 }
 
-struct GovernedCustodyStoreV1 {
+impl LocalGovernedExecutorV1<'_> {
+    fn invoke(
+        &self,
+        operation: &str,
+        dispatch: &ExecutorDispatchWireV1,
+    ) -> Result<ExecutorOutcomeWireV1, String> {
+        let config = self
+            .config
+            .to_str()
+            .ok_or_else(|| "executor-config-path-not-utf8".to_owned())?;
+        invoke_json(
+            self.program,
+            &[operation, config],
+            dispatch,
+            MAX_EXECUTOR_DOCUMENT_BYTES,
+        )
+    }
+}
+
+struct SystemGovernedClockV1;
+
+impl GovernedClockV1 for SystemGovernedClockV1 {
+    fn now_unix_ms(&mut self) -> Result<u64, String> {
+        now_unix_ms()
+    }
+}
+
+struct SqliteGovernedCustodyStoreV1 {
     connection: Connection,
 }
 
-impl GovernedCustodyStoreV1 {
+impl SqliteGovernedCustodyStoreV1 {
     fn open(database: &Path) -> Result<Self, String> {
         let connection =
             Connection::open(database).map_err(|error| format!("governed-custody-open:{error}"))?;
@@ -575,7 +244,9 @@ impl GovernedCustodyStoreV1 {
             .map_err(|error| format!("governed-custody-read-timeout:{error}"))?;
         Ok(Self { connection })
     }
+}
 
+impl GovernedCustodyStoreV1 for SqliteGovernedCustodyStoreV1 {
     fn insert_custody(
         &mut self,
         envelope: &SignedIssuanceEnvelopeWireV1,
@@ -758,76 +429,55 @@ impl GovernedCustodyStoreV1 {
             .transpose()
     }
 
-    fn record_executor_outcome(
+    fn record_known_outcome(
         &mut self,
         issuance: &str,
         custody: &DocketCustodyWireV1,
-        outcome: ExecutorOutcomeWireV1,
+        receipt: &str,
+        outcome: KnownOutcomeWireV1,
         at: u64,
     ) -> Result<(), String> {
-        if outcome.attempt != custody.attempt || outcome.marker != custody.executor_marker {
-            return self.record_indeterminate(
-                issuance,
-                custody,
-                &hash_domain(
-                    "docket.governed-loop.executor-binding-refusal/v1",
-                    format!("{}:{}", outcome.attempt, outcome.marker).as_bytes(),
-                ),
-            );
-        }
-        require_digest(&outcome.receipt, "executor receipt")?;
-        match outcome.outcome {
-            ExecutorOutcomeClassWireV1::Success | ExecutorOutcomeClassWireV1::Failure => {
-                let known = match outcome.outcome {
-                    ExecutorOutcomeClassWireV1::Success => "success",
-                    ExecutorOutcomeClassWireV1::Failure => "failure",
-                    ExecutorOutcomeClassWireV1::Indeterminate => unreachable!(),
-                };
-                let settlement = hash_domain(
-                    "docket.governed-loop.settlement/v1",
-                    format!("{issuance}:{}:{}:{known}", custody.attempt, outcome.receipt)
-                        .as_bytes(),
-                );
-                let changed = self
-                    .connection
-                    .execute(
-                        "UPDATE governed_loop_attempt
+        require_digest(receipt, "executor receipt")?;
+        let known = match outcome {
+            KnownOutcomeWireV1::Success => "success",
+            KnownOutcomeWireV1::Failure => "failure",
+        };
+        let settlement = hash_domain(
+            "docket.governed-loop.settlement/v1",
+            format!("{issuance}:{}:{receipt}:{known}", custody.attempt).as_bytes(),
+        );
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE governed_loop_attempt
                          SET status='settled',settlement=?1,receipt=?2,outcome=?3,settled_at=?4
                          WHERE issuance=?5 AND attempt=?6 AND executor_marker=?7
                            AND status IN ('accepted','indeterminate')",
-                        params![
-                            settlement,
-                            outcome.receipt,
-                            known,
-                            u64_to_i64(at)?,
-                            issuance,
-                            custody.attempt,
-                            custody.executor_marker
-                        ],
-                    )
-                    .map_err(|error| format!("governed-settlement-write:{error}"))?;
-                if changed == 0 {
-                    let existing = self
-                        .get(issuance)?
-                        .ok_or_else(|| "governed-settlement-attempt-missing".to_owned())?;
-                    if existing.settlement.as_ref().is_some_and(|value| {
-                        value.receipt == outcome.receipt
-                            && value.outcome
-                                == match known {
-                                    "success" => KnownOutcomeWireV1::Success,
-                                    _ => KnownOutcomeWireV1::Failure,
-                                }
-                    }) {
-                        return Ok(());
-                    }
-                    return Err("governed-settlement-substitution".to_owned());
-                }
-                Ok(())
+                params![
+                    settlement,
+                    receipt,
+                    known,
+                    u64_to_i64(at)?,
+                    issuance,
+                    custody.attempt,
+                    custody.executor_marker
+                ],
+            )
+            .map_err(|error| format!("governed-settlement-write:{error}"))?;
+        if changed == 0 {
+            let existing = self
+                .get(issuance)?
+                .ok_or_else(|| "governed-settlement-attempt-missing".to_owned())?;
+            if existing
+                .settlement
+                .as_ref()
+                .is_some_and(|value| value.receipt == receipt && value.outcome == outcome)
+            {
+                return Ok(());
             }
-            ExecutorOutcomeClassWireV1::Indeterminate => {
-                self.record_indeterminate(issuance, custody, &outcome.receipt)
-            }
+            return Err("governed-settlement-substitution".to_owned());
         }
+        Ok(())
     }
 
     fn record_indeterminate(
@@ -999,105 +649,6 @@ fn validate_stored_indeterminate(
     );
     if indeterminate.reconciliation != expected {
         return Err("governed-stored-reconciliation-identity".to_owned());
-    }
-    Ok(())
-}
-
-fn require_same_envelope(
-    existing: &CustodyRecordV1,
-    envelope: &SignedIssuanceEnvelopeWireV1,
-    issuance: &AgIssuanceWireV1,
-) -> Result<(), String> {
-    if existing.issuance != *issuance
-        || existing.signed_body_b64 != envelope.body_b64
-        || existing.authentication != envelope.authentication
-    {
-        return Err("governed-issuance-immutable-rebind".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_issuance(issuance: &AgIssuanceWireV1) -> Result<(), String> {
-    if issuance.schema != AG_ISSUANCE_SCHEMA_V1 {
-        return Err("governed-issuance-schema".to_owned());
-    }
-    for (value, label) in [
-        (&issuance.issuance, "issuance"),
-        (&issuance.key.campaign, "campaign"),
-        (&issuance.program, "program"),
-        (&issuance.proposal, "proposal"),
-        (&issuance.work, "work"),
-        (&issuance.subject, "subject"),
-        (&issuance.scope, "scope"),
-        (&issuance.observation, "observation"),
-        (&issuance.standing_resolution, "standing resolution"),
-        (&issuance.mandate, "mandate"),
-        (&issuance.spend, "AG spend"),
-    ] {
-        require_digest(value, label)?;
-    }
-    require_uuid(&issuance.key.occurrence)?;
-    if issuance.work_schema.is_empty()
-        || issuance.work_schema.len() > 128
-        || !issuance.work_schema.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
-        })
-    {
-        return Err("governed-issuance-work-schema".to_owned());
-    }
-    let basis = serde_json::json!({
-        "key": {
-            "campaign": issuance.key.campaign,
-            "occurrence": issuance.key.occurrence,
-        },
-        "mandate": issuance.mandate,
-        "observation": issuance.observation,
-        "program": issuance.program,
-        "proposal": issuance.proposal,
-        "scope": issuance.scope,
-        "spend": issuance.spend,
-        "standing_resolution": issuance.standing_resolution,
-        "subject": issuance.subject,
-        "work": issuance.work,
-        "work_schema": issuance.work_schema,
-    });
-    let canonical =
-        serde_json::to_vec(&basis).map_err(|error| format!("governed-issuance-basis:{error}"))?;
-    let expected = hash_domain("ag.governed-loop.issuance/v1", &canonical);
-    if expected != issuance.issuance {
-        return Err("governed-issuance-identity-mismatch".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_standing(
-    issuance: &AgIssuanceWireV1,
-    standing: &ExecutionStandingResolutionV1,
-    now: u64,
-) -> Result<(), String> {
-    if standing.schema != STANDING_RESOLUTION_SCHEMA_V1 {
-        return Err("governed-execution-standing-schema".to_owned());
-    }
-    for (value, label) in [
-        (&standing.resolution, "Docket standing resolution"),
-        (&standing.currentness, "Docket standing currentness"),
-        (&standing.execution_standing, "Docket execution standing"),
-    ] {
-        require_digest(value, label)?;
-    }
-    if standing.issuance != issuance.issuance
-        || standing.campaign != issuance.key.campaign
-        || standing.occurrence != issuance.key.occurrence
-        || standing.subject != issuance.subject
-        || standing.scope != issuance.scope
-    {
-        return Err("governed-execution-standing-binding-mismatch".to_owned());
-    }
-    if standing.status != ExecutionStandingStatusV1::Current
-        || standing.resolved_at_unix_ms > now
-        || now >= standing.expires_at_unix_ms
-    {
-        return Err("governed-execution-standing-not-current".to_owned());
     }
     Ok(())
 }
@@ -1301,54 +852,6 @@ fn b64_decode(value: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn hash_domain(domain: &str, payload: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"ag-ng\0digest\0v1\0");
-    hasher.update((domain.len() as u128).to_be_bytes());
-    hasher.update(domain.as_bytes());
-    hasher.update((payload.len() as u128).to_be_bytes());
-    hasher.update(payload);
-    format!("sha256:{}", lower_hex(&hasher.finalize()))
-}
-
-fn digest_json_string(domain: &str, value: &str) -> Result<String, String> {
-    let payload = serde_json::to_vec(value).map_err(|error| format!("digest-string:{error}"))?;
-    Ok(hash_domain(domain, &payload))
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn require_digest(value: &str, label: &str) -> Result<(), String> {
-    if value.len() != 71
-        || !value.starts_with("sha256:")
-        || !value[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(format!("governed-{label}-digest"));
-    }
-    Ok(())
-}
-
-fn require_uuid(value: &str) -> Result<(), String> {
-    if value.len() != 36
-        || value.bytes().enumerate().any(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte != b'-',
-            _ => !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        })
-    {
-        return Err("governed-occurrence-uuid".to_owned());
-    }
-    Ok(())
-}
-
 fn now_unix_ms() -> Result<u64, String> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1378,6 +881,7 @@ mod tests {
     use crate::store::SqliteStore;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use sha2::Digest as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1622,6 +1126,288 @@ mod tests {
         assert!(result.is_err());
         assert!(!database.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_before_custody_reservation_is_not_accepted_and_invokes_nothing() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let result = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            None,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert_eq!(result, DocketReconciliationWireV1::NotAccepted);
+        assert!(!fixture
+            .executor_program
+            .with_extension("invocations")
+            .exists());
+    }
+
+    #[test]
+    fn transport_refusal_after_custody_reconciles_without_a_second_execute() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        std::fs::write(
+            fixture.executor_program.with_extension("response"),
+            b"not-json",
+        )
+        .unwrap();
+        let custody = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let inspection = inspect(&fixture.database, &fixture.issuance.issuance).unwrap();
+        assert_eq!(
+            inspection.record.unwrap().status,
+            GovernedRecordStatusV1::Indeterminate
+        );
+
+        write_executor(
+            &fixture.executor_program,
+            &custody,
+            ExecutorOutcomeClassWireV1::Success,
+            &digest("reconciled-after-transport-refusal"),
+        );
+        let reconciled = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            Some(&custody.attempt),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert!(matches!(
+            reconciled,
+            DocketReconciliationWireV1::Settled { .. }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("invocations")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn executable_change_after_reservation_refuses_before_executor_invocation() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let standing: ExecutionStandingResolutionV1 = strict_json(
+            &std::fs::read(fixture.standing_program.with_extension("response")).unwrap_or_else(
+                |_| {
+                    let output = Command::new(&fixture.standing_program).output().unwrap();
+                    output.stdout
+                },
+            ),
+            "test-standing",
+        )
+        .unwrap();
+        write_mutating_static_program(
+            &fixture.standing_program,
+            &serde_json::to_string(&standing).unwrap(),
+            &fixture.executor_program,
+        );
+
+        accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let record = inspect(&fixture.database, &fixture.issuance.issuance)
+            .unwrap()
+            .record
+            .unwrap();
+        assert_eq!(record.status, GovernedRecordStatusV1::Indeterminate);
+        assert!(!fixture
+            .executor_program
+            .with_extension("invocations")
+            .exists());
+    }
+
+    #[test]
+    fn terminal_failure_and_settlement_replay_are_exact_and_nonexecuting() {
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Failure);
+        let custody = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let first = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            Some(&custody.attempt),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        write_refusing_program(&fixture.executor_program);
+        let replay = reconcile(
+            &fixture.database,
+            &fixture.issuance.issuance,
+            Some(&custody.attempt),
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert!(matches!(
+            first,
+            DocketReconciliationWireV1::Settled {
+                settlement: DocketSettlementWireV1 {
+                    outcome: KnownOutcomeWireV1::Failure,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read(fixture.executor_program.with_extension("invocations")).unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn changed_outcome_binding_and_stored_dispatch_inputs_refuse() {
+        for field in ["attempt", "marker"] {
+            let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+            let mut changed = fixture.custody.clone();
+            match field {
+                "attempt" => changed.attempt = digest("changed-attempt"),
+                "marker" => changed.executor_marker = digest("changed-marker"),
+                _ => unreachable!(),
+            }
+            write_executor(
+                &fixture.executor_program,
+                &changed,
+                ExecutorOutcomeClassWireV1::Success,
+                &digest("binding-refusal"),
+            );
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap();
+            assert_eq!(
+                inspect(&fixture.database, &fixture.issuance.issuance)
+                    .unwrap()
+                    .record
+                    .unwrap()
+                    .status,
+                GovernedRecordStatusV1::Indeterminate,
+                "field={field}"
+            );
+        }
+
+        for column in ["work", "subject", "scope"] {
+            let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+            accept(
+                &fixture.database,
+                &fixture.envelope,
+                &fixture.trust,
+                &fixture.standing_program,
+                &fixture.executor_program,
+                &fixture.root.join("executor-config"),
+            )
+            .unwrap();
+            let connection = Connection::open(&fixture.database).unwrap();
+            connection
+                .execute(
+                    &format!("UPDATE governed_loop_attempt SET {column}=?1"),
+                    [digest("stored-dispatch-substitution")],
+                )
+                .unwrap();
+            drop(connection);
+            assert!(
+                inspect(&fixture.database, &fixture.issuance.issuance).is_err(),
+                "column={column}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_and_exact_semantic_rows_remain_c1_compatible() {
+        let actual: [u8; 32] = sha2::Sha256::digest(include_bytes!(
+            "../migrations/0006_governed_loop_custody.sql"
+        ))
+        .into();
+        let expected: [u8; 32] =
+            hex_bytes("eefe9b084d1515086d3de3621c8b52a95a1603622f23482d2e700242bb7caeeb")
+                .try_into()
+                .unwrap();
+        assert_eq!(actual, expected);
+        let fixture = fixture(ExecutorOutcomeClassWireV1::Success);
+        let custody = accept(
+            &fixture.database,
+            &fixture.envelope,
+            &fixture.trust,
+            &fixture.standing_program,
+            &fixture.executor_program,
+            &fixture.root.join("executor-config"),
+        )
+        .unwrap();
+        let connection = Connection::open(&fixture.database).unwrap();
+        let row: (String, String, String, String, String, String, String) = connection
+            .query_row(
+                "SELECT issuance,ag_spend,execution_standing,attempt,executor_marker,status,outcome
+                 FROM governed_loop_attempt",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                fixture.issuance.issuance.clone(),
+                fixture.issuance.spend.clone(),
+                custody.execution_standing.clone(),
+                custody.attempt.clone(),
+                custody.executor_marker.clone(),
+                "settled".to_owned(),
+                "success".to_owned(),
+            )
+        );
+        let standing: (String, String, String) = connection
+            .query_row(
+                "SELECT execution_standing,issuance,standing_currentness
+                 FROM governed_execution_standing_use",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            standing,
+            (
+                custody.execution_standing,
+                fixture.issuance.issuance.clone(),
+                custody.standing_currentness,
+            )
+        );
     }
 
     #[test]
@@ -2028,6 +1814,21 @@ mod tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
+    fn write_mutating_static_program(path: &Path, output: &str, mutated: &Path) {
+        let escaped = output.replace('\'', "'\\''");
+        let mutated = mutated.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf '\\n# changed-after-reservation\\n' >> '{mutated}'\nprintf '%s' '{escaped}'\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
     fn write_refusing_program(path: &Path) {
         std::fs::write(path, "#!/bin/sh\nexit 77\n").unwrap();
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
@@ -2052,5 +1853,13 @@ mod tests {
             }
         }
         output
+    }
+
+    fn hex_bytes(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
     }
 }

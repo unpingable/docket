@@ -135,6 +135,9 @@ name = "gwr-runtime"
 version = "0.1.0"
 dependencies = [
  "gwr-core",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
