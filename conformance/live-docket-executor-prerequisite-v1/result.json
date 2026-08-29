@@ -1,0 +1,37 @@
+{
+  "schema": "docket.live-docket-executor-prerequisite-result/v1",
+  "campaign": "live-docket-executor-prerequisite-v1",
+  "codename": "RIVER-CLERK",
+  "source": {
+    "remote": "git@github-unpingable:unpingable/docket.git",
+    "branch": "campaign/c2-governed-loop-layering",
+    "commit": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b"
+  },
+  "result_branch": "campaign/live-docket-executor-prerequisite-v1",
+  "classification": "docket-process-host-qualified-bedrock-prerequisite-incomplete",
+  "bedrock_adapter_present": false,
+  "production_activation": false,
+  "authority_counts": {
+    "ag_issuances": 0,
+    "ag_acceptances": 0,
+    "ag_consumptions": 0,
+    "docket_production_attempts": 0,
+    "docket_standing_consumptions": 0,
+    "nq_claims": 0,
+    "nq_live_occurrences": 0,
+    "pods": 0,
+    "live_route_changes": 0,
+    "approval_responses": 0
+  },
+  "qualification": {
+    "cargo_fmt_check": "pass",
+    "cargo_clippy_workspace_all_targets_deny_warnings": "pass",
+    "cargo_test_workspace_debug": "pass",
+    "cargo_test_workspace_release": "pass",
+    "executor_transport_sha256sums": "pass",
+    "frozen_transport_diff": "empty",
+    "focused_real_process_cases": 17,
+    "state_pathname_replacement_unit_cases": 1
+  },
+  "stop_condition": "A separately owned NQ/Bedrock adapter plus durable claim/fence interface must qualify against this host before BEDROCK first-live-occurrence successor admission."
+}
