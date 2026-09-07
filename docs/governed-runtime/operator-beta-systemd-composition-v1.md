@@ -8,8 +8,8 @@
 `a05f7410cee0cca262d95ea198099f811091cc0f`
 **AG M1A accepted result:** `92d274c299478a65121f2d8e1b93a2d00383a828`
 **NQ-ng acquisition contract:** `e45c7b4bfb18ea740576a65f692b29f4390fbaff`
-**NQ-ng helper candidate (independent audit pending):**
-`0fe03f50ff971d910ff61f3ed2dd5d6534e67ab7`
+**NQ-ng helper accepted result (publication pending):**
+`9d8624a2d13cb1562b55a81de6f6cea07fb65dcc`
 **Release-basis acceptance:**
 `2e9a7657c414bd6307efd09fa0104fc6fb92938c`
 
@@ -181,9 +181,13 @@ accepted. The executor receipt is enactment testimony, not proof of a current
 postcondition. Only a subsequent fresh NQ-ng observation may support the
 postcondition, and M1B remains independently qualified.
 The accepted NQ-ng acquisition contract is
-`e45c7b4bfb18ea740576a65f692b29f4390fbaff`. The current helper subject
-`0fe03f50ff971d910ff61f3ed2dd5d6534e67ab7` is only a candidate until
-independent audit returns; it is not yet an admitted M1B result.
+`e45c7b4bfb18ea740576a65f692b29f4390fbaff`.
+The NQ-ng helper qualification result
+`9d8624a2d13cb1562b55a81de6f6cea07fb65dcc` independently returned
+`ACCEPTED / PROCEED` for implementation
+`386358190e974c532d5237d36231fe7e806d100e`. It remains unpublished at this
+checkpoint and establishes only the bounded helper, not an admitted M1B
+package/VM result.
 
 ## Failure cuts and reconciliation
 
