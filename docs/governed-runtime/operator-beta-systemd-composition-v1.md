@@ -1,10 +1,15 @@
 # Operator-beta AG systemd composition contract
 
 **Recorded:** 2026-09-07
-**Status:** `M1_DOCKET_COMPOSITION_CONTRACT__IMPLEMENTATION_NOT_STARTED`
+**Status:** `M1_DOCKET_COMPOSITION_CONTRACT__NQ_NG_RECONCILIATION_REVIEW_REQUIRED`
 
 **Docket owner base:** `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`
+**AG/Docket adoption integration result:**
+`a05f7410cee0cca262d95ea198099f811091cc0f`
 **AG M1A accepted result:** `92d274c299478a65121f2d8e1b93a2d00383a828`
+**NQ-ng acquisition contract:** `e45c7b4bfb18ea740576a65f692b29f4390fbaff`
+**NQ-ng helper candidate (independent audit pending):**
+`0fe03f50ff971d910ff61f3ed2dd5d6534e67ab7`
 **Release-basis acceptance:**
 `2e9a7657c414bd6307efd09fa0104fc6fb92938c`
 
@@ -25,7 +30,7 @@ AG historical decision and one-use authorization consumption
   -> target-local AG systemd executor V2
   -> executor-owned systemd evidence and terminal receipt
   -> Docket settlement or outcome-unknown reconciliation
-  -> fresh classic-NQ observation (separate M1B owner)
+  -> fresh NQ-ng observation (separate M1B owner)
 ```
 
 AG owns the decision cut, authorization consumption, signed issuance, exact
@@ -34,7 +39,7 @@ receipt. Docket owns authentication of the issuance, its fresh execution
 standing decision, canonical attempt and marker, exact executor binding,
 dispatch custody, settlement, and reconciliation. The executor owns whether
 its retained evidence supports `success`, `failure`, or `indeterminate`.
-Classic NQ owns fresh postcondition observation. No component silently assumes
+NQ-ng owns fresh postcondition observation. No component silently assumes
 another component's authority.
 
 The canonical Docket product is this repository. The sibling campaign/evidence
@@ -51,9 +56,17 @@ schema corpus, SQLite migration, and external behavior while placing the
 transport-neutral law in `gwr-runtime` and local process/SQLite adapters in
 `gwr-local`.
 
-The AG side is the accepted and published M1A result
-`92d274c299478a65121f2d8e1b93a2d00383a828`. Its qualified target-local package
-is `agent-governor-ng-systemd-executor` version `0.1.0-1+m1a3`, archive SHA-256
+The admitted AG/Docket adoption pair is the accepted and published AG result
+`a05f7410cee0cca262d95ea198099f811091cc0f` with exact Docket C2
+`c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`. That result contains the tested
+AG integration merge `651d7178ef4a8950b9d9ac25c7d3fe496ed55f96` and preserves the separately
+qualified M1A systemd owner result
+`92d274c299478a65121f2d8e1b93a2d00383a828` as an ancestor. The adoption
+integration witness does not reclassify either owner's earlier result; this
+composition requires new evidence against the integrated pair.
+
+The M1A result's qualified target-local package is
+`agent-governor-ng-systemd-executor` version `0.1.0-1+m1a3`, archive SHA-256
 `2852dc8a516980c4a1936d64a3a3f472d95fccf5eb3935f01a1be277f6b24f26`.
 The package installs the feature-enabled process adapter only at
 `/usr/libexec/agent-governor-ng/ag-effectd`, with executable SHA-256
@@ -110,6 +123,15 @@ authentication, custody, executor binding, status, settlement, or
 indeterminate evidence. No composition-specific Docket state table or event
 stream is authorized by this contract.
 
+The operator selected NQ-ng for M1B after the original release-basis record
+named classic NQ. The classic worktree and its exact results remain preserved,
+but that lane is `SUPERSEDED_FOR_OPERATOR_BETA`. No classic-NQ implementation,
+acceptance, or evidence transfers to NQ-ng. NQ-ng must establish its own exact
+contract, implementation, package, fixture, and terminal qualification under
+its owner gates. Docket may consume only a terminally accepted NQ-ng artifact
+whose applicability to the exact composed occurrence has been mechanically
+verified.
+
 ## Bounded beta occurrence
 
 The composition fixture admits one non-production action:
@@ -156,8 +178,12 @@ historical basis.
 Docket and the executor do not copy or reinterpret AG policy evaluation.
 Docket's settlement proves only its own custody and the executor outcome it
 accepted. The executor receipt is enactment testimony, not proof of a current
-postcondition. Only a subsequent fresh classic-NQ observation may support the
+postcondition. Only a subsequent fresh NQ-ng observation may support the
 postcondition, and M1B remains independently qualified.
+The accepted NQ-ng acquisition contract is
+`e45c7b4bfb18ea740576a65f692b29f4390fbaff`. The current helper subject
+`0fe03f50ff971d910ff61f3ed2dd5d6534e67ab7` is only a candidate until
+independent audit returns; it is not yet an admitted M1B result.
 
 ## Failure cuts and reconciliation
 
@@ -250,14 +276,14 @@ The Docket owner result may close on those twelve cases without claiming a
 fresh postcondition. The complete M1 vertical later joins the accepted Docket
 result to independently accepted M1B evidence and must additionally prove:
 
-- fresh classic-NQ postcondition evidence is joined only through recorded
+- fresh NQ-ng postcondition evidence is joined only through recorded
   exact subject, scope, and target identities; an unrecorded edge remains
   absent; and
 - original decision, historical warrant, and current support remain separate
   when later observation or policy differs.
 
 Those are composition acceptance conditions, not authority for Docket to
-implement, reinterpret, or qualify classic NQ.
+implement, reinterpret, or qualify NQ-ng.
 
 ## Current gate and non-goals
 
@@ -274,7 +300,9 @@ Not authorized here:
 - a distributed transaction coordinator;
 - a second orchestration or persistence layer;
 - production deployment, default-branch merge, or service activation;
-- classic-NQ implementation or cutover;
+- classic-NQ implementation, result transfer, or cutover;
+- NQ-ng package, VM, provider, or production activation outside its accepted
+  owner lane;
 - worker/provider/model execution;
 - UI controls or aggregate `authorized`, `executed`, `healthy`, or
   `exactly_once` status; or
