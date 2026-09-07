@@ -128,9 +128,10 @@ named classic NQ. The classic worktree and its exact results remain preserved,
 but that lane is `SUPERSEDED_FOR_OPERATOR_BETA`. No classic-NQ implementation,
 acceptance, or evidence transfers to NQ-ng. NQ-ng must establish its own exact
 contract, implementation, package, fixture, and terminal qualification under
-its owner gates. Docket may consume only a terminally accepted NQ-ng artifact
-whose applicability to the exact composed occurrence has been mechanically
-verified.
+its owner gates. The eventual main-loop integration artifact may join only a
+terminally accepted NQ-ng artifact whose applicability to the exact composed
+occurrence has been mechanically verified. Docket neither consumes nor
+reinterprets NQ-ng evidence.
 
 ## Bounded beta occurrence
 
