@@ -886,6 +886,83 @@ def check_run(path: pathlib.Path, nq: Any) -> None:
     print(json.dumps({"result": "COMPOSED_RUN_REOPENED", "run_id": result["run_id"]}, sort_keys=True))
 
 
+def check_refusal(path: pathlib.Path, nq: Any) -> None:
+    recovery = nq.load_recovery(path)
+    refusal = nq.load_json_artifact(path / "REFUSAL.json", "composition refusal")
+    refusal_fields = {
+        "schema",
+        "run_id",
+        "occurred_at",
+        "phase",
+        "reason",
+        "effect_outcome",
+    }
+    producer = recovery.get("producer")
+    composition = recovery.get("composition")
+    if (
+        set(refusal) != refusal_fields
+        or refusal.get("schema") != "constellation.operator_beta.m1b_refusal.v1"
+        or not isinstance(refusal.get("run_id"), str)
+        or not refusal["run_id"]
+        or not isinstance(refusal.get("phase"), str)
+        or not refusal["phase"]
+        or not isinstance(refusal.get("reason"), str)
+        or not refusal["reason"]
+        or len(refusal["reason"].encode()) > 4096
+        or not isinstance(refusal.get("occurred_at"), str)
+        or not isinstance(refusal.get("effect_outcome"), str)
+    ):
+        raise nq.Refusal("composition refusal is not one closed owner record")
+    if (
+        recovery.get("phase") != "refused"
+        or recovery.get("run_id") != refusal["run_id"]
+        or recovery.get("last_completed_phase") != refusal["phase"]
+        or recovery.get("effect_outcome") != refusal["effect_outcome"]
+        or recovery.get("refusal") != refusal
+        or recovery.get("next_lawful_action")
+        != "reopen evidence; do not restart producer"
+    ):
+        raise nq.Refusal("composition recovery and refusal disagree")
+    if (
+        recovery.get("harness_subject") != NQ_HEAD
+        or not isinstance(recovery.get("input_facts"), dict)
+        or not recovery["input_facts"]
+        or not isinstance(producer, dict)
+        or set(producer) != {"systemd_unit", "invocation_id", "main_pid", "start_ticks"}
+        or not re.fullmatch(
+            r"[A-Za-z0-9_.@:-]{1,255}\.service", str(producer.get("systemd_unit", ""))
+        )
+        or not re.fullmatch(r"[0-9a-fA-F]{32}", str(producer.get("invocation_id", "")))
+        or not isinstance(producer.get("main_pid"), int)
+        or not isinstance(producer.get("start_ticks"), int)
+        or not isinstance(composition, dict)
+        or not re.fullmatch(r"[0-9a-f]{40}", str(composition.get("subject", "")))
+        or composition.get("package_sha256") != COMPOSITION_PACKAGE_SHA256
+        or composition.get("receipt_sha256") != COMPOSITION_RECEIPT_SHA256
+        or composition.get("authority")
+        != "AG-ng decision/spend; Docket attempt/transport; AG-ng effect evidence"
+    ):
+        raise nq.Refusal("composition refusal does not bind the admitted occurrence")
+    custody = recovery.get("effect_custody")
+    if (
+        refusal["effect_outcome"] == "KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS"
+        and not isinstance(custody, dict)
+    ):
+        raise nq.Refusal("successful effect testimony has no retained owner custody")
+    if refusal["effect_outcome"] == "NO_EFFECT_ATTEMPTED" and custody is not None:
+        raise nq.Refusal("no-effect refusal unexpectedly retains effect custody")
+    def pathname_exists(candidate: pathlib.Path) -> bool:
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    if pathname_exists(path / "RESULT.json") or pathname_exists(path / "ARTIFACTS.sha256"):
+        raise nq.Refusal("refused composition has an additional success terminal record")
+    print(json.dumps({"result": "COMPOSED_REFUSAL_REOPENED", "run_id": refusal["run_id"]}, sort_keys=True))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
@@ -905,6 +982,9 @@ def parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check-run")
     check.add_argument("path", type=pathlib.Path)
     check.add_argument("--nq-harness", type=pathlib.Path, required=True)
+    refusal = commands.add_parser("check-refusal")
+    refusal.add_argument("path", type=pathlib.Path)
+    refusal.add_argument("--nq-harness", type=pathlib.Path, required=True)
     return root
 
 
@@ -915,6 +995,8 @@ def main() -> int:
         exact_repository(args.nq_harness, NQ_HEAD, NQ_TREE, nq)
         if args.command == "check-run":
             check_run(args.path, nq)
+        elif args.command == "check-refusal":
+            check_refusal(args.path, nq)
         else:
             producer_class(nq)(args).execute()
     except Exception as error:

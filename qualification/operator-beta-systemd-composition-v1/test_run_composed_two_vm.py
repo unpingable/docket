@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import io
 import json
@@ -37,6 +38,116 @@ nq = load(
 
 
 class CompositionAdapterTests(unittest.TestCase):
+    def refusal_records(self, root: pathlib.Path) -> tuple[dict, dict]:
+        refusal = {
+            "schema": "constellation.operator_beta.m1b_refusal.v1",
+            "run_id": "composition-refusal-1",
+            "occurred_at": "2026-09-08T12:00:00Z",
+            "phase": "guests_prepared",
+            "reason": "bounded local fixture refusal",
+            "effect_outcome": "NO_EFFECT_ATTEMPTED",
+        }
+        recovery = {
+            "schema": "constellation.operator_beta.m1b_recovery.v1",
+            "campaign": nq.CAMPAIGN,
+            "run_id": refusal["run_id"],
+            "host": "local-fixture",
+            "working_directory": str(root),
+            "harness_subject": adapter.NQ_HEAD,
+            "accepted_package_result": "fixture",
+            "input_facts": {"fixture": "admitted"},
+            "protocols": {"docket_transport": "gwr.executor-transport/v1"},
+            "phase": "refused",
+            "last_completed_phase": refusal["phase"],
+            "next_lawful_action": "reopen evidence; do not restart producer",
+            "effect_outcome": refusal["effect_outcome"],
+            "effect_custody": None,
+            "updated_at": refusal["occurred_at"],
+            "producer": {
+                "systemd_unit": "constellation-composition-refusal-1.service",
+                "invocation_id": "1" * 32,
+                "main_pid": 1200,
+                "start_ticks": 4500,
+            },
+            "expected_terminal_records": [
+                "RESULT.json + ARTIFACTS.sha256",
+                "or REFUSAL.json + RECOVERY.json",
+            ],
+            "paths": {
+                "run_root": str(root),
+                "host_log": str(root / "host.log"),
+                "evidence": str(root / "evidence"),
+            },
+            "guests": [],
+            "composition": {
+                "subject": "a" * 40,
+                "package_sha256": adapter.COMPOSITION_PACKAGE_SHA256,
+                "receipt_sha256": adapter.COMPOSITION_RECEIPT_SHA256,
+                "authority": "AG-ng decision/spend; Docket attempt/transport; AG-ng effect evidence",
+            },
+            "refusal": copy.deepcopy(refusal),
+        }
+        return refusal, recovery
+
+    def write_refusal_records(
+        self, root: pathlib.Path, refusal: dict, recovery: dict
+    ) -> None:
+        (root / "REFUSAL.json").write_bytes(nq.canonical(refusal) + b"\n")
+        (root / "RECOVERY.json").write_bytes(nq.canonical(recovery) + b"\n")
+
+    def test_refusal_reopens_only_exact_agreeing_owner_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            refusal, recovery = self.refusal_records(root)
+            self.write_refusal_records(root, refusal, recovery)
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                adapter.check_refusal(root, nq)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"result": "COMPOSED_REFUSAL_REOPENED", "run_id": refusal["run_id"]},
+            )
+
+    def test_refusal_reopen_rejects_disagreement_and_success_terminal(self) -> None:
+        substitutions = (
+            ("run", lambda refusal, _recovery: refusal.__setitem__("run_id", "other")),
+            ("phase", lambda refusal, _recovery: refusal.__setitem__("phase", "other")),
+            (
+                "effect",
+                lambda refusal, _recovery: refusal.__setitem__(
+                    "effect_outcome", "KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS"
+                ),
+            ),
+            ("reason", lambda refusal, _recovery: refusal.__setitem__("reason", "other")),
+            (
+                "nested",
+                lambda _refusal, recovery: recovery["refusal"].__setitem__(
+                    "reason", "other"
+                ),
+            ),
+        )
+        for label, substitute in substitutions:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                refusal, recovery = self.refusal_records(root)
+                substitute(refusal, recovery)
+                self.write_refusal_records(root, refusal, recovery)
+                with self.assertRaisesRegex(nq.Refusal, "disagree|custody"):
+                    adapter.check_refusal(root, nq)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            refusal, recovery = self.refusal_records(root)
+            self.write_refusal_records(root, refusal, recovery)
+            (root / "RESULT.json").write_bytes(b"{}\n")
+            with self.assertRaisesRegex(nq.Refusal, "additional success"):
+                adapter.check_refusal(root, nq)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            refusal, recovery = self.refusal_records(root)
+            self.write_refusal_records(root, refusal, recovery)
+            (root / "ARTIFACTS.sha256").symlink_to(root / "missing")
+            with self.assertRaisesRegex(nq.Refusal, "additional success"):
+                adapter.check_refusal(root, nq)
+
     def test_docket_inspection_preserves_owner_json_framing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "docket-inspection.json"
