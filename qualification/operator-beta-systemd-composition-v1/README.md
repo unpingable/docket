@@ -1,5 +1,15 @@
 # Operator-beta AG → Docket → systemd composition fixture
 
+## Classic-retirement derivative qualification
+
+The current candidate inputs and qualification boundary are recorded in
+[CLASSIC_RETIREMENT_DERIVATIVE.md](CLASSIC_RETIREMENT_DERIVATIVE.md).
+The run-002 record below is retained historical evidence for its original
+revisions, not the current derivative pins or acceptance of new runtime heads.
+The derivative must earn its own composition evidence.
+
+## Historical run-002 record
+
 **Recorded:** 2026-09-08
 **State:** `RUN_002_ACCEPTED__CLOSEOUT_READY_FOR_INDEPENDENT_AUDIT`
 
