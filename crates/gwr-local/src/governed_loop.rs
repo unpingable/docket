@@ -1804,6 +1804,7 @@ mod tests {
 
     fn write_static_program(path: &Path, output: &str) {
         let escaped = output.replace('\'', "'\\''");
+        std::fs::write(path.with_extension("response"), output).unwrap();
         std::fs::write(
             path,
             format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' '{escaped}'\n"),

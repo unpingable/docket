@@ -109,22 +109,37 @@ impl LaborProvider for CodexExecProvider {
     ) -> Result<PreparationReport, ProviderError> {
         let workspace = assignment.workspace.clone();
         let prompt = prompt_for(assignment);
-        let mut child = Command::new(&self.codex_bin)
-            .arg("exec")
-            .args(["-c", "approval_policy=\"never\""])
-            .args(["--sandbox", "workspace-write"])
-            .arg("--skip-git-repo-check")
-            .args(["--cd", workspace.to_string_lossy().as_ref()])
-            .arg(&prompt)
-            .current_dir(&workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| ProviderError::Died(format!("spawn codex: {e}")))?;
+        let started = Instant::now();
+        let mut child = loop {
+            let result = Command::new(&self.codex_bin)
+                .arg("exec")
+                .args(["-c", "approval_policy=\"never\""])
+                .args(["--sandbox", "workspace-write"])
+                .arg("--skip-git-repo-check")
+                .args(["--cd", workspace.to_string_lossy().as_ref()])
+                .arg(&prompt)
+                .current_dir(&workspace)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            match result {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && started.elapsed() < self.timeout.min(Duration::from_millis(250)) =>
+                {
+                    // No child exists when spawn returns ETXTBSY. A bounded
+                    // retry therefore cannot duplicate provider execution.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    return Err(ProviderError::Died(format!("spawn codex: {error}")));
+                }
+            }
+        };
 
         // Bounded: poll for completion; past the deadline the provider is dead.
-        let started = Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,

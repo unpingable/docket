@@ -11,7 +11,10 @@ use gwr_runtime::ports::labor_provider::{
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static FIXTURE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn sh(dir: &Path, args: &[&str]) -> String {
     let out = Command::new(args[0])
@@ -29,8 +32,20 @@ fn sh(dir: &Path, args: &[&str]) -> String {
 
 /// A source repo and a populated disposable workspace at its basis.
 fn fixture(name: &str) -> (PathBuf, PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!("gwr-codex-{}-{}", name, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = loop {
+        let nonce = FIXTURE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = std::env::temp_dir().join(format!(
+            "gwr-codex-{}-{}-{}",
+            name,
+            std::process::id(),
+            nonce
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("claim isolated fixture directory: {error}"),
+        }
+    };
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     sh(&repo, &["git", "init", "-q"]);
@@ -58,8 +73,10 @@ fn fixture(name: &str) -> (PathBuf, PathBuf, String) {
 
 fn fake_codex(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("fake-codex");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let staged = dir.join(".fake-codex.staged");
+    std::fs::write(&staged, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(staged, &path).unwrap();
     path
 }
 

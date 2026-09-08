@@ -12,10 +12,47 @@ use gwr_core::refusal::DispatchRefusalGround;
 use gwr_core::work_request::CommitHash;
 use gwr_runtime::ports::effect_broker::{BrokerOutcome, EffectBroker};
 use std::io::Write as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const ENVELOPE_PREFIX: &str = "gwr-envelope-v1";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct BrokerTemporaryDirectory(PathBuf);
+
+impl BrokerTemporaryDirectory {
+    fn create(journal: &Journal, dispatch: &str) -> Result<Self, String> {
+        let parent = journal
+            .path
+            .parent()
+            .ok_or_else(|| "journal has no custody directory".to_owned())?;
+        for _ in 0..10_000 {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".gwr-broker-{dispatch}-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err("could not reserve a unique broker temporary directory".to_owned())
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for BrokerTemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// Serialize an envelope to the explicit on-disk format the broker binary
 /// reads. One `key=value` per line; `allowed_path` repeats.
@@ -295,8 +332,8 @@ pub fn execute_envelope(
 
     // Temporary index: the governed repository's worktree and index are never
     // touched. Only objects are written until the ref transition.
-    let tmp_index = std::env::temp_dir().join(format!("gwr-index-{}", env.dispatch));
-    let _ = std::fs::remove_file(&tmp_index);
+    let temporary = BrokerTemporaryDirectory::create(journal, &env.dispatch)?;
+    let tmp_index = temporary.join("index");
     let index_str = tmp_index.to_string_lossy().to_string();
     let envs = [("GIT_INDEX_FILE", index_str.as_str())];
 
@@ -306,8 +343,16 @@ pub fn execute_envelope(
     }
 
     // Apply the patch to the temporary index.
-    let patch_file = std::env::temp_dir().join(format!("gwr-patch-{}", env.dispatch));
-    std::fs::write(&patch_file, patch).map_err(|e| e.to_string())?;
+    let patch_file = temporary.join("patch");
+    let mut patch_output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&patch_file)
+        .map_err(|error| error.to_string())?;
+    patch_output
+        .write_all(patch)
+        .and_then(|()| patch_output.sync_all())
+        .map_err(|error| error.to_string())?;
     let apply = git_env(
         &env.repository,
         &[
@@ -411,8 +456,6 @@ pub fn execute_envelope(
     phase(journal, &format!("ref_updated {current} {result}"))?;
 
     phase(journal, "acknowledged")?;
-    let _ = std::fs::remove_file(&tmp_index);
-    let _ = std::fs::remove_file(&patch_file);
     Ok(BrokerRun::Committed {
         previous: current,
         result,

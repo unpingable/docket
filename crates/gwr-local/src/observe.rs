@@ -10,7 +10,27 @@ use gwr_core::ids::{AttemptId, ObservationId};
 use gwr_core::observation_plan::ObservationRecord;
 use gwr_runtime::ports::adapters::{Clock, IdSource};
 use gwr_runtime::ports::store::{Store, StoreError};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static OBSERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn observation_custody_root() -> Result<std::path::PathBuf, ObserveError> {
+    for _ in 0..10_000 {
+        let sequence = OBSERVATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("gwr-observe-{}-{sequence}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ObserveError::Io(error.to_string())),
+        }
+    }
+    Err(ObserveError::Io(
+        "could not reserve a unique observation directory".to_owned(),
+    ))
+}
 
 #[derive(Debug)]
 pub enum ObserveError {
@@ -52,12 +72,8 @@ pub fn observe(
     let repo = projected.attempt.repository.as_str().to_string();
     let result_commit = commitment.result_commit.clone();
 
-    let worktree = std::env::temp_dir().join(format!(
-        "gwr-observe-{}-{}",
-        std::process::id(),
-        result_commit.as_str()
-    ));
-    let _ = std::fs::remove_dir_all(&worktree);
+    let custody_root = observation_custody_root()?;
+    let worktree = custody_root.join("worktree");
     let add = Command::new("git")
         .args([
             "-C",
@@ -71,35 +87,39 @@ pub fn observe(
         .output()
         .map_err(|e| ObserveError::Io(e.to_string()))?;
     if !add.status.success() {
+        let _ = std::fs::remove_dir_all(&custody_root);
         return Err(ObserveError::Io(format!(
             "worktree add failed: {}",
             String::from_utf8_lossy(&add.stderr)
         )));
     }
 
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
-        .current_dir(&worktree)
-        .output()
-        .map_err(|e| ObserveError::Io(e.to_string()))?;
+    let result = (|| {
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(&worktree)
+            .output()
+            .map_err(|e| ObserveError::Io(e.to_string()))?;
 
-    let record = ObservationRecord {
-        id: ObservationId::from_bytes(ids.fresh16()),
-        attempt: attempt_id,
-        argv,
-        working_directory_identity: format!("detached-worktree@{}", result_commit.as_str()),
-        result_commit,
-        environment_description: projected
-            .attempt
-            .observation_plan
-            .environment_description
-            .clone(),
-        exit_status: output.status.code().unwrap_or(-1),
-        stdout_digest: Sha256Digest::of_bytes(&output.stdout),
-        stderr_digest: Sha256Digest::of_bytes(&output.stderr),
-        observed_at: clock.now(),
-    };
-    store.record_observation(&record)?;
+        let record = ObservationRecord {
+            id: ObservationId::from_bytes(ids.fresh16()),
+            attempt: attempt_id,
+            argv,
+            working_directory_identity: format!("detached-worktree@{}", result_commit.as_str()),
+            result_commit,
+            environment_description: projected
+                .attempt
+                .observation_plan
+                .environment_description
+                .clone(),
+            exit_status: output.status.code().unwrap_or(-1),
+            stdout_digest: Sha256Digest::of_bytes(&output.stdout),
+            stderr_digest: Sha256Digest::of_bytes(&output.stderr),
+            observed_at: clock.now(),
+        };
+        store.record_observation(&record)?;
+        Ok(record)
+    })();
 
     let _ = Command::new("git")
         .args([
@@ -111,5 +131,6 @@ pub fn observe(
             worktree.to_string_lossy().as_ref(),
         ])
         .output();
-    Ok(record)
+    let _ = std::fs::remove_dir_all(&custody_root);
+    result
 }
