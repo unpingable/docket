@@ -70,6 +70,32 @@ fn backend(e: rusqlite::Error) -> StoreError {
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
 
 impl SqliteStore {
+    /// Existing current-schema query snapshot. No creation, migrations,
+    /// journal-mode transition, or domain writes. SQLite may use its existing
+    /// WAL reader-coordination files; this is not an immutable-file export.
+    pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(backend)?;
+        conn.pragma_update(None, "query_only", true)
+            .map_err(backend)?;
+        conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
+            .map_err(backend)?;
+        conn.execute_batch("BEGIN DEFERRED TRANSACTION")
+            .map_err(backend)?;
+        // These statements require the current supported schema without
+        // running any migration or inferring missing columns as empty facts.
+        for query in [
+            "SELECT repository_id FROM work_request LIMIT 0",
+            "SELECT observation FROM reliance_refusal LIMIT 0",
+            "SELECT source FROM standing_grant LIMIT 0",
+            "SELECT * FROM campaign_stage_standing LIMIT 0",
+            "SELECT * FROM governed_loop_attempt LIMIT 0",
+        ] {
+            conn.prepare(query).map_err(backend)?;
+        }
+        Ok(Self { conn })
+    }
+
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();

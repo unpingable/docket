@@ -83,6 +83,7 @@ Authorization and evidence:
   governed-loop accept | reconcile-issuance | reconcile-attempt
   list [--json]
   show (--attempt <id> | --dispatch <id>) [--json]
+  show-read-only (--attempt <id> | --dispatch <id>) [--json]
   journal (--attempt <id> | --dispatch <id>) [--json]
 
 Campaign-stage standing (S-2; a distinct domain from effect standing):
@@ -272,6 +273,18 @@ struct State {
 }
 
 impl State {
+    fn open_read_only(args: &[String]) -> Result<Self, String> {
+        let dir = PathBuf::from(need(args, "--state")?);
+        let store =
+            SqliteStore::open_read_only(&dir.join("state.sqlite")).map_err(|e| format!("{e:?}"))?;
+        Ok(Self {
+            dir,
+            store,
+            ids: HashChainIds::new(),
+            clock: SystemClock,
+        })
+    }
+
     fn open(args: &[String]) -> Result<Self, String> {
         let dir = PathBuf::from(need(args, "--state")?);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1430,8 +1443,10 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        ["docket", "show"] | ["show"] => {
-            let mut st = State::open(args)?;
+        ["docket", "show"] | ["show"] | ["show-read-only"] => {
+            let mut st = if cmd.as_slice() == ["show-read-only"] {
+                State::open_read_only(args)?
+            } else { State::open(args)? };
             let attempt = resolve_attempt(&mut st, args)?;
             // One canonical read model sources both surfaces; the human and
             // JSON renderings are pure functions of the same assembled value.

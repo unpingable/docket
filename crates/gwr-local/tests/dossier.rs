@@ -245,6 +245,50 @@ fn retirement_native_docket_source_stores() {
     }
 }
 
+#[test]
+fn readonly_dossier_never_initializes_or_migrates_and_denies_writes() {
+    let mut fx = fixture("readonly");
+    drive_committed(&mut fx);
+    let expected = render_json(&assemble(&mut fx.store, fx.att.attempt_id).unwrap());
+    let mut reader = SqliteStore::open_read_only(&fx.root.join("state.sqlite")).unwrap();
+    assert_eq!(
+        render_json(&assemble(&mut reader, fx.att.attempt_id).unwrap()),
+        expected
+    );
+    assert!(reader
+        .execute_raw_for_test("DELETE FROM work_request")
+        .is_err());
+    let command = |root: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_docket"))
+            .args(["show-read-only", "--state"])
+            .arg(root)
+            .args(["--attempt", "09090909090909090909090909090909", "--json"])
+            .output()
+            .unwrap()
+    };
+    let out = command(&fx.root);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), expected);
+    let missing = fx.root.join("absent");
+    assert!(!command(&missing).status.success());
+    assert!(!missing.exists());
+    let old = fx.root.join("old");
+    std::fs::create_dir(&old).unwrap();
+    let old_db = old.join("state.sqlite");
+    rusqlite::Connection::open(&old_db)
+        .unwrap()
+        .execute_batch("CREATE TABLE work_request (id TEXT);")
+        .unwrap();
+    let before = std::fs::read(&old_db).unwrap();
+    assert!(!command(&old).status.success());
+    assert_eq!(std::fs::read(&old_db).unwrap(), before);
+    assert!(SqliteStore::open_read_only(&old_db).is_err());
+}
+
 fn grant(fx: &mut Fx, byte: u8, act: StandingAct) -> StandingGrant {
     let g = StandingGrant::issue(
         StandingGrantId::from_bytes([byte; 16]),
