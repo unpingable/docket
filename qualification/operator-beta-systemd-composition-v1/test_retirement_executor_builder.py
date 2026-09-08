@@ -8,6 +8,14 @@ import build_retirement_executor as builder
 
 
 class ExecutorBuilderTests(unittest.TestCase):
+    def test_failed_build_retains_both_streams_and_terminal_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "attempt.log"
+            with self.assertRaisesRegex(builder.shared.Refusal, "retained output"):
+                builder.logged_build(["/bin/sh", "-c", "echo useful-output; echo useful-error >&2; exit 7"], log)
+            self.assertEqual(log.read_text(), "useful-output\nuseful-error\n")
+            self.assertEqual(log.with_suffix(".exit").read_text(), "7\n")
+
     def test_command_keeps_offline_exact_image_and_feature_enabled_binary(self):
         command = builder.command(*(pathlib.Path(value) for value in ("source", "vendor", "cargo", "target")))
         self.assertEqual(command[command.index("--network") + 1], "none")

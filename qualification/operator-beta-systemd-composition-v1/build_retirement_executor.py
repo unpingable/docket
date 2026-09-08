@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
 import tempfile
 
 import build_bookworm_fixture as shared
@@ -15,6 +16,17 @@ VERSION = "0.1.0-1+classicretirement1"
 PACKAGE = f"agent-governor-ng-systemd-executor_{VERSION}_amd64.deb"
 SCHEMA = "constellation.classic_retirement.executor_build.v1"
 LIMITATIONS = ["qualification-only", "no installation or execution qualification", "no inherited M2 acceptance"]
+
+
+def logged_build(arguments, destination):
+    """Retain command output before reporting failure or supervisor loss."""
+    with destination.open("xb", buffering=0) as log:
+        result = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        os.fsync(log.fileno())
+    terminal = destination.with_suffix(".exit")
+    terminal.write_text(f"{result.returncode}\n")
+    if result.returncode != 0:
+        raise shared.Refusal(f"build exited {result.returncode}; retained output: {destination}")
 
 
 def command(source, vendor, cargo_home, target):
@@ -60,6 +72,7 @@ def build(args):
     source = shared.source_facts(args.source, shared.AG_HEAD, shared.AG_TREE, "AG")
     vendor = shared.tree_digest(args.vendor, b"ag-composition-vendor-v1")
     image = shared.image_facts()
+    args.output.mkdir(mode=0o700)
     # Two independent offline builds, with only one temporary campaign-owned root.
     with tempfile.TemporaryDirectory(prefix=".retirement-executor-", dir=args.output.parent) as temporary:
         scratch = pathlib.Path(temporary)
@@ -75,8 +88,9 @@ def build(args):
             cargo_home, target = case / "cargo", case / "target"
             cargo_home.mkdir()
             target.mkdir()
-            result = shared.run(command(checkout, args.vendor, cargo_home, target))
-            (case / "build.log").write_bytes(result.stdout + result.stderr)
+            print(f"BUILD_STARTED {label}", flush=True)
+            logged_build(command(checkout, args.vendor, cargo_home, target), args.output / f"{label}-build.log")
+            print(f"BUILD_COMPLETED {label}", flush=True)
             binary = target / "release/ag-effectd"
             versions = shared.run(["readelf", "--version-info", str(binary)]).stdout.decode()
             parsed = [(int(a), int(b)) for a, b in re.findall(r"Name: GLIBC_(\d+)\.(\d+)", versions)]
@@ -87,12 +101,10 @@ def build(args):
                           "package_sha256": shared.sha256(package), "package_bytes": package.stat().st_size})
         if facts[0] != facts[1]:
             raise shared.Refusal("independent executor builds differ")
-        args.output.mkdir(mode=0o700)
         shutil.copyfile(scratch / "a" / PACKAGE, args.output / PACKAGE)
         logs = {}
         for label in ("a", "b"):
             destination = args.output / f"{label}-build.log"
-            shutil.copyfile(scratch / label / "build.log", destination)
             logs[destination.name] = shared.sha256(destination)
         receipt = {"schema": SCHEMA, "source": source, "vendor": list(vendor), "image": image,
                    "environment": shared.BUILD_ENV, "clean_builds": 2, "version": VERSION,

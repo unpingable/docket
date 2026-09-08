@@ -12,6 +12,19 @@ packaging mechanics to build a separate feature-enabled `ag-effectd` package
 twice. The latter installs no service, configuration or mutable state. Its
 receipt is build evidence, not execution or package-installation acceptance.
 
+Each build now streams stdout/stderr to an exclusive durable output log before
+checking its exit code, with a separate terminal record. A failed later build
+does not delete earlier logs. Scratch compilation files remain temporary; logs
+and partial output custody remain in the named occurrence for reconciliation.
+This corrects an independent-review finding in the first derivative candidate;
+the already-started 001 occurrence remains attached to its original source.
+
+Executor package acceptance additionally requires an independent inspection of
+the actual archive's closed binary-only layout, ownership/modes, control fields,
+binary and package hashes against the receipt, source/tree/vendor/image pins,
+and both retained build logs. The receipt does not authenticate itself. No
+automatic runner pin is generated from an unreviewed receipt.
+
 Pending: independently review the derivative builders, build and inspect their
 actual artifacts, pin the final corrected NQ native package and AG package in
 a separate derivative harness, then run the affected local and two-VM witnesses.
