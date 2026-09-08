@@ -1,8 +1,9 @@
 # Classic-retirement composition derivative — NOT YET QUALIFIED
 
 This isolated candidate derives from M2 controller `b8bbb84`. It does not
-change the accepted M2 worktree, result, or runtime claims. The fixed Docket
-runtime remains `c49ad8d`; AG runtime is newly pinned to `bf6adde` rather than
+change the accepted M2 worktree, result, or runtime claims. The derivative Docket
+runtime is now candidate `6c57926` (adds migration-free `show-read-only` to
+the c49 lineage); AG runtime is newly pinned to `bf6adde` rather than
 inheriting acceptance from `837de28`.
 
 `build_bookworm_fixture.py` rebuilds the composition driver against that AG
@@ -31,3 +32,8 @@ a separate derivative harness, then run the affected local and two-VM witnesses.
 No VM launch is authorized by merely producing a package. Original package
 digests and qualification-result identities must not be presented as accepting
 these new artifacts. Root owns integrated dependency pins and final acceptance.
+
+The two-build occurrence001 on Docketc49 is retained as intermediate evidence.
+The new6c package is candidate-only until the exact read-only implementation's
+four gates and independent review close. A build is permitted against its frozen
+interface while acceptance completes; it does not close that acceptance gate.
