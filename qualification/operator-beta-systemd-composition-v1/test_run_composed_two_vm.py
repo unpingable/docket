@@ -32,7 +32,7 @@ adapter = load("composition_adapter_test", HERE / "run_composed_two_vm.py")
 nq = load(
     "composition_nq_test",
     pathlib.Path(
-        "/data/git/.worktrees/nq-ng-operator-beta-profile-v1/qualification/operator-beta-m1b-v1/run_two_vm.py"
+        "/data/git/.worktrees/nq-ng-classic-retirement-composition-20260908/qualification/operator-beta-m1b-v1/run_two_vm.py"
     ),
 )
 
@@ -56,25 +56,25 @@ class CompositionAdapterTests(unittest.TestCase):
             "harness_subject": adapter.NQ_HEAD,
             "accepted_package_result": "8865dcad23f17a1f26716161554530237e04bb9e",
             "input_facts": {
-                "ag_deb_sha256": "98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279",
-                "ag_executable_sha256": "668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068",
-                "ag_store_audit_result": "db4bad1fba2b5ab512cc58356314228167b2f48e",
+                "ag_deb_sha256": "80ea7ad067da9d5ed1f07b39fb7ee41eef58680f3af15fad64c6b1bf05c1045c",
+                "ag_executable_sha256": "7c45c79de452ab838cf79575872b0797eafbe27c7904b113e560967d11eef75e",
+                "ag_store_audit_result": "5194005c3cb029e2d7ac98b9c4c6beb6dda6e5f1",
                 "composition_repository": {"head": adapter.COMPOSITION_OWNER_SUBJECT,
                                            "tree": adapter.COMPOSITION_OWNER_TREE},
                 "composition_fixture": {
-                    "ag_source": "837de287497942c79966aa05c083acee9c312261",
-                    "docket_source": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b",
+                    "ag_source": "bf6adde2792a886d1ba75d97ca77efb8e914f4f5",
+                    "docket_source": "6c57926d2560c47c681691e006fbbfe244c6993e",
                     "package_sha256": adapter.COMPOSITION_PACKAGE_SHA256,
                     "receipt_sha256": adapter.COMPOSITION_RECEIPT_SHA256,
                     "binaries": {
-                        "composition-driver": {"sha256": "bf7535db16f7a2a75ccc58d3a1516be955e0669044ab730e548e13e7109268d4"},
-                        "docket": {"sha256": "183e649753276557b58f3cfc54ed097720f0e0fdf529f45a8cf5c2109aedb47d"},
+                        "composition-driver": {"sha256": "0a0e4d200156b20e52d75f643074aa4d0ee82928c55a746ee464a62d6e4ca320"},
+                        "docket": {"sha256": "4134dba8a5437782669d7a694acacb61ac49628f6a805ddbce2e7a1f9a3c95b1"},
                     },
                 },
                 "free_bytes": 30000000000,
                 "image_checksum_signature": "UPSTREAM_DETACHED_SIGNATURE_NOT_PUBLISHED",
                 "image_sha512": "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817",
-                "nq_deb_sha256": "0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636",
+                "nq_deb_sha256": "8c41c2b4d320770c6a04b09649b4c229fb00e86f64689c3c2f3f1c2a4d4e3019",
             },
             "protocols": {"docket_transport": "gwr.executor-transport/v1"},
             "phase": "refused",

@@ -37,3 +37,17 @@ The two-build occurrence001 on Docketc49 is retained as intermediate evidence.
 The new6c package is candidate-only until the exact read-only implementation's
 four gates and independent review close. A build is permitted against its frozen
 interface while acceptance completes; it does not close that acceptance gate.
+
+The exact6c read-only query is now independently accepted, and package002 and
+local composition003 passed on AGbf6/Docket6c. The local result is SETTLED with
+the deliberately mismatched-machine failure, no StartUnit transmission, exact
+duplicate/restart/reconcile behavior and exact store-cut audit. NQ's derivative
+harness is pinned to `7886222`, package-result `1c3c5fe`, and AG store-audit
+record `5194005`. Full NQ runtime remains separately frozen at `0224195`.
+
+Producer A records its actual externally admitted HEAD/tree from its invocation.
+After freezing A, a checker-only B updates COMPOSITION_OWNER_SUBJECT/TREE to A.
+The old checker-only constants inside A are not a producer label and must never
+be used to reopen the new occurrence; use B for its refusal check. This preserves
+the existing two-stage pattern without self-referential hashes or old8ac labels
+in new run evidence. VM launch remains held for root's exact preflight review.

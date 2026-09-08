@@ -27,13 +27,13 @@ from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
 BUILDER_PATH = HERE / "build_bookworm_fixture.py"
-NQ_HEAD = "9f1b081b7fc5b2d99fb92ee6b0ac4107c7e7dfe4"
-NQ_TREE = "dd1a7d1d501848b26fd2d69b44ede75afed710b1"
-NQ_QUALIFIED_HARNESS = "dc5d602484a4556c465df6947e98d81dba0d314a"
+NQ_HEAD = "7886222f20ebc76516300985cbf09b36c2b294e0"
+NQ_TREE = "cf5f2e281d0efc20882114b29cc5c414298b5e8e"
+NQ_QUALIFIED_HARNESS = "7886222f20ebc76516300985cbf09b36c2b294e0"
 COMPOSITION_OWNER_SUBJECT = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
 COMPOSITION_OWNER_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
-COMPOSITION_PACKAGE_SHA256 = "5bb3f3d27a4c19cbb2c7bc80bdf69d9f5aab076d9f20cd49b59a8b8c45e4a479"
-COMPOSITION_RECEIPT_SHA256 = "e1b859a84e77ef94a545daaa6d3fd7acce9e0a249c998a8948306d93e109b4db"
+COMPOSITION_PACKAGE_SHA256 = "45a18d7c0d7a70933c6a7e2f6c56c190203d1a4afee9b1ec5097065d848d168e"
+COMPOSITION_RECEIPT_SHA256 = "8d69bb44685d68497724a4cf27940344eae62b6a5964fd7b3e82637bf85c736f"
 COMPOSITION_PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
 COMPOSITION_PACKAGE_VERSION = "0.1.0-1"
 REMOTE_COMPOSITION_ROOT = "/var/lib/constellation-operator-beta-composition"
@@ -77,7 +77,7 @@ def exact_repository(path: pathlib.Path, head: str, tree: str, nq: Any) -> None:
         check=False,
     )
     if unchanged.returncode != 0:
-        raise nq.Refusal("NQ-ng producer differs from its accepted run-012 harness")
+        raise nq.Refusal("NQ-ng producer differs from its admitted derivative harness")
 
 
 def exact_composition_repository(subject: str, nq: Any) -> dict[str, str]:
@@ -947,17 +947,17 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
             "nq_deb_sha256",
         }
         or recovery["input_facts"].get("ag_deb_sha256")
-        != "98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279"
+        != "80ea7ad067da9d5ed1f07b39fb7ee41eef58680f3af15fad64c6b1bf05c1045c"
         or recovery["input_facts"].get("ag_executable_sha256")
-        != "668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068"
+        != "7c45c79de452ab838cf79575872b0797eafbe27c7904b113e560967d11eef75e"
         or recovery["input_facts"].get("ag_store_audit_result")
-        != "db4bad1fba2b5ab512cc58356314228167b2f48e"
+        != "5194005c3cb029e2d7ac98b9c4c6beb6dda6e5f1"
         or recovery["input_facts"].get("image_checksum_signature")
         != "UPSTREAM_DETACHED_SIGNATURE_NOT_PUBLISHED"
         or recovery["input_facts"].get("image_sha512")
         != "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817"
         or recovery["input_facts"].get("nq_deb_sha256")
-        != "0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636"
+        != "8c41c2b4d320770c6a04b09649b4c229fb00e86f64689c3c2f3f1c2a4d4e3019"
         or not isinstance(recovery["input_facts"].get("free_bytes"), int)
         or recovery["input_facts"]["free_bytes"] < 0
         or not isinstance(producer, dict)
@@ -982,17 +982,17 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
     if (
         not isinstance(fixture, dict)
         or fixture.get("ag_source")
-        != "837de287497942c79966aa05c083acee9c312261"
+        != "bf6adde2792a886d1ba75d97ca77efb8e914f4f5"
         or fixture.get("docket_source")
-        != "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b"
+        != "6c57926d2560c47c681691e006fbbfe244c6993e"
         or fixture.get("package_sha256") != COMPOSITION_PACKAGE_SHA256
         or fixture.get("receipt_sha256") != COMPOSITION_RECEIPT_SHA256
         or not isinstance(fixture.get("binaries"), dict)
         or set(fixture["binaries"]) != {"composition-driver", "docket"}
         or fixture["binaries"]["composition-driver"].get("sha256")
-        != "bf7535db16f7a2a75ccc58d3a1516be955e0669044ab730e548e13e7109268d4"
+        != "0a0e4d200156b20e52d75f643074aa4d0ee82928c55a746ee464a62d6e4ca320"
         or fixture["binaries"]["docket"].get("sha256")
-        != "183e649753276557b58f3cfc54ed097720f0e0fdf529f45a8cf5c2109aedb47d"
+        != "4134dba8a5437782669d7a694acacb61ac49628f6a805ddbce2e7a1f9a3c95b1"
         or not isinstance(repository, dict)
         or repository
         != {"head": COMPOSITION_OWNER_SUBJECT, "tree": COMPOSITION_OWNER_TREE}
