@@ -18,8 +18,8 @@ import tempfile
 from typing import Any
 
 SCHEMA = "constellation.operator_beta.docket_systemd_fixture_build.v1"
-AG_HEAD = "837de287497942c79966aa05c083acee9c312261"
-AG_TREE = "20023de0b8299fa125ed5f9fcaf63383a4978e30"
+AG_HEAD = "bf6adde2792a886d1ba75d97ca77efb8e914f4f5"
+AG_TREE = "31b3b15437baffcaa41ae31020f4570599304019"
 DOCKET_HEAD = "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b"
 DOCKET_TREE = "19573c62de34efc4651b7af52bb9315339255194"
 IMAGE_ID = "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379"
