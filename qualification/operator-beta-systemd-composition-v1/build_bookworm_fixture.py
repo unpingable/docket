@@ -205,63 +205,21 @@ def docker_prefix() -> list[str]:
 
 
 def normalized_commands() -> dict[str, list[str]]:
-    prefix = docker_prefix()
     return {
-        "ag": prefix
-        + [
-            "-e",
-            "CARGO_HOME=/cargo-home",
-            "-e",
-            "CARGO_TARGET_DIR=/target",
-            "-v",
-            "<AG_SOURCE>:/ag:ro",
-            "-v",
-            "<AG_VENDOR>:/ag-vendor:ro",
-            "<CARGO_HOME>:/cargo-home:rw",
-            "-v",
-            "<TARGET>:/target:rw",
-            "-w",
-            "/ag",
-            IMAGE_ID,
-            "cargo",
-            "build",
-            "--locked",
-            "--offline",
-            "--release",
-            "-p",
-            "ag-app",
-            "--example",
-            "operator_beta_systemd_composition",
-            "--features",
-            "systemd-dbus",
-        ],
-        "docket": prefix
-        + [
-            "-e",
-            "CARGO_HOME=/cargo-home",
-            "-e",
-            "CARGO_TARGET_DIR=/target",
-            "-v",
-            "<DOCKET_SOURCE>:/docket:ro",
-            "-v",
-            "<DOCKET_VENDOR>:/docket-vendor:ro",
-            "-v",
-            "<CARGO_HOME>:/cargo-home:rw",
-            "-v",
-            "<TARGET>:/target:rw",
-            "-w",
-            "/docket",
-            IMAGE_ID,
-            "cargo",
-            "build",
-            "--locked",
-            "--offline",
-            "--release",
-            "-p",
-            "gwr-local",
-            "--bin",
+        "ag": build_command(
+            pathlib.Path("<AG_SOURCE>"),
+            pathlib.Path("<AG_VENDOR>"),
+            pathlib.Path("<CARGO_HOME>"),
+            pathlib.Path("<TARGET>"),
+            "ag",
+        ),
+        "docket": build_command(
+            pathlib.Path("<DOCKET_SOURCE>"),
+            pathlib.Path("<DOCKET_VENDOR>"),
+            pathlib.Path("<CARGO_HOME>"),
+            pathlib.Path("<TARGET>"),
             "docket",
-        ],
+        ),
     }
 
 

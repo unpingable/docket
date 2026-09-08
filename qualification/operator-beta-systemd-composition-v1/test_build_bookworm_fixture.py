@@ -48,6 +48,14 @@ class FixtureBuilderTests(unittest.TestCase):
         commands = builder.normalized_commands()
         self.assertEqual(set(commands), {"ag", "docket"})
         for kind, command in commands.items():
+            expected = builder.build_command(
+                pathlib.Path(f"<{kind.upper()}_SOURCE>"),
+                pathlib.Path(f"<{kind.upper()}_VENDOR>"),
+                pathlib.Path("<CARGO_HOME>"),
+                pathlib.Path("<TARGET>"),
+                kind,
+            )
+            self.assertEqual(command, expected)
             self.assertIn("--network", command)
             self.assertEqual(command[command.index("--network") + 1], "none")
             self.assertEqual(command[command.index("--pull") + 1], "never")
@@ -55,6 +63,14 @@ class FixtureBuilderTests(unittest.TestCase):
             self.assertIn("--offline", command)
             self.assertIn(f"<{kind.upper()}_SOURCE>:/{kind}:ro", command)
             self.assertIn(f"<{kind.upper()}_VENDOR>:/{kind}-vendor:ro", command)
+            for mount in (
+                f"<{kind.upper()}_SOURCE>:/{kind}:ro",
+                f"<{kind.upper()}_VENDOR>:/{kind}-vendor:ro",
+                "<CARGO_HOME>:/cargo-home:rw",
+                "<TARGET>:/target:rw",
+            ):
+                self.assertGreater(command.index(mount), 0)
+                self.assertEqual(command[command.index(mount) - 1], "-v")
             self.assertEqual(command.count(builder.IMAGE_ID), 1)
 
     def test_receipt_root_and_limitations_are_closed(self) -> None:

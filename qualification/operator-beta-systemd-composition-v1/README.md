@@ -33,7 +33,7 @@ SHA-256 990dc8709862ffa5be429cde9ae16cb5c8d11dfcdce93567dc4af1b51987f8cb
 ```
 
 Its canonical build receipt is SHA-256
-`f07f2bb12f5a3f55888375cae5f384dd22b031c6fd70a624cc6fff3d676e0670`.
+`00d8184e8b50805c6fdeef8770df62332e41c01be521dc0d3eb14346c029d261`.
 The package data archive is a closed root-owned 0755 layout containing only:
 
 ```text
