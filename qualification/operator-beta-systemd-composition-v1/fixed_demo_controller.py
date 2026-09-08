@@ -52,13 +52,13 @@ INPUT_FIELDS = (
 )
 
 ADMITTED_SPEC_PATH = pathlib.Path(
-    "/var/tmp/constellation-operator-beta-m2-controller-v1/fixed-demo-spec.v1.json"
+    "/var/tmp/constellation-operator-beta-m2-controller-run-002/fixed-demo-spec.v1.json"
 )
 # Independently enrolled physical state/lock identity, frozen before launch.
 # These literals must be supplied by the integration owner's enrollment record;
 # absent enrollment is a refusal, never a digest derived from candidate bytes.
-ADMITTED_SPEC_BYTES = 3677
-ADMITTED_SPEC_SHA256 = "7dc3825bd3c524c932c04684d2b34db20ecf28d9fe44524740823439410648ef"
+ADMITTED_SPEC_BYTES = 0
+ADMITTED_SPEC_SHA256 = ""
 COMPOSITION_BASE = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
 COMPOSITION_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
 COMPOSITION_DIRECTORY = "/data/git/.worktrees/docket-operator-beta-systemd-composition-v1"
@@ -67,10 +67,10 @@ ADMITTED_COHORT: dict[str, Any] | None = {
     "scenario": SCENARIO,
     "controller_base_subject": COMPOSITION_BASE,
     "controller_base_tree": COMPOSITION_TREE,
-    "state_root": "/var/tmp/constellation-operator-beta-m2-controller-v1/state",
-    "run_id": "operator-beta-composed-m2-run-001",
-    "run_root": "/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-001",
-    "producer_unit": "constellation-operator-beta-composed-m2-run-001.service",
+    "state_root": "/var/tmp/constellation-operator-beta-m2-controller-run-002/state",
+    "run_id": "operator-beta-composed-m2-run-002",
+    "run_root": "/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-002",
+    "producer_unit": "constellation-operator-beta-composed-m2-run-002.service",
     "controller_ssh_port": 23155,
     "target_ssh_port": 23156,
     "fixture_link_port": 24579,
