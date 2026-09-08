@@ -22,7 +22,7 @@ authoring interface, or authority source.
 
 The controller consumes one canonical newline-framed
 `constellation.operator_beta.fixed_demo_launch_spec.v1` from its fixed installed
-path `/var/tmp/constellation-operator-beta-m2-controller-v1/fixed-demo-spec.v1.json`.
+path `/var/tmp/constellation-operator-beta-m2-controller-run-002/fixed-demo-spec.v1.json`.
 The CLI accepts only `start` or `status`; callers cannot select a spec, digest,
 runner, occurrence, or input cohort. Docket code closes every semantic field
 against `ADMITTED_COHORT`. The local installer supplies only physical directory

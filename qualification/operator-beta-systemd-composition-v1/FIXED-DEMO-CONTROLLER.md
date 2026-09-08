@@ -11,6 +11,44 @@ the missing terminal-refusal reopener defined by
 
 ## Current correction following rejected b95b77e — 2026-09-08
 
+### Separately authorized occurrence 002
+
+This isolated branch prepares `operator-beta-composed-m2-run-002` for the
+remaining browser qualification obligation. The integration owner reports that
+occurrence 001 reached a sealed terminal record, while its recorder did not
+complete the planned active-state reload observation. Occurrence 002 is an
+explicitly authorized new same-scenario occurrence, not reset or automatic retry
+of 001. Original controller branch, state, intent, terminal evidence and browser
+view remain attached to occurrence 001.
+
+The new spec and state reside beneath
+`/var/tmp/constellation-operator-beta-m2-controller-run-002/`; run evidence is
+`/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-002`;
+the new unit is `constellation-operator-beta-composed-m2-run-002.service`.
+The preparatory exact commit `f481875b5bb0bd62707ba97dcb8e97c7b726be74`
+leaves admission unbound and fails closed until the integration owner creates
+and retains the distinct physical enrollment. Accepted producer, builder,
+NQ-ng harness, checker, packages, ports, mechanism and API remain unchanged.
+This occurrence requires its own exact independent admission review and browser
+exercise. Earlier acceptance does not transfer to its new physical identities.
+
+The integration owner's occurrence 002 enrollment record is
+`/data/git/.campaign-artifacts/m2-showing-supervision-002/SPEC-ENROLLMENT.json`.
+It binds 3682 spec bytes, SHA-256
+`d4eec211a40c0b894e46cbabd309ef578626e47d26a08571ad8bce95d135ee3f`.
+These independently retained values are the new literal admission anchor.
+Enrollment verified the nine bound input/code files and created no intent or
+producer start. This is enrollment evidence, not an accepted demo result.
+
+After literal enrollment, the focused gate passed all 42 tests (0.694 seconds)
+and its explicit boundary substitution control exited 1 after all 42 tests
+passed (0.670 seconds). `git diff --check` passed. Tests exercised local fixtures
+only; no occurrence 002 start, real VM, effect or provider was invoked by this
+implementation lane. The final code delta from accepted `d3ff31c` is seven
+literal replacements; all controller mechanisms and API shapes are unchanged.
+
+### Retained correction and occurrence 001 enrollment history
+
 Independent review rejected `b95b77ee7e4e3ade48ccc0b1773f6679525e1fa3` on
 four concrete boundaries. This correction independently pins the full installed
 spec bytes, records the exact captured controller execution digest, closes the

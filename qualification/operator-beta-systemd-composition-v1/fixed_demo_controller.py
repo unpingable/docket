@@ -57,8 +57,8 @@ ADMITTED_SPEC_PATH = pathlib.Path(
 # Independently enrolled physical state/lock identity, frozen before launch.
 # These literals must be supplied by the integration owner's enrollment record;
 # absent enrollment is a refusal, never a digest derived from candidate bytes.
-ADMITTED_SPEC_BYTES = 0
-ADMITTED_SPEC_SHA256 = ""
+ADMITTED_SPEC_BYTES = 3682
+ADMITTED_SPEC_SHA256 = "d4eec211a40c0b894e46cbabd309ef578626e47d26a08571ad8bce95d135ee3f"
 COMPOSITION_BASE = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
 COMPOSITION_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
 COMPOSITION_DIRECTORY = "/data/git/.worktrees/docket-operator-beta-systemd-composition-v1"
