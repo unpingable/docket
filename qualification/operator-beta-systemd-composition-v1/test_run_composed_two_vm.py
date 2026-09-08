@@ -54,8 +54,28 @@ class CompositionAdapterTests(unittest.TestCase):
             "host": "local-fixture",
             "working_directory": str(root),
             "harness_subject": adapter.NQ_HEAD,
-            "accepted_package_result": "fixture",
-            "input_facts": {"fixture": "admitted"},
+            "accepted_package_result": "8865dcad23f17a1f26716161554530237e04bb9e",
+            "input_facts": {
+                "ag_deb_sha256": "98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279",
+                "ag_executable_sha256": "668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068",
+                "ag_store_audit_result": "db4bad1fba2b5ab512cc58356314228167b2f48e",
+                "composition_repository": {"head": adapter.COMPOSITION_OWNER_SUBJECT,
+                                           "tree": adapter.COMPOSITION_OWNER_TREE},
+                "composition_fixture": {
+                    "ag_source": "837de287497942c79966aa05c083acee9c312261",
+                    "docket_source": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b",
+                    "package_sha256": adapter.COMPOSITION_PACKAGE_SHA256,
+                    "receipt_sha256": adapter.COMPOSITION_RECEIPT_SHA256,
+                    "binaries": {
+                        "composition-driver": {"sha256": "bf7535db16f7a2a75ccc58d3a1516be955e0669044ab730e548e13e7109268d4"},
+                        "docket": {"sha256": "183e649753276557b58f3cfc54ed097720f0e0fdf529f45a8cf5c2109aedb47d"},
+                    },
+                },
+                "free_bytes": 30000000000,
+                "image_checksum_signature": "UPSTREAM_DETACHED_SIGNATURE_NOT_PUBLISHED",
+                "image_sha512": "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817",
+                "nq_deb_sha256": "0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636",
+            },
             "protocols": {"docket_transport": "gwr.executor-transport/v1"},
             "phase": "refused",
             "last_completed_phase": refusal["phase"],
@@ -80,7 +100,7 @@ class CompositionAdapterTests(unittest.TestCase):
             },
             "guests": [],
             "composition": {
-                "subject": "a" * 40,
+                "subject": adapter.COMPOSITION_OWNER_SUBJECT,
                 "package_sha256": adapter.COMPOSITION_PACKAGE_SHA256,
                 "receipt_sha256": adapter.COMPOSITION_RECEIPT_SHA256,
                 "authority": "AG-ng decision/spend; Docket attempt/transport; AG-ng effect evidence",
@@ -106,6 +126,24 @@ class CompositionAdapterTests(unittest.TestCase):
                 json.loads(output.getvalue()),
                 {"result": "COMPOSED_REFUSAL_REOPENED", "run_id": refusal["run_id"]},
             )
+
+    def test_refusal_coherent_outcome_and_cohort_substitutions_refuse(self) -> None:
+        for case in ("outcome", "repository", "package"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary).resolve()
+                refusal, recovery = self.refusal_records(root)
+                if case == "outcome":
+                    refusal["effect_outcome"] = "UNRECOGNIZED_OUTCOME"
+                    recovery["effect_outcome"] = refusal["effect_outcome"]
+                    recovery["refusal"] = copy.deepcopy(refusal)
+                elif case == "repository":
+                    recovery["composition"]["subject"] = "a" * 40
+                    recovery["input_facts"]["composition_repository"]["head"] = "a" * 40
+                else:
+                    recovery["input_facts"]["nq_deb_sha256"] = "0" * 64
+                self.write_refusal_records(root, refusal, recovery)
+                with self.assertRaises(nq.Refusal):
+                    adapter.check_refusal(root, nq)
 
     def test_refusal_reopen_rejects_disagreement_and_success_terminal(self) -> None:
         substitutions = (

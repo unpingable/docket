@@ -30,6 +30,8 @@ BUILDER_PATH = HERE / "build_bookworm_fixture.py"
 NQ_HEAD = "9f1b081b7fc5b2d99fb92ee6b0ac4107c7e7dfe4"
 NQ_TREE = "dd1a7d1d501848b26fd2d69b44ede75afed710b1"
 NQ_QUALIFIED_HARNESS = "dc5d602484a4556c465df6947e98d81dba0d314a"
+COMPOSITION_OWNER_SUBJECT = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
+COMPOSITION_OWNER_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
 COMPOSITION_PACKAGE_SHA256 = "5bb3f3d27a4c19cbb2c7bc80bdf69d9f5aab076d9f20cd49b59a8b8c45e4a479"
 COMPOSITION_RECEIPT_SHA256 = "e1b859a84e77ef94a545daaa6d3fd7acce9e0a249c998a8948306d93e109b4db"
 COMPOSITION_PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
@@ -910,7 +912,11 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
         or not refusal["reason"]
         or len(refusal["reason"].encode()) > 4096
         or not isinstance(refusal.get("occurred_at"), str)
-        or not isinstance(refusal.get("effect_outcome"), str)
+        or refusal.get("effect_outcome") not in {
+            "NO_EFFECT_ATTEMPTED",
+            "OUTCOME_UNKNOWN_REQUIRES_COMPOSED_REOPEN",
+            "KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS",
+        }
     ):
         raise nq.Refusal("composition refusal is not one closed owner record")
     if (
@@ -925,32 +931,112 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
         raise nq.Refusal("composition recovery and refusal disagree")
     if (
         recovery.get("harness_subject") != NQ_HEAD
+        or recovery.get("accepted_package_result")
+        != "8865dcad23f17a1f26716161554530237e04bb9e"
         or not isinstance(recovery.get("input_facts"), dict)
-        or not recovery["input_facts"]
+        or set(recovery["input_facts"])
+        != {
+            "ag_deb_sha256",
+            "ag_executable_sha256",
+            "ag_store_audit_result",
+            "composition_fixture",
+            "composition_repository",
+            "free_bytes",
+            "image_checksum_signature",
+            "image_sha512",
+            "nq_deb_sha256",
+        }
+        or recovery["input_facts"].get("ag_deb_sha256")
+        != "98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279"
+        or recovery["input_facts"].get("ag_executable_sha256")
+        != "668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068"
+        or recovery["input_facts"].get("ag_store_audit_result")
+        != "db4bad1fba2b5ab512cc58356314228167b2f48e"
+        or recovery["input_facts"].get("image_checksum_signature")
+        != "UPSTREAM_DETACHED_SIGNATURE_NOT_PUBLISHED"
+        or recovery["input_facts"].get("image_sha512")
+        != "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817"
+        or recovery["input_facts"].get("nq_deb_sha256")
+        != "0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636"
+        or not isinstance(recovery["input_facts"].get("free_bytes"), int)
+        or recovery["input_facts"]["free_bytes"] < 0
         or not isinstance(producer, dict)
         or set(producer) != {"systemd_unit", "invocation_id", "main_pid", "start_ticks"}
         or not re.fullmatch(
             r"[A-Za-z0-9_.@:-]{1,255}\.service", str(producer.get("systemd_unit", ""))
         )
         or not re.fullmatch(r"[0-9a-fA-F]{32}", str(producer.get("invocation_id", "")))
-        or not isinstance(producer.get("main_pid"), int)
-        or not isinstance(producer.get("start_ticks"), int)
+        or type(producer.get("main_pid")) is not int or producer["main_pid"] <= 0
+        or type(producer.get("start_ticks")) is not int or producer["start_ticks"] <= 0
         or not isinstance(composition, dict)
-        or not re.fullmatch(r"[0-9a-f]{40}", str(composition.get("subject", "")))
+        or composition.get("subject") != COMPOSITION_OWNER_SUBJECT
         or composition.get("package_sha256") != COMPOSITION_PACKAGE_SHA256
         or composition.get("receipt_sha256") != COMPOSITION_RECEIPT_SHA256
         or composition.get("authority")
         != "AG-ng decision/spend; Docket attempt/transport; AG-ng effect evidence"
     ):
         raise nq.Refusal("composition refusal does not bind the admitted occurrence")
+    facts = recovery["input_facts"]
+    fixture = facts.get("composition_fixture")
+    repository = facts.get("composition_repository")
+    if (
+        not isinstance(fixture, dict)
+        or fixture.get("ag_source")
+        != "837de287497942c79966aa05c083acee9c312261"
+        or fixture.get("docket_source")
+        != "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b"
+        or fixture.get("package_sha256") != COMPOSITION_PACKAGE_SHA256
+        or fixture.get("receipt_sha256") != COMPOSITION_RECEIPT_SHA256
+        or not isinstance(fixture.get("binaries"), dict)
+        or set(fixture["binaries"]) != {"composition-driver", "docket"}
+        or fixture["binaries"]["composition-driver"].get("sha256")
+        != "bf7535db16f7a2a75ccc58d3a1516be955e0669044ab730e548e13e7109268d4"
+        or fixture["binaries"]["docket"].get("sha256")
+        != "183e649753276557b58f3cfc54ed097720f0e0fdf529f45a8cf5c2109aedb47d"
+        or not isinstance(repository, dict)
+        or repository
+        != {"head": COMPOSITION_OWNER_SUBJECT, "tree": COMPOSITION_OWNER_TREE}
+    ):
+        raise nq.Refusal("composition refusal input cohort differs")
     custody = recovery.get("effect_custody")
     if (
         refusal["effect_outcome"] == "KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS"
         and not isinstance(custody, dict)
     ):
         raise nq.Refusal("successful effect testimony has no retained owner custody")
+    if refusal["effect_outcome"] == "KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS":
+        identities = {"issuance", "attempt", "marker", "work", "subject", "scope", "receipt"}
+        raw_digests = {"plan_sha256", "dispatch_sha256", "outcome_sha256"}
+        required = identities | raw_digests | {"docket_state", "ag_authorization_consumption"}
+        optional = {"ag_store_audit_outcome_sha256", "ag_store_cut_bytes", "ag_store_cut_sha256",
+                    "docket_restart_inspection_sha256"}
+        if (
+            not required.issubset(custody) or set(custody) - required - optional
+            or any(not re.fullmatch(r"sha256:[0-9a-f]{64}", str(custody.get(key, ""))) for key in identities)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(custody.get(key, ""))) for key in raw_digests)
+            or custody.get("docket_state") != "RECORDED"
+            or custody.get("ag_authorization_consumption") != "RECORDED"
+        ):
+            raise nq.Refusal("successful effect testimony has invalid owner custody")
+        occurrence = path / "evidence" / "composition-occurrence"
+        result = canonical_record(occurrence / "composition-result.json", "composition result", nq)
+        outcome = canonical_record(occurrence / "executor-outcome.json", "executor outcome", nq)
+        if (
+            any(result.get(key) != custody[key] for key in identities)
+            or result.get("run_id") != recovery["run_id"]
+            or outcome.get("outcome") != "success" or outcome.get("receipt") != custody["receipt"]
+            or sha256(occurrence / "executor-outcome.json") != custody["outcome_sha256"]
+            or sha256(occurrence / "executor-dispatch.json") != custody["dispatch_sha256"]
+            or sha256(occurrence / "occurrence" / "systemd-plan-v2.json") != custody["plan_sha256"]
+        ):
+            raise nq.Refusal("refusal effect custody differs from retained owner records")
     if refusal["effect_outcome"] == "NO_EFFECT_ATTEMPTED" and custody is not None:
         raise nq.Refusal("no-effect refusal unexpectedly retains effect custody")
+    if (
+        refusal["effect_outcome"] == "OUTCOME_UNKNOWN_REQUIRES_COMPOSED_REOPEN"
+        and custody is not None
+    ):
+        raise nq.Refusal("unknown effect outcome unexpectedly retains settled custody")
     def pathname_exists(candidate: pathlib.Path) -> bool:
         try:
             candidate.lstat()

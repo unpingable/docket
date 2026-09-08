@@ -67,6 +67,173 @@ class UnobservableManager(FakeManager):
 
 
 class FixedDemoControllerTests(unittest.TestCase):
+    def test_admitted_capsule_loads_real_frozen_runner_and_builder(self) -> None:
+        spec = controller.ADMITTED_COHORT
+        controller.verify_owner_repository(spec["runner"])
+        controller.verify_owner_repository(spec["nq_harness"])
+        argv = controller.runner_argv(spec)
+        self.assertLess(len(argv[5]), 100000)
+        result = controller.subprocess.run(argv[:8] + ["--help"], capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(b"check-run", result.stdout)
+
+    def test_capsule_executes_captured_runner_and_imports_after_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, _path, _size, _digest = self.fixture(pathlib.Path(temporary).resolve())
+            module_paths = [spec[name]["path"] for name in ("builder", "nq_harness")]
+            runner = (
+                "import importlib.util,sys\n"
+                f"paths={module_paths!r}\n"
+                "values=[]\n"
+                "for i,path in enumerate(paths):\n"
+                " s=importlib.util.spec_from_file_location('frozen'+str(i),path)\n"
+                " m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;s.loader.exec_module(m)\n"
+                " values.append(m.VALUE)\n"
+                "print('captured-runner:'+','.join(values))\n"
+            )
+            for name, body in (("runner", runner), ("builder", "VALUE='builder'\n"),
+                               ("nq_harness", "VALUE='nq-ng'\n")):
+                path = pathlib.Path(spec[name]["path"])
+                path.write_text(body)
+                spec[name]["bytes"] = path.stat().st_size
+                spec[name]["sha256"] = controller.digest_path(path)
+            argv = controller.runner_argv(spec)
+            for name in ("runner", "builder", "nq_harness"):
+                path = pathlib.Path(spec[name]["path"])
+                path.rename(path.with_suffix(".retained"))
+                path.write_text("raise SystemExit('replacement must never execute')\n")
+            result = controller.subprocess.run(argv, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout, b"captured-runner:builder,nq-ng\n")
+            self.assertEqual(result.stderr, b"")
+            changed = list(argv)
+            changed[6] = "0" * 64
+            refused = controller.subprocess.run(changed, capture_output=True, timeout=10)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertEqual(refused.stdout, b"")
+            self.assertIn(b"capsule identity differs", refused.stderr)
+
+    def test_capsule_source_mutation_before_capture_refuses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, _path, _size, _digest = self.fixture(pathlib.Path(temporary).resolve())
+            pathlib.Path(spec["builder"]["path"]).write_bytes(b"changed\n")
+            with self.assertRaises(controller.Refusal):
+                controller.runner_argv(spec)
+
+    def test_recovery_keeps_missing_acceptance_disagreement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            fixed = controller.FixedController(path, size, digest, FakeManager(),
+                lambda _cut: (_ for _ in ()).throw(RuntimeError("interrupted")))
+            with self.assertRaises(RuntimeError):
+                fixed.start()
+            recovery = {"state": "REOPENED", "phase": "configured", "producer": {}}
+            with mock.patch.object(controller, "runner_recovery", return_value=recovery):
+                result = fixed.status()
+            self.assertEqual(result["runner_durable"]["state"], "configured")
+            self.assertEqual(result["controller_custody"]["state"], "INDETERMINATE")
+            self.assertIn("launch intent has no valid retained Docket acceptance", result["disagreements"])
+
+    def test_manager_query_failures_are_not_observable(self) -> None:
+        for error in (OSError("fixture"), controller.subprocess.TimeoutExpired("systemctl", 10)):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(controller.subprocess, "run", side_effect=error):
+                    self.assertEqual(controller.SystemdUserManager().query("fixture.service")["state"], "NOT_OBSERVABLE")
+        with mock.patch.object(controller.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"\xff")):
+            self.assertEqual(controller.SystemdUserManager().query("fixture.service")["state"], "NOT_OBSERVABLE")
+
+    def test_owner_repository_checks_head_tree_and_cleanliness(self) -> None:
+        record = {"path": "/fixture/repo/qualification/lane/runner.py", "subject": "a" * 40, "tree": "b" * 40}
+        for substitution in (None, 0, 1, 2):
+            replies = [mock.Mock(returncode=0, stdout=("a" * 40 + "\n").encode(), stderr=b""),
+                       mock.Mock(returncode=0, stdout=("b" * 40 + "\n").encode(), stderr=b""),
+                       mock.Mock(returncode=0, stdout=b"", stderr=b"")]
+            if substitution is not None:
+                replies[substitution].stdout = b"different"
+            with mock.patch.object(controller.subprocess, "run", side_effect=replies):
+                if substitution is None:
+                    controller.verify_owner_repository(record)
+                else:
+                    with self.assertRaises(controller.Refusal):
+                        controller.verify_owner_repository(record)
+
+    def test_runner_terminal_does_not_replace_missing_controller_custody(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            terminal = {"state": "TERMINAL", "owner": "Docket", "disposition": "fixture"}
+            with mock.patch.object(controller, "owner_terminal", return_value=terminal):
+                projection = controller.FixedController(path, size, digest, FakeManager()).status()
+            self.assertEqual(projection["runner_durable"]["state"], "TERMINAL")
+            self.assertEqual(projection["controller_custody"]["state"], "INDETERMINATE")
+            self.assertIn("runner evidence exists without Docket launch intent", projection["disagreements"])
+
+    def test_inactive_acceptance_substitutions_remain_visible(self) -> None:
+        substitutions = {"scenario": "other", "invocation_id": "invalid", "main_pid": -1,
+                         "start_ticks": False, "execution_sha256": "0" * 64}
+        for field, value in substitutions.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+                manager = FakeManager()
+                with self.execution_observation(spec, digest):
+                    controller.FixedController(path, size, digest, manager).start()
+                acceptance = pathlib.Path(spec["state_root"]) / "launch-accepted.v1.json"
+                record = json.loads(acceptance.read_bytes())
+                record[field] = value
+                acceptance.chmod(0o600)
+                acceptance.write_bytes(controller.canonical(record) + b"\n")
+                acceptance.chmod(0o400)
+                manager.active = False
+                result = controller.FixedController(path, size, digest, manager).status()
+                self.assertEqual(result["controller_custody"]["state"], "INDETERMINATE")
+                self.assertTrue(result["disagreements"])
+
+    def test_manager_inactive_does_not_suppress_live_os_testimony(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            manager = FakeManager()
+            fixed = controller.FixedController(path, size, digest, manager)
+            with self.execution_observation(spec, digest):
+                fixed.start()
+                manager.active = False
+                result = fixed.status()
+            self.assertEqual(result["live_sources"]["manager"]["state"], "PROCESS_EXITED")
+            self.assertEqual(result["live_sources"]["os"]["state"], "PROCESS_ACTIVE")
+            self.assertIn("manager and OS process testimony disagree", result["disagreements"])
+
+    def test_lock_replacement_after_intent_prevents_manager_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            manager = FakeManager()
+            lock = pathlib.Path(spec["state_root"]) / "launch.lock"
+            def replace(name):
+                if name == "intent_durable":
+                    lock.rename(lock.with_suffix(".retained"))
+                    lock.touch(mode=0o600)
+            with self.assertRaisesRegex(controller.Refusal, "pathname identity"):
+                controller.FixedController(path, size, digest, manager, replace).start()
+            self.assertEqual(manager.starts, 0)
+
+    def test_lock_contention_times_out_before_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            manager = FakeManager()
+            with (pathlib.Path(spec["state_root"]) / "launch.lock").open("rb") as lock:
+                controller.fcntl.flock(lock, controller.fcntl.LOCK_EX)
+                with mock.patch.object(controller, "LOCK_WAIT_SECONDS", 0.02):
+                    with self.assertRaisesRegex(controller.Refusal, "timed out"):
+                        controller.FixedController(path, size, digest, manager).start()
+            self.assertEqual(manager.starts, 0)
+            self.assertFalse((pathlib.Path(spec["state_root"]) / "launch-intent.v1.json").exists())
+
+    def test_unadmitted_coherent_spec_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            manager = FakeManager()
+            with mock.patch.object(controller, "ADMITTED_COHORT", None):
+                with self.assertRaisesRegex(controller.Refusal, "not admitted"):
+                    controller.FixedController(path, size, digest, manager).start()
+            self.assertEqual(manager.starts, 0)
+
     def fixture(self, root: pathlib.Path):
         state = root / "controller-state"
         state.mkdir(mode=0o700)
@@ -76,11 +243,14 @@ class FixedDemoControllerTests(unittest.TestCase):
         records = root / "records"
         records.mkdir()
         files: dict[str, pathlib.Path] = {}
-        for name in ("runner", "nq_harness", *controller.INPUT_FIELDS):
+        for name in ("runner", "builder", "nq_harness", *controller.INPUT_FIELDS):
             path = records / name
             path.write_bytes((name + "\n").encode())
             files[name] = path
         metadata = state.stat()
+        lock_path = state / "launch.lock"
+        lock_path.touch(mode=0o600)
+        lock_metadata = lock_path.stat()
 
         def bound(path: pathlib.Path) -> dict:
             return {
@@ -92,14 +262,16 @@ class FixedDemoControllerTests(unittest.TestCase):
         spec = {
             "schema": controller.SPEC_SCHEMA,
             "scenario": controller.SCENARIO,
-            "controller_subject": "a" * 40,
-            "controller_tree": "b" * 40,
+            "controller_base_subject": "a" * 40,
+            "controller_base_tree": "b" * 40,
             "state_root": str(state),
             "state_root_device": metadata.st_dev,
             "state_root_inode": metadata.st_ino,
             "state_root_uid": metadata.st_uid,
             "state_root_gid": metadata.st_gid,
             "state_root_mode": 0o700,
+            "launch_lock_device": lock_metadata.st_dev,
+            "launch_lock_inode": lock_metadata.st_ino,
             "run_id": "operator-beta-composed-m2-run-001",
             "run_root": str(run_root),
             "producer_unit": "constellation-operator-beta-composed-m2-run-001.service",
@@ -110,6 +282,11 @@ class FixedDemoControllerTests(unittest.TestCase):
             "working_directory": str(working),
             "runner": {
                 **bound(files["runner"]),
+                "subject": "c" * 40,
+                "tree": "d" * 40,
+            },
+            "builder": {
+                **bound(files["builder"]),
                 "subject": "c" * 40,
                 "tree": "d" * 40,
             },
@@ -126,6 +303,12 @@ class FixedDemoControllerTests(unittest.TestCase):
         spec_path = root / "fixed-demo-spec.json"
         raw = controller.canonical(spec) + b"\n"
         spec_path.write_bytes(raw)
+        admission = mock.patch.object(controller, "ADMITTED_COHORT", controller.admitted_cohort(spec))
+        admission.start()
+        self.addCleanup(admission.stop)
+        repository = mock.patch.object(controller, "verify_owner_repository")
+        repository.start()
+        self.addCleanup(repository.stop)
         return spec, spec_path, len(raw), controller.digest_bytes(raw)
 
     def execution_observation(self, spec, spec_sha256):
@@ -166,6 +349,8 @@ class FixedDemoControllerTests(unittest.TestCase):
             self.assertEqual(command[:5], ["systemd-run", "--user", "--quiet", "--no-block", "--collect"])
             self.assertEqual(command[command.index("--unit") + 1], spec["producer_unit"])
             self.assertIn(f"WorkingDirectory={spec['working_directory']}", command)
+            self.assertIn("RuntimeMaxSec=7200", command)
+            self.assertIn("TimeoutStopSec=30", command)
             self.assertIn(f"CONSTELLATION_FIXED_DEMO_SPEC_SHA256={digest}", command)
             self.assertEqual(command[command.index("--") + 1 :], argv)
 
@@ -208,7 +393,7 @@ class FixedDemoControllerTests(unittest.TestCase):
             with self.execution_observation(spec, digest):
                 reopened = controller.FixedController(path, size, digest, manager).start()
             self.assertEqual(manager.starts, 0)
-            self.assertEqual(reopened["durable"]["state"], "INDETERMINATE_LAUNCH_OUTCOME")
+            self.assertEqual(reopened["durable"]["state"], "INDETERMINATE")
             self.assertEqual(reopened["liveness"]["state"], "PROCESS_EXITED")
 
     def test_acknowledgement_loss_exposes_activity_without_second_launch(self) -> None:
@@ -220,7 +405,7 @@ class FixedDemoControllerTests(unittest.TestCase):
             with self.execution_observation(spec, digest):
                 reopened = controller.FixedController(path, size, digest, manager).start()
             self.assertEqual(manager.starts, 1)
-            self.assertEqual(reopened["durable"]["state"], "INDETERMINATE_LAUNCH_OUTCOME")
+            self.assertEqual(reopened["durable"]["state"], "INDETERMINATE")
             self.assertEqual(reopened["liveness"]["state"], "PROCESS_ACTIVE")
 
     def test_spec_content_and_state_root_replacement_refuse(self) -> None:
@@ -297,7 +482,7 @@ class FixedDemoControllerTests(unittest.TestCase):
                 return_value={"argv": ["different"], "working_directory": "/", "environment": {}},
             ):
                 projection = controller.FixedController(path, size, digest, manager).status()
-            self.assertEqual(projection["durable"]["state"], "INDETERMINATE_LAUNCH_OUTCOME")
+            self.assertEqual(projection["durable"]["state"], "INDETERMINATE")
             self.assertEqual(projection["liveness"]["state"], "PROCESS_ACTIVE")
             self.assertIn(
                 "active manager process differs from the fixed execution",

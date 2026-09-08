@@ -21,12 +21,22 @@ authoring interface, or authority source.
 ## One closed launch
 
 The controller consumes one canonical newline-framed
-`constellation.operator_beta.fixed_demo_launch_spec.v1` at a caller-admitted
-path, byte length, and SHA-256. The AG demo configuration must pin those three
-values; the browser supplies none. The spec closes the scenario/run/root/unit,
+`constellation.operator_beta.fixed_demo_launch_spec.v1` from its fixed installed
+path `/var/tmp/constellation-operator-beta-m2-controller-v1/fixed-demo-spec.v1.json`.
+The CLI accepts only `start` or `status`; callers cannot select a spec, digest,
+runner, occurrence, or input cohort. Docket code closes every semantic field
+against `ADMITTED_COHORT`. The local installer supplies only physical directory
+and lock identities, which are revalidated on every use. The mode-0400 installed
+spec must belong to the invoking account. AG configuration independently pins
+the controller code; it is not Docket's admission authority.
+The spec closes the scenario/run/root/unit,
 three ports, 7,200-second bound, controller and owner subjects/trees, physical
-controller-state directory identity, runner/harness identities, and all six
+controller-state directory and lock identities, runner/builder/harness identities, and all six
 input paths/lengths/digests. The controller derives the complete runner argv.
+The fresh M2 run root is fixed at
+`/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-001`.
+This uses the filesystem with room for the accepted NQ-ng 24 GiB preflight;
+earlier authoritative `/var/tmp` run archives remain in place.
 
 The controller opens the pre-existing mode-0700 state directory by exact
 device/inode/owner/mode and holds a no-follow regular-file `flock` while
@@ -34,6 +44,46 @@ starting. Before any user-systemd call it create-exclusively writes, fdatasyncs,
 and directory-fsyncs the deterministic `launch-intent.v1.json`. Any existing
 intent pathname, including a partial or invalid interrupted record, forbids a
 second manager call. There is no retry/reset/delete operation.
+The lock must already exist at its admitted device/inode; acquisition uses
+nonblocking attempts with an explicit five-second monotonic deadline. Its
+pathname and controller directory are revalidated before intent and manager
+operations. Timeout is a controller refusal and creates no launch intent.
+
+## Execution bytes and environment assumptions
+
+The producer remains the accepted `8ac6ea5` composition runner, with its exact
+adjacent builder and NQ-ng `9f1b081` harness. The newer M2 controller/checker has
+a separate byte identity recorded in intent and status. Original owner records
+retain the producer subject; no validator revision is substituted into them.
+
+Before launch, the controller opens each of those three source files no-follow,
+requires its exact length/SHA-256 and stable file metadata, and captures its
+bytes. It compresses the canonical three-file map into a bounded ASCII argument
+for `/usr/bin/python3 -I -B -c` under user systemd. The final encoded argument is
+at most 100,000 bytes and decoded content at most 1 MiB. The exact argv vector,
+capsule digest and bootstrap digest are bound into intent and compared to the
+actual process command-line vector before acceptance.
+
+The bootstrap verifies the capsule digest and framing, then supplies the three
+modules through an in-memory loader mediating the runner's explicit
+`spec_from_file_location` calls. It preserves original filenames and refuses
+other dynamic campaign-module paths; it has no source-file fallback. Source
+pathname replacement after capture cannot change executed campaign code.
+Later Git checks may still refuse a changed checkout. Qualification executes a
+real child after replacing all three source paths and requires captured output,
+plus a digest-substitution refusal.
+
+This bounded local environment trusts the host kernel, user-systemd manager,
+Python interpreter/standard library, installed OS tools, and invoking account.
+It does not claim confinement from another process that can modify that
+account's process memory or the trusted platform. Repository files may change
+concurrently; the capsule closes their validation-to-process-open interval.
+Package/image inputs retain the accepted runner's existing hash and copy
+validation. No new process-control or authority service is introduced.
+The producer unit also sets `RuntimeMaxSec=7200` and `TimeoutStopSec=30`.
+This encloses the accepted NQ cooperative runtime checks. Expiry does not
+establish a terminal owner result: retained refusal must reopen, otherwise
+controller status remains uncertain and forbids another launch.
 
 After a successful manager reply, the controller requires an active exact
 unit/InvocationID/MainPID, reads PID start ticks, argv, cwd, and the one admitted
@@ -61,6 +111,21 @@ The source-labeled projection keeps durable state, live process testimony,
 runner identity, disagreements, and release limitations separate. Phase never
 implies liveness; process exit never implies terminality; an AG success receipt
 never implies the current NQ postcondition.
+`controller_custody` and `runner_durable` are separate. Missing/invalid intent
+or acceptance remains a disagreement even when valid runner recovery or
+terminal evidence exists. `live_sources` preserves manager and OS observations
+independently, including inactive-manager/active-process disagreement. A
+timeout, inaccessible query or invalid manager encoding is `NOT_OBSERVABLE`.
+Retained acceptance fields are fully validated before any live binding,
+including scenario, invocation format, positive PID/start ticks and exact
+intent/execution digest, even after the process exits.
+
+Evidence entries name their owner and retained path. Existing bytes are only
+`RECORDED_UNVERIFIED` until terminal owner reopening establishes the chain;
+missing or unobservable evidence is explicit. No narrative log parsing creates
+domain state. Refusal reopening admits only the three actual composition effect
+testimony states and their custody relation, with the frozen producer/input
+cohort required. It does not claim teardown or no-effect qualification.
 
 ## Qualification boundary
 
