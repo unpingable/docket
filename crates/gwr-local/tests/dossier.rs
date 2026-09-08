@@ -69,8 +69,15 @@ impl Drop for Fx {
 }
 
 fn fixture(name: &str) -> Fx {
-    let root = std::env::temp_dir().join(format!("gwr-dossier-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = if name.starts_with("retirement-") {
+        let root = PathBuf::from(std::env::var("DOCKET_NQ_FIXTURE_ROOT").unwrap()).join(name);
+        std::fs::create_dir(&root).expect("exclusive campaign fixture directory");
+        root
+    } else {
+        let root = std::env::temp_dir().join(format!("gwr-dossier-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    };
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(root.join("journals")).unwrap();
@@ -158,6 +165,83 @@ fn fixture(name: &str) -> Fx {
         att,
         basis,
         ids: HashChainIds::new(),
+    }
+}
+
+/// Retained real source stores for native NQ acquisition; never an M2 store.
+#[test]
+#[ignore = "campaign-owned DOCKET_NQ_FIXTURE_ROOT must exist and be empty"]
+fn retirement_native_docket_source_stores() {
+    for state in ["prepared", "committed", "refused", "indeterminate"] {
+        let mut fx = fixture(&format!("retirement-{state}"));
+        let repository_id = RepositoryId::from_bytes([0x5c; 16]);
+        fx.store
+            .register_repository(&RepositoryRegistration {
+                id: repository_id,
+                registered_at: ClockReading(4),
+                aliases: vec![RepositoryAlias {
+                    kind: RepositoryAliasKind::Path,
+                    locator: fx.att.repository.clone(),
+                    registered_at: ClockReading(4),
+                    current: true,
+                }],
+            })
+            .unwrap();
+        fx.store
+            .bind_work_request_repository(fx.att.work_request, repository_id)
+            .unwrap();
+        match state {
+            "committed" => {
+                ratify_and_reserve(&mut fx);
+                let mut b = broker(&fx);
+                let out = dispatch(
+                    &mut fx.store,
+                    fx.att.attempt_id,
+                    &mut b,
+                    &FixedClock(ClockReading(20)),
+                    &mut fx.ids,
+                )
+                .unwrap();
+                assert!(matches!(out, DispatchOutcome::Committed(_)));
+            }
+            "indeterminate" => drive_indeterminate_after_landing(&mut fx),
+            "refused" => {
+                ratify_and_reserve(&mut fx);
+                sh(
+                    &fx.repo,
+                    &[
+                        "git",
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "different basis",
+                    ],
+                );
+                let changed = sh(&fx.repo, &["git", "rev-parse", "HEAD"]);
+                sh(&fx.repo, &["git", "update-ref", TARGET_REF, &changed]);
+                let mut b = broker(&fx);
+                let out = dispatch(
+                    &mut fx.store,
+                    fx.att.attempt_id,
+                    &mut b,
+                    &FixedClock(ClockReading(20)),
+                    &mut fx.ids,
+                )
+                .unwrap();
+                assert!(!matches!(out, DispatchOutcome::Committed(_)));
+            }
+            _ => {}
+        }
+        let d = assemble(&mut fx.store, fx.att.attempt_id).unwrap();
+        let bytes = render_json(&d);
+        std::fs::write(fx.root.join("source.json"), bytes).unwrap();
+        // Preserve the exact store and pathname so the supported CLI can reopen
+        // it after this test exits; no renamed repository or copied truth state.
+        std::mem::forget(fx);
     }
 }
 
