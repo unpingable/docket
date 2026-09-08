@@ -8,6 +8,14 @@ import build_retirement_executor as builder
 
 
 class ExecutorBuilderTests(unittest.TestCase):
+    def test_unavailable_builder_retains_not_started_disposition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = pathlib.Path(temporary) / "unavailable.log"
+            with self.assertRaisesRegex(builder.shared.Refusal, "did not start"):
+                builder.logged_build([str(pathlib.Path(temporary) / "missing-builder")], log)
+            self.assertIn("BUILD_NOT_STARTED", log.read_text())
+            self.assertEqual(log.with_suffix(".exit").read_text(), "NOT_STARTED\n")
+
     def test_failed_build_retains_both_streams_and_terminal_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             log = pathlib.Path(temporary) / "attempt.log"

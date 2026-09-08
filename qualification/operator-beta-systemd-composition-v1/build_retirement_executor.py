@@ -21,7 +21,13 @@ LIMITATIONS = ["qualification-only", "no installation or execution qualification
 def logged_build(arguments, destination):
     """Retain command output before reporting failure or supervisor loss."""
     with destination.open("xb", buffering=0) as log:
-        result = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            result = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        except OSError as error:
+            log.write(f"BUILD_NOT_STARTED: {error}\n".encode())
+            os.fsync(log.fileno())
+            destination.with_suffix(".exit").write_text("NOT_STARTED\n")
+            raise shared.Refusal(f"build did not start; retained output: {destination}") from error
         os.fsync(log.fileno())
     terminal = destination.with_suffix(".exit")
     terminal.write_text(f"{result.returncode}\n")
