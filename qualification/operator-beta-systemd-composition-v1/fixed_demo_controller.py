@@ -29,6 +29,8 @@ from typing import Any, Protocol
 
 HERE = pathlib.Path(__file__).resolve().parent
 RUNNER_PATH = HERE / "run_composed_two_vm.py"
+CHECKER_BYTES = 54529
+CHECKER_SHA256 = "4c44d4ff56a6802ac9af0279c059278a799a77353c8d9b21c8cb4af659ed2bb1"
 SPEC_SCHEMA = "constellation.operator_beta.fixed_demo_launch_spec.v1"
 INTENT_SCHEMA = "constellation.operator_beta.fixed_demo_launch_intent.v1"
 ACCEPTED_SCHEMA = "constellation.operator_beta.fixed_demo_launch_accepted.v1"
@@ -557,7 +559,7 @@ def intent_record(spec: dict[str, Any], spec_raw: bytes, spec_sha256: str) -> di
         "controller_base_subject": spec["controller_base_subject"],
         "controller_base_tree": spec["controller_base_tree"],
         "controller_sha256": digest_path(pathlib.Path(__file__)),
-        "checker_sha256": digest_path(RUNNER_PATH),
+        "checker_sha256": CHECKER_SHA256,
         "state_root": spec["state_root"],
         "state_root_device": spec["state_root_device"],
         "state_root_inode": spec["state_root_inode"],
@@ -888,7 +890,9 @@ def os_occurrence_from_acceptance(
 def load_owner_modules(spec: dict[str, Any]) -> tuple[Any, Any]:
     # Capture the validator separately from the admitted producer. Its identity
     # is reported by status and bound in launch intent; it grants no mechanics.
-    checker, _metadata = read_nofollow_path(RUNNER_PATH, "composition checker")
+    checker, _metadata = read_nofollow_path(RUNNER_PATH, "composition checker", CHECKER_BYTES)
+    if digest_bytes(checker) != CHECKER_SHA256:
+        raise Refusal("composition checker differs from the admitted validator")
     captured = {str(RUNNER_PATH): checker}
     for field in ("builder", "nq_harness"):
         record = spec[field]
@@ -1194,7 +1198,7 @@ def status_projection(
             "model_provider": "NOT_APPLICABLE",
             "producer_subject": spec["composition_subject"],
             "producer_sha256": spec["runner"]["sha256"],
-            "checker_sha256": digest_path(RUNNER_PATH),
+            "checker_sha256": CHECKER_SHA256,
             "controller_sha256": digest_path(pathlib.Path(__file__)),
             "code_capsule_sha256": argv[6],
         },

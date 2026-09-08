@@ -15,7 +15,7 @@ Independent review rejected `864c353cea7399153edc9d7fea4f24a420025a86`.
 Corrections address fixed Docket admission, separate controller and
 runner custody, retained acceptance validation, independent manager/OS
 testimony, closed refusal outcomes/cohort, and bounded lock acquisition with
-pathname revalidation. The focused gate currently passes 34 cases; its injected
+pathname revalidation. The focused gate currently passes 35 cases; its injected
 control exits 1 after those cases. This is local evidence, not acceptance.
 
 The implementation now selects the exact accepted `8ac6ea5` producer separately
@@ -52,6 +52,13 @@ root on `/data/git` to satisfy NQ-ng's 24 GiB free-space prerequisite and adds
 the exact systemd 7200-second runtime/30-second stop limits. Focused cases cover
 the final envelope. Final exact-subject re-audit remains required. Do not launch
 a VM or present this checkpoint as accepted before that disposition.
+
+The validator dependency is separately pinned by exact length/SHA-256 before
+its captured bytes may be imported. A direct substitution case refuses before
+import. This closes the corresponding query-side pathname substitution while
+retaining the accepted producer identity. Full candidate 0e1fefc gates are
+retained in `m2-controller-gates-004`; this subsequent narrow validator-pin
+child requires its own independent disposition.
 
 ## Evidence at rejected checkpoint 864c353
 

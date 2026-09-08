@@ -67,6 +67,15 @@ class UnobservableManager(FakeManager):
 
 
 class FixedDemoControllerTests(unittest.TestCase):
+    def test_checker_substitution_refuses_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, _path, _size, _digest = self.fixture(pathlib.Path(temporary).resolve())
+            changed = pathlib.Path(temporary) / "checker.py"
+            changed.write_bytes(b" " * controller.CHECKER_BYTES)
+            with mock.patch.object(controller, "RUNNER_PATH", changed):
+                with self.assertRaisesRegex(controller.Refusal, "admitted validator"):
+                    controller.load_owner_modules(spec)
+
     def test_admitted_capsule_loads_real_frozen_runner_and_builder(self) -> None:
         spec = controller.ADMITTED_COHORT
         controller.verify_owner_repository(spec["runner"])
