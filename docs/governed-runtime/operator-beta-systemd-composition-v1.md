@@ -1,7 +1,7 @@
 # Operator-beta AG systemd composition contract
 
 **Recorded:** 2026-09-07
-**Status:** `M1_DOCKET_COMPOSITION_CONTRACT_ACCEPTED__CURRENT_PIN_REAUDIT_REQUIRED`
+**Status:** `FIXTURE_IMPLEMENTED__LOCAL_QUALIFICATION_GREEN__LIVE_COMPOSED_OCCURRENCE_NOT_RUN__INDEPENDENT_AUDIT_REQUIRED`
 
 **Docket owner base:** `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`
 **AG/Docket successor reconciliation result:**
@@ -300,12 +300,15 @@ implement, reinterpret, or qualify NQ-ng.
 
 ## Current gate and non-goals
 
-The original contract is accepted and published. This current-pin correction requires
-independent review before a fixture or runtime edit. The next lawful transition after
-acceptance is the smallest qualification
-harness that composes the existing AG and Docket CLIs in an isolated resettable
-environment. A Docket runtime change is allowed only if that exercise exposes
-a concrete owner defect that existing interfaces cannot close.
+The original contract and current-pin correction are accepted and published at
+`85ff185347e46ff2bf6168a6f300bbe4f94a5dbc`. The qualification-only fixture now
+exists without a Docket runtime change. Its local tests, exact owner suites,
+reproducible Bookworm package, and known-no-effect composed occurrence are green.
+The successful reset-VM effect, full two-VM evidence archive, restart/store-cut,
+and teardown remain `NOT_RUN` until this implementation checkpoint is independently
+accepted. Acceptance authorizes only a fresh bounded qualification occurrence; it
+does not transfer the earlier NQ-ng run-012 result or qualify the composition by
+itself.
 
 Not authorized here:
 
@@ -322,7 +325,8 @@ Not authorized here:
   `exactly_once` status; or
 - inference of missing provenance from matching content or timestamps.
 
-This checkpoint is documentation only. The composed implementation and qualification are
-`NOT_STARTED`; the separately accepted NQ run-012 is not relabeled. A Docket database
-occurrence, AG authorization consumption through Docket, provider contact, deployment, and
-production remain `NOT_RUN`.
+The qualification-only fixture is implemented and its non-live local gate is green; it
+does not change Docket product runtime or transfer the separately accepted NQ run-012
+result. A successful reset-VM Docket database occurrence, AG authorization consumption
+through Docket, full composed archive/restart/teardown, provider contact, deployment, and
+production remain `NOT_RUN` pending independent acceptance and a fresh occurrence.
