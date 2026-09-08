@@ -34,7 +34,7 @@ three ports, 7,200-second bound, controller and owner subjects/trees, physical
 controller-state directory and lock identities, runner/builder/harness identities, and all six
 input paths/lengths/digests. The controller derives the complete runner argv.
 The fresh M2 run root is fixed at
-`/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-001`.
+`/data/git/.campaign-artifacts/constellation-operator-beta-composed-m2-run-002`.
 This uses the filesystem with room for the accepted NQ-ng 24 GiB preflight;
 earlier authoritative `/var/tmp` run archives remain in place.
 
