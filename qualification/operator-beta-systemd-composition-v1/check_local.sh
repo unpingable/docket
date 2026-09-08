@@ -7,7 +7,7 @@ docket_source=${DOCKET_SOURCE:-/data/git/.worktrees/ag-ng-docket-adoption-docket
 nq_source=${NQ_SOURCE:-/data/git/.worktrees/nq-ng-operator-beta-profile-v1}
 ag_vendor=${AG_VENDOR:-/data/git/.campaign-artifacts/docket-systemd-composition-v1/build-inputs/ag-vendor}
 docket_vendor=${DOCKET_VENDOR:-/data/git/.campaign-artifacts/docket-systemd-composition-v1/build-inputs/docket-vendor}
-fixture=${COMPOSITION_FIXTURE:-/data/git/.campaign-artifacts/docket-systemd-composition-v1/fixture-build-004}
+fixture=${COMPOSITION_FIXTURE:-/data/git/.campaign-artifacts/docket-systemd-composition-v1/fixture-build-006}
 ag_deb=${AG_SYSTEMD_DEB:-/data/git/.campaign-artifacts/nq-ng-operator-beta-m1b-20260908/operator-beta-m1b-v1/run-012/input/agent-governor-ng-systemd-executor_amd64.deb}
 qualification="$repo/qualification/operator-beta-systemd-composition-v1"
 package="$fixture/constellation-operator-beta-composition-fixture_0.1.0-1_amd64.deb"
@@ -49,7 +49,7 @@ cargo test --locked --manifest-path "$ag_source/Cargo.toml" \
 cargo test --locked --manifest-path "$ag_source/Cargo.toml" \
   -p ag-app --test governed_docket_process
 
-expected_package=990dc8709862ffa5be429cde9ae16cb5c8d11dfcdce93567dc4af1b51987f8cb
+expected_package=5bb3f3d27a4c19cbb2c7bc80bdf69d9f5aab076d9f20cd49b59a8b8c45e4a479
 if test "${COMPOSITION_INJECT_BOUNDARY_FAILURE:-0}" = 1; then
   expected_package=0000000000000000000000000000000000000000000000000000000000000000
 fi
@@ -76,9 +76,13 @@ AG_EFFECTD_BIN="$scratch/ag/usr/libexec/agent-governor-ng/ag-effectd" \
   constellation-beta-http-fixture.service \
   sha256:1111111111111111111111111111111111111111111111111111111111111111 \
   sha256:2222222222222222222222222222222222222222222222222222222222222222
-python3 -B - "$scratch/result" <<'PY'
-import json,pathlib,sys
+python3 -B - "$scratch/result" \
+  "$scratch/composition/usr/libexec/constellation-operator-beta/docket" \
+  "$scratch/ag/usr/libexec/agent-governor-ng/ag-effectd" <<'PY'
+import hashlib,json,pathlib,shutil,sqlite3,subprocess,sys
 root=pathlib.Path(sys.argv[1])
+docket=pathlib.Path(sys.argv[2])
+effectd=pathlib.Path(sys.argv[3])
 result=json.loads((root/'composition-result.json').read_bytes())
 outcome=json.loads((root/'executor-outcome.json').read_bytes())
 evidence=json.loads((root/'systemd-evidence.json').read_bytes())
@@ -91,6 +95,33 @@ assert outcome['outcome']=='failure'
 assert evidence['outcome_code']=='systemd_machine_identity_mismatch'
 assert evidence['job_path'] is None and evidence['job_result'] is None
 assert [item['kind'] for item in evidence['messages']]==['get_machine_id_reply']
+for relative in ('composition-result.json','executor-outcome.json','docket-inspection.json'):
+    assert (root/relative).read_bytes().endswith(b'\n')
+store=root/'occurrence/ag-effectd-attempts.sqlite'
+connection=sqlite3.connect(store)
+checkpoint=connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+connection.close()
+assert checkpoint is not None and checkpoint[0]==0
+wal=pathlib.Path(str(store)+'-wal')
+assert not wal.exists() or wal.stat().st_size==0
+cut=root/'ag-effectd-attempts-cut.sqlite'
+shutil.copyfile(store,cut)
+cut.chmod(0o400)
+store_sha='sha256:'+hashlib.sha256(cut.read_bytes()).hexdigest()
+audited=subprocess.run(
+    [str(effectd),'audit-store',str(root/'occurrence/systemd-plan-v2.json'),
+     '--store-cut',str(cut),'--store-bytes',str(cut.stat().st_size),
+     '--store-sha256',store_sha],
+    input=(root/'executor-dispatch.json').read_bytes(),capture_output=True,check=True,
+)
+assert audited.stderr==b''
+assert audited.stdout==(root/'executor-outcome.json').read_bytes()
+inspected=subprocess.run(
+    [str(docket),'governed-loop','inspect','--state',str(root/'occurrence/docket-state'),
+     '--issuance',result['issuance']],capture_output=True,check=True,
+)
+assert inspected.stderr==b''
+assert inspected.stdout==(root/'docket-inspection.json').read_bytes()
 PY
 
 echo COMPOSITION_LOCAL_QUALIFICATION_PASSED

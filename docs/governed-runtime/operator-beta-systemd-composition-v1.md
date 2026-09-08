@@ -1,7 +1,7 @@
 # Operator-beta AG systemd composition contract
 
 **Recorded:** 2026-09-07
-**Status:** `FIXTURE_IMPLEMENTED__LOCAL_QUALIFICATION_GREEN__LIVE_COMPOSED_OCCURRENCE_NOT_RUN__INDEPENDENT_AUDIT_REQUIRED`
+**Status:** `LIVE_RUN_001_PRESERVED__OWNER_OUTPUT_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_AUDIT`
 
 **Docket owner base:** `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`
 **AG/Docket successor reconciliation result:**
@@ -304,11 +304,14 @@ The original contract and current-pin correction are accepted and published at
 `85ff185347e46ff2bf6168a6f300bbe4f94a5dbc`. The qualification-only fixture now
 exists without a Docket runtime change. Its local tests, exact owner suites,
 reproducible Bookworm package, and known-no-effect composed occurrence are green.
-The successful reset-VM effect, full two-VM evidence archive, restart/store-cut,
-and teardown remain `NOT_RUN` until this implementation checkpoint is independently
-accepted. Acceptance authorizes only a fresh bounded qualification occurrence; it
-does not transfer the earlier NQ-ng run-012 result or qualify the composition by
-itself.
+Accepted/published fixture checkpoint `ea9d394831ae5f640e8ea7bd5871b978bcce5e7f`
+authorized fresh run `operator-beta-composed-m1b-run-001`. That run retained one
+AG authorization spend, one Docket attempt/settlement, one successful owner effect,
+fresh post/restart NQ evidence, and then refused at query-only AG store audit because
+the fixture retained the canonical outcome without the owner CLI's terminal newline.
+Run-001 is terminal and must not be resumed or relabeled. The framing correction must
+receive independent acceptance before any distinct fresh occurrence. Full owner
+store-cut acceptance, teardown, and a terminal composed result remain unestablished.
 
 Not authorized here:
 
@@ -325,8 +328,9 @@ Not authorized here:
   `exactly_once` status; or
 - inference of missing provenance from matching content or timestamps.
 
-The qualification-only fixture is implemented and its non-live local gate is green; it
-does not change Docket product runtime or transfer the separately accepted NQ run-012
-result. A successful reset-VM Docket database occurrence, AG authorization consumption
-through Docket, full composed archive/restart/teardown, provider contact, deployment, and
-production remain `NOT_RUN` pending independent acceptance and a fresh occurrence.
+The qualification-only fixture is implemented and does not change Docket product
+runtime or transfer the separately accepted NQ run-012 result. Run-001 records a
+Docket database occurrence, AG authorization consumption through Docket, and an AG
+owner effect, but no terminal composed qualification. Full owner store-cut acceptance,
+teardown, another occurrence, provider contact, deployment, and production remain
+`NOT_RUN` pending correction qualification and independent acceptance.

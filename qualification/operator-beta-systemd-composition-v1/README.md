@@ -1,7 +1,7 @@
 # Operator-beta AG → Docket → systemd composition fixture
 
 **Recorded:** 2026-09-08
-**State:** `LOCAL_QUALIFICATION_GREEN__LIVE_COMPOSED_OCCURRENCE_NOT_RUN__INDEPENDENT_AUDIT_REQUIRED`
+**State:** `LIVE_RUN_001_PRESERVED__OWNER_OUTPUT_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_AUDIT`
 
 This directory is a qualification-only adapter around existing owners. It adds no
 Docket runtime state, transport, effect family, daemon, retry controller, or product
@@ -29,11 +29,11 @@ The target-only qualification package is:
 
 ```text
 constellation-operator-beta-composition-fixture_0.1.0-1_amd64.deb
-SHA-256 990dc8709862ffa5be429cde9ae16cb5c8d11dfcdce93567dc4af1b51987f8cb
+SHA-256 5bb3f3d27a4c19cbb2c7bc80bdf69d9f5aab076d9f20cd49b59a8b8c45e4a479
 ```
 
 Its canonical build receipt is SHA-256
-`00d8184e8b50805c6fdeef8770df62332e41c01be521dc0d3eb14346c029d261`.
+`e1b859a84e77ef94a545daaa6d3fd7acce9e0a249c998a8948306d93e109b4db`.
 The package data archive is a closed root-owned 0755 layout containing only:
 
 ```text
@@ -115,11 +115,21 @@ with the exact retained Docket and AG binaries; it is no longer left at its norm
 ignored default in this gate.
 
 These results cover the non-live owner laws in the twelve-case contract matrix. They
-do not establish the reset-VM success, composed archive, live method count,
-restart/store-cut, or teardown. Those dimensions remain `NOT_RUN` until a clean
-implementation checkpoint receives independent acceptance and a new run identity is
-used. Earlier NQ runs 001–012 are never resumed, relabeled, or treated as the composed
-occurrence.
+preceded accepted/published fixture checkpoint `ea9d394831ae5f640e8ea7bd5871b978bcce5e7f`.
+Fresh occurrence `operator-beta-composed-m1b-run-001` then retained one exact AG spend,
+one Docket attempt/settlement, one successful owner effect, and fresh post/restart NQ
+evidence. It refused at the query-only AG store audit because the driver retained a
+272-byte canonical outcome without the owner CLI's terminal newline while `audit-store`
+returned the same object in 273 bytes with that newline. Run-001 remains terminal at
+`restart_reopen_proved` with `reopen evidence; do not restart producer`; it has no owner
+store-audit record, teardown, manifest, or terminal composed result. Its evidence is not
+transferred to another occurrence. Earlier NQ runs 001–012 are likewise never resumed
+or relabeled.
+
+The bounded correction appends one newline to every driver-retained canonical record,
+matching both accepted owner CLI projections. The local known-no-effect case must now
+replay AG `audit-store` and Docket `governed-loop inspect` and require byte-identical
+outcomes before the correction can be frozen for independent review.
 
 ## Local gate
 
@@ -138,10 +148,11 @@ owner suites pass.
 
 ## Next gate
 
-1. Freeze a clean non-rewriting implementation checkpoint.
+1. Rebuild the qualification package/receipt and freeze a clean non-rewriting
+   owner-output-framing correction checkpoint.
 2. Independently audit exact source, package/receipt reproduction, local gate,
    deterministic negative control, and the claim boundary.
-3. Only after acceptance, use a fresh run identity under the existing isolated
+3. Only after correction acceptance, use a fresh run identity under the existing isolated
    user-systemd producer custody.
 4. Independently reopen the terminal archive. A refusal or indeterminate result is a
    legitimate terminal outcome and must not be relabeled as success.

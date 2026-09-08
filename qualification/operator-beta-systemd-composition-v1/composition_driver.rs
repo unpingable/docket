@@ -315,7 +315,7 @@ fn authorize(engine: &mut CampaignEngineV1, scenario: &Scenario) -> Result<(), S
     Ok(())
 }
 
-fn inspect_docket(docket: &Path, state: &Path, issuance: &str) -> Result<Value, String> {
+fn inspect_docket(docket: &Path, state: &Path, issuance: &str) -> Result<(Value, Vec<u8>), String> {
     let output = Command::new(docket)
         .args([
             "governed-loop",
@@ -330,7 +330,8 @@ fn inspect_docket(docket: &Path, state: &Path, issuance: &str) -> Result<Value, 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
-    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
+    let inspection = serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    Ok((inspection, output.stdout))
 }
 
 fn require_absolute_executable(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -348,7 +349,9 @@ fn require_absolute_executable(path: &Path, label: &str) -> Result<PathBuf, Stri
 
 fn write_canonical<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let document = JcsDocument::canonicalize(value).map_err(|error| error.to_string())?;
-    std::fs::write(path, document.as_bytes()).map_err(|error| error.to_string())
+    let mut bytes = document.as_bytes().to_vec();
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -441,7 +444,8 @@ fn run() -> Result<(), String> {
     if duplicate != custody {
         return Err("identical issuance did not converge on retained Docket custody".to_owned());
     }
-    let inspection = inspect_docket(&docket, &docket_state, issuance.issuance.as_str())?;
+    let (inspection, inspection_raw) =
+        inspect_docket(&docket, &docket_state, issuance.issuance.as_str())?;
     if inspection["record"]["status"] != "settled" {
         return Err("query-only Docket inspection did not reopen settlement".to_owned());
     }
@@ -476,7 +480,8 @@ fn run() -> Result<(), String> {
     write_canonical(&output.join("issuance.json"), &issuance)?;
     write_canonical(&output.join("docket-custody.json"), &custody)?;
     write_canonical(&output.join("docket-settlement.json"), &settlement)?;
-    write_canonical(&output.join("docket-inspection.json"), &inspection)?;
+    std::fs::write(output.join("docket-inspection.json"), inspection_raw)
+        .map_err(|error| error.to_string())?;
     write_canonical(&output.join("executor-dispatch.json"), &dispatch)?;
     write_canonical(&output.join("executor-outcome.json"), &executor_outcome)?;
     std::fs::write(output.join("systemd-evidence.json"), &systemd_evidence)
