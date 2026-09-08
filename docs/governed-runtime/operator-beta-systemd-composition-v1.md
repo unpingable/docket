@@ -1,17 +1,21 @@
 # Operator-beta AG systemd composition contract
 
 **Recorded:** 2026-09-07
-**Status:** `M1_DOCKET_COMPOSITION_CONTRACT__NQ_NG_RECONCILIATION_REVIEW_REQUIRED`
+**Status:** `M1_DOCKET_COMPOSITION_CONTRACT_ACCEPTED__CURRENT_PIN_REAUDIT_REQUIRED`
 
 **Docket owner base:** `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`
-**AG/Docket adoption integration result:**
-`a05f7410cee0cca262d95ea198099f811091cc0f`
+**AG/Docket successor reconciliation result:**
+`44271684f6fb647620d8cade291814dadd08be18`
+**AG store-audit owner:** `837de287497942c79966aa05c083acee9c312261`
+**AG store-audit package qualification:**
+`db4bad1fba2b5ab512cc58356314228167b2f48e`
 **AG M1A accepted result:** `92d274c299478a65121f2d8e1b93a2d00383a828`
 **NQ-ng acquisition contract:** `e45c7b4bfb18ea740576a65f692b29f4390fbaff`
-**NQ-ng helper accepted result (publication pending):**
-`9d8624a2d13cb1562b55a81de6f6cea07fb65dcc`
+**NQ-ng M1B result branch:** `9f1b081b7fc5b2d99fb92ee6b0ac4107c7e7dfe4`
+**NQ-ng qualification closeout:** `5ea0a4be9f7aed0fb7f31db730b2db834957129b`
+**NQ-ng harness subject:** `dc5d602484a4556c465df6947e98d81dba0d314a`
 **Release-basis acceptance:**
-`2e9a7657c414bd6307efd09fa0104fc6fb92938c`
+`d968db4a1b9cda702e2e6167df605b16822f0b43`
 
 This contract defines the narrow M1 composition between AG's already-qualified
 systemd executor and Docket's already-qualified generic local executor
@@ -56,21 +60,24 @@ schema corpus, SQLite migration, and external behavior while placing the
 transport-neutral law in `gwr-runtime` and local process/SQLite adapters in
 `gwr-local`.
 
-The admitted AG/Docket adoption pair is the accepted and published AG result
-`a05f7410cee0cca262d95ea198099f811091cc0f` with exact Docket C2
-`c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`. That result contains the tested
-AG integration merge `651d7178ef4a8950b9d9ac25c7d3fe496ed55f96` and preserves the separately
-qualified M1A systemd owner result
-`92d274c299478a65121f2d8e1b93a2d00383a828` as an ancestor. The adoption
-integration witness does not reclassify either owner's earlier result; this
-composition requires new evidence against the integrated pair.
+The admitted AG/Docket adoption pair is accepted and published successor result
+`44271684f6fb647620d8cade291814dadd08be18`, whose exact AG owner parent is
+`837de287497942c79966aa05c083acee9c312261`, with exact Docket C2
+`c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`. The AG owner descends accepted original
+integration result `a05f7410cee0cca262d95ea198099f811091cc0f`, tested merge
+`651d7178ef4a8950b9d9ac25c7d3fe496ed55f96`, and separately qualified M1A systemd owner
+result `92d274c299478a65121f2d8e1b93a2d00383a828`. The fresh successor witness requalified
+the managed-file adoption path only. It does not qualify this systemd composition or
+reclassify any earlier result.
 
-The M1A result's qualified target-local package is
-`agent-governor-ng-systemd-executor` version `0.1.0-1+m1a3`, archive SHA-256
-`2852dc8a516980c4a1936d64a3a3f472d95fccf5eb3935f01a1be277f6b24f26`.
+The current qualified target-local AG package was built from exact owner
+`837de287497942c79966aa05c083acee9c312261` and is closed by package-qualification result
+`db4bad1fba2b5ab512cc58356314228167b2f48e`. Its archive SHA-256 is
+`98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279`.
 The package installs the feature-enabled process adapter only at
 `/usr/libexec/agent-governor-ng/ag-effectd`, with executable SHA-256
-`d2c021892d470d227548bf94ceb943d6b9457592176f289bd9864b40a3aeb460`.
+`668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068`.
+The older M1A package and receipt remain predecessor evidence at their original subjects.
 
 Docket state, Docket's local process, the AG governed-loop process that invokes
 it, the AG executor process, executor plan, and executor attempt store reside
@@ -183,12 +190,13 @@ postcondition. Only a subsequent fresh NQ-ng observation may support the
 postcondition, and M1B remains independently qualified.
 The accepted NQ-ng acquisition contract is
 `e45c7b4bfb18ea740576a65f692b29f4390fbaff`.
-The NQ-ng helper qualification result
-`9d8624a2d13cb1562b55a81de6f6cea07fb65dcc` independently returned
-`ACCEPTED / PROCEED` for implementation
-`386358190e974c532d5237d36231fe7e806d100e`. It remains unpublished at this
-checkpoint and establishes only the bounded helper, not an admitted M1B
-package/VM result.
+The accepted/published NQ-ng mechanism result is retained by branch
+`9f1b081b7fc5b2d99fb92ee6b0ac4107c7e7dfe4`, closeout
+`5ea0a4be9f7aed0fb7f31db730b2db834957129b`, and harness
+`dc5d602484a4556c465df6947e98d81dba0d314a`. Run-012 qualifies the bounded package,
+two-VM observation, direct AG-owner effect, restart/reopen, store-cut, and teardown
+mechanism cases with declared limitations. It explicitly leaves Docket database occurrence
+and AG authorization consumption `NOT_RUN`, so it cannot serve as the composed occurrence.
 
 ## Failure cuts and reconciliation
 
@@ -246,8 +254,8 @@ sufficient evidence for any stronger claim.
 The smallest qualifying implementation should prefer a campaign-owned fixture
 and existing CLIs over Docket runtime changes. It must exercise and retain:
 
-1. exact accepted Docket and AG result ancestry, executable/package digests,
-   and target-local placement;
+1. exact accepted Docket C2, AG owner/result, NQ-ng harness/closeout ancestry,
+   executable/package digests, and target-local placement;
 2. one real AG decision and one-use consumption producing the exact signed
    issuance consumed by Docket;
 3. fresh Docket standing resolution, one custody row, one attempt, one marker,
@@ -292,8 +300,9 @@ implement, reinterpret, or qualify NQ-ng.
 
 ## Current gate and non-goals
 
-This contract requires independent review before a fixture or runtime edit.
-The next lawful transition after acceptance is the smallest qualification
+The original contract is accepted and published. This current-pin correction requires
+independent review before a fixture or runtime edit. The next lawful transition after
+acceptance is the smallest qualification
 harness that composes the existing AG and Docket CLIs in an isolated resettable
 environment. A Docket runtime change is allowed only if that exercise exposes
 a concrete owner defect that existing interfaces cannot close.
@@ -313,5 +322,7 @@ Not authorized here:
   `exactly_once` status; or
 - inference of missing provenance from matching content or timestamps.
 
-This checkpoint is documentation only. Implementation and qualification are
-`NOT_STARTED` until an independent audit accepts the exact contract subject.
+This checkpoint is documentation only. The composed implementation and qualification are
+`NOT_STARTED`; the separately accepted NQ run-012 is not relabeled. A Docket database
+occurrence, AG authorization consumption through Docket, provider contact, deployment, and
+production remain `NOT_RUN`.
