@@ -532,6 +532,41 @@ def canonical_record(path: pathlib.Path, label: str, nq: Any) -> dict[str, Any]:
     return record
 
 
+def owner_json_record(path: pathlib.Path, label: str, nq: Any) -> dict[str, Any]:
+    """Open one newline-framed owner JSON object without reconstructing its bytes."""
+    metadata = nq.regular_file(path, label)
+    if metadata.st_size <= 0 or metadata.st_size > 16 * 1024 * 1024:
+        raise nq.Refusal(f"{label} exceeds its byte bound")
+    raw = path.read_bytes()
+    if (
+        not raw.endswith(b"\n")
+        or not raw[:-1].startswith(b"{")
+        or not raw[:-1].endswith(b"}")
+    ):
+        raise nq.Refusal(f"{label} is not one newline-framed JSON object")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON member: {key}")
+            result[key] = value
+        return result
+
+    try:
+        record = json.loads(raw[:-1], object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise nq.Refusal(f"{label} is not one duplicate-free JSON object") from error
+    if not isinstance(record, dict):
+        raise nq.Refusal(f"{label} is not one JSON object")
+    return record
+
+
+def nq_owner_record(path: pathlib.Path, label: str, nq: Any) -> dict[str, Any]:
+    """Use NQ-ng's accepted framing law for NQ-owned diagnostic artifacts."""
+    return nq.load_json_artifact(path, label)
+
+
 def reopen_archive_exact(
     archive: pathlib.Path, retained: pathlib.Path, nq: Any
 ) -> None:
@@ -637,7 +672,7 @@ def verify_composition_chain(path: pathlib.Path, result: dict[str, Any], nq: Any
     issuance = canonical_record(first / "issuance.json", "AG issuance", nq)
     custody = canonical_record(first / "docket-custody.json", "Docket custody", nq)
     settlement = canonical_record(first / "docket-settlement.json", "Docket settlement", nq)
-    inspection = canonical_record(first / "docket-inspection.json", "Docket inspection", nq)
+    inspection = owner_json_record(first / "docket-inspection.json", "Docket inspection", nq)
     dispatch = canonical_record(first / "executor-dispatch.json", "executor dispatch", nq)
     outcome = canonical_record(first / "executor-outcome.json", "executor outcome", nq)
     replay = canonical_record(first / "ag-replay.json", "AG replay", nq)
@@ -765,7 +800,7 @@ def verify_nq_and_teardown(path: pathlib.Path, result: dict[str, Any], nq: Any) 
         ("http-restart-artifact.json", "nq.http_endpoint", "unresolved", "http-restart"),
     )
     for name, profile, condition, instance in cases:
-        artifact = canonical_record(path / "evidence" / name, name, nq)
+        artifact = nq_owner_record(path / "evidence" / name, name, nq)
         nq.verify_diagnostic_artifact(
             artifact,
             profile=profile,

@@ -37,6 +37,49 @@ nq = load(
 
 
 class CompositionAdapterTests(unittest.TestCase):
+    def test_docket_inspection_preserves_owner_json_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "docket-inspection.json"
+            owner_bytes = b'{"schema":"docket.governed-loop.inspection/v1","requested_issuance":"sha256:1","record":{"status":"settled"}}\n'
+            path.write_bytes(owner_bytes)
+            self.assertEqual(
+                adapter.owner_json_record(path, "Docket inspection", nq),
+                {
+                    "schema": "docket.governed-loop.inspection/v1",
+                    "requested_issuance": "sha256:1",
+                    "record": {"status": "settled"},
+                },
+            )
+            self.assertEqual(path.read_bytes(), owner_bytes)
+
+            for invalid in (
+                owner_bytes.rstrip(b"\n"),
+                owner_bytes + b"{}\n",
+                b'{"schema":"first","schema":"second"}\n',
+            ):
+                path.write_bytes(invalid)
+                with self.assertRaisesRegex(nq.Refusal, "Docket inspection"):
+                    adapter.owner_json_record(path, "Docket inspection", nq)
+
+    def test_nq_artifact_uses_nq_owner_framing_without_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "systemd-pre-artifact.json"
+            owner_bytes = nq.canonical(
+                {"schema": "nq.diagnostic-artifact/v1", "observations": []}
+            )
+            path.write_bytes(owner_bytes)
+            self.assertEqual(
+                adapter.nq_owner_record(path, "NQ diagnostic artifact", nq),
+                {"schema": "nq.diagnostic-artifact/v1", "observations": []},
+            )
+            self.assertEqual(path.read_bytes(), owner_bytes)
+
+            path.write_bytes(
+                b'{"schema":"nq.diagnostic-artifact/v1","observations":[]}'
+            )
+            with self.assertRaisesRegex(nq.Refusal, "canonical JSON"):
+                adapter.nq_owner_record(path, "NQ diagnostic artifact", nq)
+
     def test_manifest_reopen_requires_exact_physical_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

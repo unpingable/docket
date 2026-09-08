@@ -1,7 +1,7 @@
 # Operator-beta AG → Docket → systemd composition fixture
 
 **Recorded:** 2026-09-08
-**State:** `LIVE_RUN_001_PRESERVED__OWNER_OUTPUT_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_AUDIT`
+**State:** `LIVE_RUN_002_SEALED__SOURCE_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT`
 
 This directory is a qualification-only adapter around existing owners. It adds no
 Docket runtime state, transport, effect family, daemon, retry controller, or product
@@ -91,9 +91,10 @@ It explicitly keeps `aggregate_postcondition=NOT_RECORDED`,
 
 The local gate currently establishes:
 
-- 10 direct builder/adapter cases, including closed receipt/inventory, path/mode/
+- 12 direct builder/adapter cases, including closed receipt/inventory, path/mode/
   content substitutions, exact target invocation, worker/owner outcome disagreement,
-  closed artifact inventory, and non-collapsed terminal dimensions;
+  closed artifact inventory, source-owned Docket/NQ JSON framing, and non-collapsed
+  terminal dimensions;
 - all 17 exact Docket governed-loop owner cases, including concurrent same-issuance
   convergence, standing/authentication/custody refusal, acknowledgement-loss/
   indeterminate reconciliation, substitution, restart, replay, and query-only inspect;
@@ -131,6 +132,26 @@ matching both accepted owner CLI projections. The local known-no-effect case mus
 replay AG `audit-store` and Docket `governed-loop inspect` and require byte-identical
 outcomes before the correction can be frozen for independent review.
 
+That correction was independently accepted and published at
+`eccceefc4f906830ad2ae8f4a8eca245bee3800e`. Fresh occurrence
+`operator-beta-composed-m1b-run-002` then reached a sealed producer result with one
+recorded AG authorization consumption, one recorded Docket occurrence, one successful
+AG-owned enactment receipt, restart/reopen evidence, and exact teardown evidence. Its
+first query-only `check-run` correctly refused acceptance: the checker required the
+retained Docket inspection to use campaign-owned JCS ordering even though Docket's
+authoritative `governed-loop inspect` interface emits a newline-framed serde JSON object
+in its owner field order. The retained original, restart, and fresh query outputs are
+byte-identical. The same generic checker also rejected NQ-ng's valid newline-free
+canonical diagnostic artifacts even though NQ-ng's accepted owner loader permits its
+canonical bytes with or without one terminal newline. Run-002 remains sealed but
+unaccepted while these source-owned framing boundaries are corrected and independently
+reviewed. No run result is relabeled by this correction.
+
+With the bounded checker correction applied, 12 direct cases, the complete local owner
+gate, and its deterministic package-identity substitution control passed. The exact
+sealed run-002 archive then reopened query-only as `COMPOSED_RUN_REOPENED`; its manifest,
+RESULT, retained evidence, and owner output bytes were not changed.
+
 ## Local gate
 
 The retained campaign paths are defaults; each may be overridden by the corresponding
@@ -140,6 +161,9 @@ environment variable in `check_local.sh`.
 bash qualification/operator-beta-systemd-composition-v1/check_local.sh
 COMPOSITION_INJECT_BOUNDARY_FAILURE=1 \
   bash qualification/operator-beta-systemd-composition-v1/check_local.sh
+python3 -B qualification/operator-beta-systemd-composition-v1/run_composed_two_vm.py \
+  check-run /var/tmp/constellation-operator-beta-composed-m1b-run-002 \
+  --nq-harness /data/git/.worktrees/nq-ng-operator-beta-profile-v1/qualification/operator-beta-m1b-v1/run_two_vm.py
 ```
 
 The first command must print `COMPOSITION_LOCAL_QUALIFICATION_PASSED`. The second
@@ -148,14 +172,12 @@ owner suites pass.
 
 ## Next gate
 
-1. Rebuild the qualification package/receipt and freeze a clean non-rewriting
-   owner-output-framing correction checkpoint.
-2. Independently audit exact source, package/receipt reproduction, local gate,
-   deterministic negative control, and the claim boundary.
-3. Only after correction acceptance, use a fresh run identity under the existing isolated
-   user-systemd producer custody.
-4. Independently reopen the terminal archive. A refusal or indeterminate result is a
-   legitimate terminal outcome and must not be relabeled as success.
+1. Independently re-audit the non-rewriting source-framing checker correction and the
+   unchanged exact run-002 archive.
+2. If accepted, retain a closed qualification receipt and campaign-owned archive copy
+   without widening the run's declared limitations.
+3. A refusal or indeterminate result remains a legitimate terminal outcome and must not
+   be relabeled as success.
 
 No publication, default-branch merge, deployment, target activation outside the
 fixture, or productization follows from this checkpoint.
