@@ -54,6 +54,11 @@ INPUT_FIELDS = (
 ADMITTED_SPEC_PATH = pathlib.Path(
     "/var/tmp/constellation-operator-beta-m2-controller-v1/fixed-demo-spec.v1.json"
 )
+# Independently enrolled physical state/lock identity, frozen before launch.
+# These literals must be supplied by the integration owner's enrollment record;
+# absent enrollment is a refusal, never a digest derived from candidate bytes.
+ADMITTED_SPEC_BYTES = 3677
+ADMITTED_SPEC_SHA256 = "7dc3825bd3c524c932c04684d2b34db20ecf28d9fe44524740823439410648ef"
 COMPOSITION_BASE = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
 COMPOSITION_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
 COMPOSITION_DIRECTORY = "/data/git/.worktrees/docket-operator-beta-systemd-composition-v1"
@@ -157,6 +162,13 @@ def canonical(value: Any) -> bytes:
 
 def digest_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def executed_source_sha256() -> str:
+    value = globals().get("__executed_source_sha256__")
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise Refusal("controller execution has no retained source identity")
+    return value
 
 
 def digest_path(path: pathlib.Path) -> str:
@@ -558,7 +570,7 @@ def intent_record(spec: dict[str, Any], spec_raw: bytes, spec_sha256: str) -> di
         "spec_sha256": spec_sha256,
         "controller_base_subject": spec["controller_base_subject"],
         "controller_base_tree": spec["controller_base_tree"],
-        "controller_sha256": digest_path(pathlib.Path(__file__)),
+        "controller_sha256": executed_source_sha256(),
         "checker_sha256": CHECKER_SHA256,
         "state_root": spec["state_root"],
         "state_root_device": spec["state_root_device"],
@@ -581,7 +593,7 @@ def validate_intent(value: dict[str, Any], expected: dict[str, Any]) -> None:
 def process_start_ticks(pid: int) -> int:
     try:
         raw = pathlib.Path(f"/proc/{pid}/stat").read_text()
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise Refusal("manager PID is not observable") from error
     closing = raw.rfind(")")
     fields = raw[closing + 2 :].split() if closing >= 0 else []
@@ -595,14 +607,14 @@ def process_execution(pid: int, spec_sha256: str) -> dict[str, Any]:
         argv_raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
         cwd = os.readlink(f"/proc/{pid}/cwd")
         environment_raw = pathlib.Path(f"/proc/{pid}/environ").read_bytes()
-    except (OSError, UnicodeDecodeError) as error:
+        argv = [part.decode() for part in argv_raw.rstrip(b"\0").split(b"\0")]
+        environment = {}
+        for item in environment_raw.rstrip(b"\0").split(b"\0"):
+            if item.startswith(b"CONSTELLATION_FIXED_DEMO_SPEC_SHA256="):
+                key, value = item.decode().split("=", 1)
+                environment[key] = value
+    except (OSError, UnicodeError) as error:
         raise Refusal("manager process execution is not observable") from error
-    argv = [part.decode() for part in argv_raw.rstrip(b"\0").split(b"\0")]
-    environment = {}
-    for item in environment_raw.rstrip(b"\0").split(b"\0"):
-        if item.startswith(b"CONSTELLATION_FIXED_DEMO_SPEC_SHA256="):
-            key, value = item.decode().split("=", 1)
-            environment[key] = value
     return {
         "argv": argv,
         "working_directory": cwd,
@@ -667,16 +679,20 @@ class SystemdUserManager:
                 "reason": completed.stderr.decode(errors="replace")[:MAX_REASON_BYTES].strip(),
             }
         try:
-            properties = dict(
-                line.split("=", 1)
-                for line in completed.stdout.decode(errors="strict").splitlines()
-                if "=" in line
-            )
-        except UnicodeDecodeError:
+            properties = {}
+            for line in completed.stdout.decode(errors="strict").splitlines():
+                if "=" not in line:
+                    raise Refusal("manager reply has an invalid property line")
+                key, value = line.split("=", 1)
+                if key in properties:
+                    raise Refusal("manager reply repeats a property")
+                properties[key] = value
+            validate_manager_properties(properties)
+        except (UnicodeError, Refusal) as error:
             return {
                 "source": "user-systemd",
                 "state": "NOT_OBSERVABLE",
-                "reason": "manager reply is not UTF-8",
+                "reason": str(error)[:MAX_REASON_BYTES],
             }
         return {"source": "user-systemd", "state": "OBSERVED", "properties": properties}
 
@@ -730,6 +746,33 @@ def optional_child_record(directory: int, name: str, label: str) -> tuple[dict[s
         raise error
 
 
+def validate_manager_properties(properties: Any) -> None:
+    fields = {"LoadState", "ActiveState", "SubState", "InvocationID", "MainPID"}
+    if not isinstance(properties, dict) or set(properties) != fields:
+        raise Refusal("manager reply does not contain exactly five requested properties")
+    if not all(isinstance(value, str) for value in properties.values()):
+        raise Refusal("manager property is not a string")
+    if properties["LoadState"] not in {"loaded", "not-found", "bad-setting", "error", "merged", "masked", "stub"}:
+        raise Refusal("manager load state is invalid")
+    if properties["ActiveState"] not in {"active", "reloading", "inactive", "failed", "activating", "deactivating", "maintenance", "refreshing"}:
+        raise Refusal("manager active state is invalid")
+    if properties["SubState"] not in {
+        "dead", "condition", "start-pre", "start", "start-post", "running", "exited",
+        "reload", "reload-signal", "reload-notify", "refreshing", "stop", "stop-watchdog",
+        "stop-sigterm", "stop-sigkill", "stop-post", "final-watchdog", "final-sigterm",
+        "final-sigkill", "failed", "auto-restart", "auto-restart-queued", "cleaning",
+    }:
+        raise Refusal("manager service sub-state is invalid")
+    pid = properties["MainPID"]
+    if not re.fullmatch(r"0|[1-9][0-9]{0,9}", pid) or int(pid) > 2147483647:
+        raise Refusal("manager main PID is invalid")
+    invocation = properties["InvocationID"]
+    if invocation and not re.fullmatch(r"[0-9a-fA-F]{32}", invocation):
+        raise Refusal("manager invocation identity is invalid")
+    if int(pid) > 0 and not invocation:
+        raise Refusal("manager process has no invocation identity")
+
+
 def manager_occurrence(
     manager: Manager, spec: dict[str, Any], argv: list[str], spec_sha256: str
 ) -> dict[str, Any]:
@@ -744,13 +787,12 @@ def manager_occurrence(
     if observed.get("state") != "OBSERVED":
         return observed
     properties = observed.get("properties")
-    if not isinstance(properties, dict):
-        return {"source": "user-systemd", "state": "NOT_OBSERVABLE", "reason": "invalid reply"}
     try:
-        pid = int(properties.get("MainPID", "0"))
-    except (TypeError, ValueError):
-        pid = 0
-    active = properties.get("ActiveState") == "active" and pid > 0
+        validate_manager_properties(properties)
+    except Refusal as error:
+        return {"source": "user-systemd", "state": "NOT_OBSERVABLE", "reason": str(error)}
+    pid = int(properties["MainPID"])
+    active = pid > 0
     result: dict[str, Any] = {
         "source": "user-systemd",
         "state": "PROCESS_ACTIVE" if active else "PROCESS_EXITED",
@@ -958,6 +1000,7 @@ def owner_terminal(spec: dict[str, Any]) -> dict[str, Any] | None:
         return {
             "state": "TERMINAL",
             "owner": "Docket",
+            "validator": "Docket",
             "disposition": result["disposition"],
             "evidence": str(root / "RESULT.json"),
             "replay": "check-run",
@@ -978,7 +1021,8 @@ def owner_terminal(spec: dict[str, Any]) -> dict[str, Any] | None:
             return {"state": "INDETERMINATE", "owner": "Docket", "reason": str(error)}
         return {
             "state": "REFUSED",
-            "owner": "Docket",
+            "owner": "NQ-ng",
+            "validator": "Docket",
             "disposition": "REFUSED",
             "reason": recovery["refusal"]["reason"],
             "effect_outcome": recovery["effect_outcome"],
@@ -1199,7 +1243,7 @@ def status_projection(
             "producer_subject": spec["composition_subject"],
             "producer_sha256": spec["runner"]["sha256"],
             "checker_sha256": CHECKER_SHA256,
-            "controller_sha256": digest_path(pathlib.Path(__file__)),
+            "controller_sha256": executed_source_sha256(),
             "code_capsule_sha256": argv[6],
         },
         "disagreements": disagreements,
@@ -1318,7 +1362,13 @@ def main() -> int:
         raw, metadata = read_nofollow_path(ADMITTED_SPEC_PATH, "installed Docket spec")
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o400:
             raise Refusal("installed Docket spec owner or mode differs")
-        controller = FixedController(ADMITTED_SPEC_PATH, len(raw), digest_bytes(raw))
+        if (type(ADMITTED_SPEC_BYTES) is not int or ADMITTED_SPEC_BYTES <= 0
+                or not isinstance(ADMITTED_SPEC_SHA256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", ADMITTED_SPEC_SHA256)):
+            raise Refusal("fixed physical state enrollment is not admitted")
+        if len(raw) != ADMITTED_SPEC_BYTES or digest_bytes(raw) != ADMITTED_SPEC_SHA256:
+            raise Refusal("installed Docket spec differs from independently admitted bytes")
+        controller = FixedController(ADMITTED_SPEC_PATH, ADMITTED_SPEC_BYTES, ADMITTED_SPEC_SHA256)
         projection = controller.start() if args.command == "start" else controller.status()
     except Exception as error:
         print(f"fixed demo controller refused: {error}", file=sys.stderr)
@@ -1328,4 +1378,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "__executed_source_sha256__" not in globals():
+        # Direct CLI bootstraps the effective controller from captured bytes.
+        # AG supplies the same marker after hashing its admitted retained bytes.
+        # __file__ remains only a location hint, never executing-byte evidence.
+        source, _metadata = read_nofollow_path(pathlib.Path(__file__), "controller source")
+        namespace = {"__name__": "__main__", "__file__": __file__,
+                     "__executed_source_sha256__": digest_bytes(source)}
+        exec(compile(source, __file__, "exec"), namespace)
+        raise SystemExit(0)
     raise SystemExit(main())

@@ -100,6 +100,12 @@ and never repairs a record.
 
 ## Terminal reopening
 
+The terminal projection distinguishes the producer of an authority record from
+the checker that reopens it: a validated NQ-ng refusal has `owner: NQ-ng` and
+`validator: Docket`; a validated composition success has `owner: Docket` and
+`validator: Docket`. An indeterminate Docket checking diagnostic is not a
+validated refusal record.
+
 Successful terminal state is admitted only by existing `check-run`.
 `check-refusal` reopens the exact physical run directory through the accepted
 NQ owner loader, requires a closed canonical refusal, requires exact agreement
@@ -139,3 +145,39 @@ Docket regression gates remain required.
 No live VM, effect, deployment, production action, handoff, model/provider,
 generic observability protocol, or UI implementation is qualified by this
 checkpoint.
+
+## Independently retained installation and execution identity
+
+The reviewed controller contains literal `ADMITTED_SPEC_BYTES` and
+`ADMITTED_SPEC_SHA256` values taken from the integration owner's enrollment
+record. They bind the full canonical physical installation spec, including
+state-root and lock device/inode/owner/mode. The CLI checks those independent
+literals before constructing its controller. It never derives expected admission
+from the bytes currently found at the installed spec path. Coherent replacement
+of spec, state root and lock therefore cannot enroll another launch occurrence.
+Absent enrollment is a refusal; replacement requires a separately reviewed
+campaign decision and does not happen through `start` or `status`.
+
+Execution testimony uses `__executed_source_sha256__`, computed from the bytes
+the capture bootstrap actually compiles and executes. The AG adapter supplies
+that marker from its retained, independently pinned controller bytes. Direct CLI
+invocation captures and executes bounded no-follow source bytes and supplies the
+same marker. `__file__` is a path hint, never a later executing-byte measurement.
+An imported controller without this marker refuses to issue execution identity.
+
+The installed/reviewed controller entrypoint, Python platform and invoking
+account are trusted premises. Direct CLI capture identifies executing bytes;
+it does not independently authorize arbitrary replacement code. AG's digest pin
+establishes adapter delegation custody, not application authority. Docket owns
+the fixed spec admission and one-intent law. Another same-UID process able to
+replace the trusted entrypoint itself or modify process memory is outside the
+declared premise; ordinary campaign source pathname changes remain covered by
+the existing capsule controls.
+
+Manager observation requires exactly the five requested properties, without
+duplicates or malformed lines. Every property has a closed type/value check;
+unknown future service state vocabulary is `NOT_OBSERVABLE`, never guessed as
+process exit. PID/InvocationID are checked before process observation. Invalid
+UTF-8 in manager output or relevant `/proc` execution fields also withdraws the
+observation. A positive PID in a valid transitional service state still requires
+the same `/proc` occurrence and execution checks before being shown as active.

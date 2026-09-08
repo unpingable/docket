@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -23,7 +24,10 @@ def load(name: str, path: pathlib.Path):
     assert specification is not None and specification.loader is not None
     module = importlib.util.module_from_spec(specification)
     sys.modules[name] = module
-    specification.loader.exec_module(module)
+    raw = path.read_bytes()
+    import hashlib
+    module.__executed_source_sha256__ = hashlib.sha256(raw).hexdigest()
+    exec(compile(raw, str(path), "exec"), module.__dict__)
     return module
 
 
@@ -67,6 +71,142 @@ class UnobservableManager(FakeManager):
 
 
 class FixedDemoControllerTests(unittest.TestCase):
+    def test_main_rejects_coherent_physical_reenrollment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            manager = FakeManager()
+            path.chmod(0o400)
+            with self.execution_observation(spec, digest):
+                controller.FixedController(path, size, digest, manager).start()
+            self.assertEqual(manager.starts, 1)
+            state = pathlib.Path(spec["state_root"])
+            retained = state.with_name("retained-original-state")
+            state.rename(retained)
+            state.mkdir(mode=0o700)
+            lock = state / "launch.lock"
+            lock.touch(mode=0o600)
+            spec.update(state_root_device=state.stat().st_dev, state_root_inode=state.stat().st_ino,
+                        launch_lock_device=lock.stat().st_dev, launch_lock_inode=lock.stat().st_ino)
+            path.chmod(0o600)
+            path.write_bytes(controller.canonical(spec) + b"\n")
+            path.chmod(0o400)
+            with mock.patch.multiple(controller, ADMITTED_SPEC_PATH=path,
+                                     ADMITTED_SPEC_BYTES=size, ADMITTED_SPEC_SHA256=digest), \
+                 mock.patch.object(controller.sys, "argv", ["controller", "start"]), \
+                 mock.patch.object(controller, "FixedController") as construction, \
+                 mock.patch.object(controller.sys, "stderr", io.StringIO()) as diagnostic:
+                self.assertEqual(controller.main(), 1)
+                self.assertIn("independently admitted bytes", diagnostic.getvalue())
+                construction.assert_not_called()
+            self.assertTrue((retained / "launch-intent.v1.json").is_file())
+            self.assertEqual(manager.starts, 1)
+
+    def test_main_rejects_wrong_anchor_and_changed_physical_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            raw = path.read_bytes()
+            for changed_fields in (False, True):
+                with self.subTest(changed_fields=changed_fields):
+                    path.chmod(0o600)
+                    if changed_fields:
+                        spec["launch_lock_inode"] += 1
+                        path.write_bytes(controller.canonical(spec) + b"\n")
+                    else:
+                        path.write_bytes(raw)
+                    path.chmod(0o400)
+                    with mock.patch.multiple(controller, ADMITTED_SPEC_PATH=path,
+                                             ADMITTED_SPEC_BYTES=size,
+                                             ADMITTED_SPEC_SHA256=digest if changed_fields else "0" * 64), \
+                         mock.patch.object(controller.sys, "argv", ["controller", "start"]), \
+                         mock.patch.object(controller, "FixedController") as construction, \
+                         mock.patch.object(controller.sys, "stderr", io.StringIO()):
+                        self.assertEqual(controller.main(), 1)
+                        construction.assert_not_called()
+
+    def test_intent_and_projection_retain_executed_controller_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, path, size, digest = self.fixture(pathlib.Path(temporary).resolve())
+            replacement = pathlib.Path(temporary) / "replaced-controller.py"
+            replacement.write_text("replacement bytes\n")
+            captured = controller.__executed_source_sha256__
+            with mock.patch.object(controller, "__file__", str(replacement)):
+                intent = controller.intent_record(spec, path.read_bytes(), digest)
+                value = controller.FixedController(path, size, digest, FakeManager()).status()
+            self.assertEqual(intent["controller_sha256"], captured)
+            self.assertEqual(value["execution"]["controller_sha256"], captured)
+            self.assertNotEqual(captured, controller.digest_path(replacement))
+            with mock.patch.object(controller, "__executed_source_sha256__", None):
+                with self.assertRaisesRegex(controller.Refusal, "retained source identity"):
+                    controller.intent_record(spec, path.read_bytes(), digest)
+
+    def test_direct_cli_capture_executes_bytes_it_identifies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "controller-fixture.py"
+            raw = pathlib.Path(controller.__file__).read_bytes().replace(
+                b"raise SystemExit(main())", b"print(executed_source_sha256()); raise SystemExit(0)"
+            )
+            path.write_bytes(raw)
+            result = controller.subprocess.run([sys.executable, "-I", "-B", str(path)],
+                                               capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stdout.decode().strip(), controller.digest_bytes(raw))
+
+    def test_manager_properties_are_complete_unique_and_typed(self) -> None:
+        valid = FakeManager().query("fixture")["properties"]
+        wire = "".join(f"{key}={value}\n" for key, value in valid.items()).encode()
+        cases = [b"", b"MainPID=0\n", wire + b"MainPID=0\n", wire + b"unknown=value\n",
+                 wire.replace(b"MainPID=0", b"MainPID=oops"),
+                 wire.replace(b"LoadState=not-found", b"LoadState=unknown"),
+                 wire.replace(b"ActiveState=inactive", b"ActiveState=unknown"),
+                 wire.replace(b"SubState=dead", b"SubState=unknown"),
+                 wire.replace(b"InvocationID=", b"InvocationID=bad"),
+                 wire.replace(b"MainPID=0", b"MainPID=-1"), wire + b"unframed\n"]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                with mock.patch.object(controller.subprocess, "run",
+                                       return_value=mock.Mock(returncode=0, stdout=raw)):
+                    manager = controller.SystemdUserManager()
+                    self.assertEqual(manager.query("fixture")["state"], "NOT_OBSERVABLE")
+                    self.assertEqual(controller.manager_occurrence(manager, {"producer_unit": "fixture"}, [], "0" * 64)["state"], "NOT_OBSERVABLE")
+        for key in valid:
+            altered = dict(valid)
+            altered[key] = None
+            manager = mock.Mock()
+            manager.query.return_value = {"state": "OBSERVED", "properties": altered}
+            self.assertEqual(controller.manager_occurrence(manager, {"producer_unit": "fixture"}, [], "0" * 64)["state"], "NOT_OBSERVABLE")
+
+    def test_invalid_proc_encoding_is_not_observable(self) -> None:
+        manager = FakeManager()
+        manager.active = True
+        for where in ("argv", "environment"):
+            with self.subTest(where=where), \
+                 mock.patch.object(controller, "process_start_ticks", return_value=10), \
+                 mock.patch.object(controller.os, "readlink", return_value="/fixture"), \
+                 mock.patch.object(pathlib.Path, "read_bytes", side_effect=[
+                     b"\xff\0" if where == "argv" else b"python\0",
+                     b"CONSTELLATION_FIXED_DEMO_SPEC_SHA256=\xff\0" if where == "environment" else b"",
+                 ]):
+                value = controller.manager_occurrence(manager, {"producer_unit": "fixture"}, [], "0" * 64)
+                self.assertEqual(value["state"], "NOT_OBSERVABLE")
+
+    def test_refusal_preserves_nq_owner_and_docket_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            spec, _path, _size, _digest = self.fixture(pathlib.Path(temporary).resolve())
+            root = pathlib.Path(spec["run_root"])
+            root.mkdir()
+            (root / "REFUSAL.json").write_text("fixture")
+            runner, nq = mock.Mock(), mock.Mock()
+            nq.load_recovery.return_value = {"run_id": spec["run_id"],
+                "harness_subject": spec["nq_harness"]["subject"],
+                "composition": {"subject": spec["composition_subject"]},
+                "refusal": {"reason": "fixture refusal"}, "effect_outcome": "NOT_RUN"}
+            with mock.patch.object(controller, "load_owner_modules", return_value=(runner, nq)):
+                value = controller.owner_terminal(spec)
+            self.assertEqual(value["owner"], "NQ-ng")
+            self.assertEqual(value["validator"], "Docket")
+            self.assertEqual(value["state"], "REFUSED")
+            runner.check_refusal.assert_called_once_with(root, nq)
+
     def test_checker_substitution_refuses_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             spec, _path, _size, _digest = self.fixture(pathlib.Path(temporary).resolve())

@@ -3,13 +3,57 @@
 **Status:** `CORRECTION_READY_FOR_INDEPENDENT_REAUDIT`
 **Accepted base:** `8ac6ea566c2b530f03ee307f0149d2e860fd2583`
 **Live two-VM exercise:** `NOT_RUN`
-**AG-hosted screen:** `NOT_STARTED`
+**AG-hosted screen:** separate candidate; its acceptance does not qualify this controller
 
 This checkpoint adds only the Docket-owned one-shot launch/status adapter and
 the missing terminal-refusal reopener defined by
 `docs/governed-runtime/operator-beta-fixed-demo-controller-v1.md`.
 
-## Current correction custody — 2026-09-08
+## Current correction following rejected b95b77e — 2026-09-08
+
+Independent review rejected `b95b77ee7e4e3ade48ccc0b1773f6679525e1fa3` on
+four concrete boundaries. This correction independently pins the full installed
+spec bytes, records the exact captured controller execution digest, closes the
+five-property manager response with malformed `/proc` handling, and separates
+NQ-ng refusal ownership from Docket validation. Production spec enrollment is
+performed and retained by the integration owner before literals are frozen.
+No runtime self-enrollment is permitted.
+
+Integration owner physical enrollment is retained at
+`/data/git/.campaign-artifacts/m2-showing-supervision-001/SPEC-ENROLLMENT.json`:
+spec 3677 bytes, SHA-256
+`7dc3825bd3c524c932c04684d2b34db20ecf28d9fe44524740823439410648ef`,
+spec mode 0400, state 0700, lock 0600. These exact literals are frozen in the
+controller. Enrollment made no manager call or producer launch and is not
+qualification acceptance.
+
+The focused controller/refusal gate passed 42 cases, including seven new controls:
+coherent replacement of the physical root/lock/spec after a retained first intent
+is refused by the actual CLI construction path; wrong compiled anchor and changed
+physical fields refuse before construction; source identity survives a different
+`__file__`; direct CLI captures and executes its identified bytes; manager output
+requires complete, unique typed fields; invalid process encoding withdraws
+observation; and refusal retains NQ-ng owner plus Docket validator.
+
+After freezing the enrollment literals, the same 42 cases passed in 0.954 seconds;
+the explicit injected boundary control passed those 42 tests and then exited 1
+as required (0.962 seconds for tests). `git diff --check` passed.
+
+A query-only direct CLI invocation against the enrolled physical spec returned
+`NO_INTENT_RECORDED`, no disagreements, ten missing evidence entries and no
+terminal result. The executing controller digest matched its captured source.
+Within the sandbox, manager access was `NOT_OBSERVABLE` with the explicit bus
+permission reason; this observation makes no process-exit claim. No launch was
+performed.
+
+This evidence remains local fixture qualification. The trusted installed
+entrypoint premise and factual-versus-admitted execution identity are explicit
+in the controller design document. Capsule bytes, accepted producer, checker,
+Rust source and package dependencies are unchanged. Earlier broad gate results
+and failures below remain attached to their original subjects. The correction
+requires independent re-audit of its exact final commit before live exercise.
+
+## Prior correction custody — retained history
 
 Independent review rejected `864c353cea7399153edc9d7fea4f24a420025a86`.
 Corrections address fixed Docket admission, separate controller and
