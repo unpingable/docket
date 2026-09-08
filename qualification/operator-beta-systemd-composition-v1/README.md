@@ -1,7 +1,7 @@
 # Operator-beta AG → Docket → systemd composition fixture
 
 **Recorded:** 2026-09-08
-**State:** `LIVE_RUN_002_SEALED__SOURCE_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT`
+**State:** `RUN_002_ACCEPTED__CLOSEOUT_READY_FOR_INDEPENDENT_AUDIT`
 
 This directory is a qualification-only adapter around existing owners. It adds no
 Docket runtime state, transport, effect family, daemon, retry controller, or product
@@ -172,12 +172,11 @@ owner suites pass.
 
 ## Next gate
 
-1. Independently re-audit the non-rewriting source-framing checker correction and the
-   unchanged exact run-002 archive.
-2. If accepted, retain a closed qualification receipt and campaign-owned archive copy
-   without widening the run's declared limitations.
-3. A refusal or indeterminate result remains a legitimate terminal outcome and must not
-   be relabeled as success.
+1. Independently audit the closed receipt, byte-identical preservation copy, closeout
+   gate, deterministic control, and Engineering/Research/Product/Drift return.
+2. Publish only the exact accepted closeout checkpoint under established branch custody.
+3. Hand the bounded result and its unchanged limitations to main-loop integration/read
+   projection; no deployment or production transition is implied.
 
 No publication, default-branch merge, deployment, target activation outside the
 fixture, or productization follows from this checkpoint.

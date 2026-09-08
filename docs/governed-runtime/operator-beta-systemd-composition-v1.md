@@ -1,7 +1,7 @@
 # Operator-beta AG systemd composition contract
 
 **Recorded:** 2026-09-07
-**Status:** `LIVE_RUN_002_SEALED__SOURCE_FRAMING_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT`
+**Status:** `RUN_002_ACCEPTED__CLOSEOUT_READY_FOR_INDEPENDENT_AUDIT`
 
 **Docket owner base:** `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b`
 **AG/Docket successor reconciliation result:**
