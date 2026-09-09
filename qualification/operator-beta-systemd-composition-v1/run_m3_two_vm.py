@@ -43,15 +43,15 @@ def source_fact(root, expected):
     return {'head': head, 'tree': tree}
 
 
-def checker_contract(producer_root, checker_root, producer_head, checker_head):
+def checker_contract(producer_root, checker_root, producer_head, checker_head, relative=HOST_RELATIVE):
     """B may change only the two producer pins; every imported source is A's."""
     source = source_fact(producer_root, producer_head)
     checker = source_fact(checker_root, checker_head)
     require(producer_root != checker_root, 'separate checker tree required')
     changed = subprocess.check_output(['git', '-C', str(checker_root), 'diff', '--name-only',
         producer_head, checker_head], text=True).splitlines()
-    require(changed == [HOST_RELATIVE], 'checker differs outside exact host pins')
-    candidate = (checker_root / HOST_RELATIVE).read_text()
+    require(changed == [relative], 'checker differs outside exact host pins')
+    candidate = (checker_root / relative).read_text()
     parsed = ast.parse(candidate)
     values = {node.targets[0].id: ast.literal_eval(node.value) for node in parsed.body
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
@@ -59,7 +59,7 @@ def checker_contract(producer_root, checker_root, producer_head, checker_head):
     require(values == {'PRODUCER_HEAD': source['head'], 'PRODUCER_TREE': source['tree']}, 'checker producer pins differ')
     for name, value in values.items():
         candidate = candidate.replace(name + " = '" + value + "'", name + " = 'UNFROZEN'")
-    require(candidate == (producer_root / HOST_RELATIVE).read_text(), 'checker source differs beyond two literal pins')
+    require(candidate == (producer_root / relative).read_text(), 'checker source differs beyond two literal pins')
     return source, checker
 
 
@@ -85,7 +85,16 @@ def extract(archive, destination):
         stream.extractall(destination, filter='data')
 
 
-def producer_class(nq):
+def producer_class(nq, controller=False):
+    # Exactly two fixed qualification variants, not a configurable workflow.
+    matrix_inventory, matrix_check = inventory, check_matrix
+    batch_name, checker_name = 'm3_guest_matrix.py', 'm3_case_check.py'
+    relative, schema = HOST_RELATIVE, 'constellation.m3-governed-vm-result/v1'
+    if controller:
+        import m3_controller_matrix as loss
+        matrix_inventory, matrix_check = loss.inventory, loss.check_matrix
+        batch_name, checker_name = 'm3_controller_matrix.py', 'm3_controller_loss_check.py'
+        relative, schema = loss.HOST_RELATIVE, loss.SCHEMA
     parent = composition.producer_class(nq)
     class M3Producer(parent):
         m3_started = False
@@ -163,7 +172,7 @@ for address in ('127.0.0.1','192.168.76.1','192.168.76.2'):
                 'producer': source_fact(HERE.parents[1], self.args.composition_subject),
                 'checker': source_fact(self.args.checker_source, self.args.checker_subject)}
             checker_contract(HERE.parents[1], self.args.checker_source,
-                self.args.composition_subject, self.args.checker_subject)
+                self.args.composition_subject, self.args.checker_subject, relative)
             require(shutil.disk_usage(self.output.parent).free > 25769803776, 'global 24GiB floor')
             return facts
 
@@ -261,9 +270,9 @@ for address in ('127.0.0.1','192.168.76.1','192.168.76.2'):
             # Backup tmpfs and held writer enrollment must follow the ordinary
             # reboot; creating them in install_inputs would lose the mount cut.
             self.install_m3_inputs(target)
-            checker = '/opt/constellation-m3/checker/qualification/operator-beta-systemd-composition-v1/m3_case_check.py'
-            checker_sha = composition.sha256(self.args.checker_source / 'qualification/operator-beta-systemd-composition-v1/m3_case_check.py')
-            batch = '/opt/constellation-m3/producer/qualification/operator-beta-systemd-composition-v1/m3_guest_matrix.py'
+            checker = '/opt/constellation-m3/checker/qualification/operator-beta-systemd-composition-v1/' + checker_name
+            checker_sha = composition.sha256(self.args.checker_source / ('qualification/operator-beta-systemd-composition-v1/' + checker_name))
+            batch = '/opt/constellation-m3/producer/qualification/operator-beta-systemd-composition-v1/' + batch_name
             self.state('m3_matrix_starting', 'start exactly one guest systemd batch; never retry')
             self.ssh(target, 'sudo systemd-run --unit=' + MATRIX_UNIT + ' --property=Type=exec --property=RemainAfterExit=yes '
                 '--property=RuntimeMaxSec=8100 /usr/bin/python3 ' + batch + ' --checker ' + checker + ' --checker-sha256 ' + checker_sha)
@@ -292,7 +301,7 @@ for address in ('127.0.0.1','192.168.76.1','192.168.76.2'):
             archive = self.output / 'evidence/m3-evidence.tar'
             self.scp_from(target, '/home/betaoperator/m3-evidence.tar', archive)
             extract(archive, self.output / 'evidence/m3')
-            check_matrix(self.output / 'evidence/m3')
+            matrix_check(self.output / 'evidence/m3')
             self.ssh(target, 'set -eu; sudo systemctl stop ' + MATRIX_UNIT + '; sudo dpkg -r constellation-m3-driver; '
                 'sudo dpkg -r ' + composition.COMPOSITION_PACKAGE_NAME + '; '
                 'sudo rm -rf /var/lib/constellation-operator-beta-composition; '
@@ -310,11 +319,11 @@ for address in ('127.0.0.1','192.168.76.1','192.168.76.2'):
             key = self.output / 'runtime/id_ed25519'
             if key.exists():
                 key.unlink()
-            result = {'schema': 'constellation.m3-governed-vm-result/v1', 'run_id': self.run_id,
+            result = {'schema': schema, 'run_id': self.run_id,
                 'producer': self.input_facts['m3_sources']['producer'], 'checker': self.input_facts['m3_sources']['checker'],
-                'disposition': 'FINITE_GOVERNED_FIXTURE_MATRIX_COMPLETED', 'count': len(inventory()),
+                'disposition': 'FINITE_GOVERNED_FIXTURE_MATRIX_COMPLETED', 'count': len(matrix_inventory()),
                 'completed_at': nq.utc_now(), 'production': 'NOT_RUN', 'deployment': 'NOT_RUN',
-                'controller_loss': 'NOT_RUN_SEPARATE_GATE', 'independent_review': 'REQUIRED',
+                'controller_loss': 'FINITE_CONTROLLER_MATRIX_COMPLETED' if controller else 'NOT_RUN_SEPARATE_GATE', 'independent_review': 'REQUIRED',
                 'retained_guest_files': 'STOPPED_CASE_CONTENT_ARCHIVES_NOT_LIVE_INODE_CUSTODY',
                 'teardown_scope': 'CASE_UNITS_STOPPED_MOUNTS_ARCHIVED_AND_UNMOUNTED_PACKAGES_REMOVED_GUESTS_OFF;SOURCE_AND_UNIT_FILES_REMAIN_IN_OFFLINE_GUEST_DISKS'}
             self.last_completed = 'sealed'
@@ -378,15 +387,20 @@ def check_matrix(root, binary=None):
                 require(actual == observation['native_reexecution'], 'native retained replay differs')
 
 
-def check_run(root, nq):
+def check_run(root, nq, controller=False, producer_head=PRODUCER_HEAD, producer_tree=PRODUCER_TREE):
+    matrix_inventory, matrix_check = inventory, check_matrix
+    schema = 'constellation.m3-governed-vm-result/v1'
+    if controller:
+        import m3_controller_matrix as loss
+        matrix_inventory, matrix_check, schema = loss.inventory, loss.check_matrix, loss.SCHEMA
     require(root.resolve(strict=True) == root and root.is_dir(), 'physical run root required')
     result = read(root / 'M3-RESULT.json')
-    require(result['schema'] == 'constellation.m3-governed-vm-result/v1', 'not an M3 terminal')
-    require(result['producer'] == {'head': PRODUCER_HEAD, 'tree': PRODUCER_TREE}, 'checker not bound to exact producer')
+    require(result['schema'] == schema, 'not the exact M3 variant terminal')
+    require(result['producer'] == {'head': producer_head, 'tree': producer_tree}, 'checker not bound to exact producer')
     require(source_fact(HERE.parents[1], result['checker']['head']) == result['checker'], 'exact checker source differs')
-    require(result['disposition'] == 'FINITE_GOVERNED_FIXTURE_MATRIX_COMPLETED' and result['count'] == len(inventory()), 'wrong M3 terminal')
+    require(result['disposition'] == 'FINITE_GOVERNED_FIXTURE_MATRIX_COMPLETED' and result['count'] == len(matrix_inventory()), 'wrong M3 terminal')
     require(result['production'] == result['deployment'] == 'NOT_RUN' and result['independent_review'] == 'REQUIRED'
-        and result['controller_loss'] == 'NOT_RUN_SEPARATE_GATE', 'stronger scope asserted')
+        and result['controller_loss'] == ('FINITE_CONTROLLER_MATRIX_COMPLETED' if controller else 'NOT_RUN_SEPARATE_GATE'), 'stronger scope asserted')
     manifest = root / 'M3-ARTIFACTS.json'
     require(composition.sha256(manifest) == result['manifest_sha256'], 'manifest identity differs')
     require(json.loads(manifest.read_bytes()) == make_manifest(root), 'physical inventory changed')
@@ -399,7 +413,7 @@ def check_run(root, nq):
         and custody['sources']['application']['head'] == inputs.APP_HEAD, 'source custody differs')
     for name, digest in custody['archives'].items():
         require(Path(name).name == name and composition.sha256(root / 'input' / name) == digest, 'source archive/input differs')
-    for role, expected in [('producer', PRODUCER_HEAD), ('checker', result['checker']['head'])]:
+    for role, expected in [('producer', producer_head), ('checker', result['checker']['head'])]:
         with tempfile.TemporaryDirectory(prefix='m3-source-reopen.') as temporary:
             require(archive_source(HERE.parents[1], expected, Path(temporary) / 'source.tar')
                 == custody['archives']['m3-' + role + '.tar'], 'Git source/archive correspondence differs')
@@ -410,13 +424,13 @@ def check_run(root, nq):
     require(composition.sha256(nq_package) == inputs.PINS['nq_package'], 'native package differs')
     with tempfile.TemporaryDirectory(prefix='m3-native-reopen.') as temporary:
         nq.run(['dpkg-deb', '-x', str(nq_package), temporary])
-        check_matrix(root / 'evidence/m3', Path(temporary) / 'usr/bin/nq')
+        matrix_check(root / 'evidence/m3', Path(temporary) / 'usr/bin/nq')
     composition.verify_composition_chain(root, result, nq)
     composition.verify_nq_and_teardown(root, result, nq)
     print('M3_VM_EVIDENCE_REOPENED_NOT_PRODUCTION')
 
 
-def main():
+def main(controller=False, producer_head=PRODUCER_HEAD, producer_tree=PRODUCER_TREE):
     parser = composition.parser()
     run = parser._subparsers._group_actions[0].choices['run']
     for name in ('nq-receipt', 'driver-deb', 'driver-receipt', 'websockets', 'app-source', 'checker-source'):
@@ -426,11 +440,11 @@ def main():
     nq = composition.load_module('nq_m3_lifecycle', args.nq_harness)
     composition.exact_repository(args.nq_harness, composition.NQ_HEAD, composition.NQ_TREE, nq)
     if args.command == 'check-run':
-        check_run(args.path, nq)
+        check_run(args.path, nq, controller, producer_head, producer_tree)
     elif args.command == 'check-refusal':
         raise ValueError('M3 refusal requires retained guest/process reconciliation; no automatic recovery')
     else:
-        producer_class(nq)(args).execute()
+        producer_class(nq, controller)(args).execute()
 
 
 if __name__ == '__main__':
