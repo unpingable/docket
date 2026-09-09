@@ -459,6 +459,13 @@ def build_case(
     extract_source(docket_source, docket)
     example = ag / "crates/ag-app/examples/operator_beta_systemd_composition.rs"
     shutil.copyfile(driver, example)
+    manifest = ag / "crates/ag-app/Cargo.toml"
+    manifest_text = manifest.read_text()
+    if manifest_text.count("[features]\n") != 1:
+        raise Refusal("AG fixture feature seam differs")
+    # Declares the companion-only compile guard; the ordinary composition
+    # example remains built without this feature and keeps its fixed contract.
+    manifest.write_text(manifest_text.replace("[features]\n", "[features]\nm3-labelwatch = []\n"))
     for source, vendor_path in ((ag, "/ag-vendor"), (docket, "/docket-vendor")):
         config = source / ".cargo/config.toml"
         config.parent.mkdir(exist_ok=True)
