@@ -453,6 +453,8 @@ def producer_class(nq: Any) -> type:
             self.complete_phase("composed_store_custody_audited", "perform bounded teardown")
 
         def teardown(self, control: Any, target: Any) -> None:
+            day_two = load_module("composition_day_two", HERE / "day_two.py")
+            day_two.exercise(self, nq, (control, target))
             result = self.ssh(
                 target,
                 f"sudo dpkg -r {COMPOSITION_PACKAGE_NAME}; "
