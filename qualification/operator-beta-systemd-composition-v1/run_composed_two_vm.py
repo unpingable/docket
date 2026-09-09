@@ -455,6 +455,8 @@ def producer_class(nq: Any) -> type:
         def teardown(self, control: Any, target: Any) -> None:
             day_two = load_module("composition_day_two", HERE / "day_two.py")
             day_two.exercise(self, nq, (control, target))
+            cold = load_module("composition_day_two_cold", HERE / "day_two_cold.py")
+            cold.exercise(self, nq, control)
             result = self.ssh(
                 target,
                 f"sudo dpkg -r {COMPOSITION_PACKAGE_NAME}; "
@@ -887,6 +889,8 @@ def check_run(path: pathlib.Path, nq: Any) -> None:
         raise nq.Refusal("retained composition fixture differs")
     verify_composition_chain(path, result, nq)
     verify_nq_and_teardown(path, result, nq)
+    cold_checker = load_module("composition_cold_checker", HERE / "day_two_cold_check.py")
+    cold_checker.verify(path, nq)
     print(json.dumps({"result": "COMPOSED_RUN_REOPENED", "run_id": result["run_id"]}, sort_keys=True))
 
 
