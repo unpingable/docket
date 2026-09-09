@@ -42,7 +42,7 @@ def exercise(producer, nq, control):
         producer.state('cold_cohort_' + name, 'execute one explicit step; no automatic retry')
         result = producer.ssh(control, prefix + shlex.quote(name), check=False)
         step_returns.append({'step': name, 'exit': result.returncode})
-        nq.atomic_write(producer.output / 'evidence/cold-step-returns.json', nq.canonical(step_returns) + b'\n', 0o400)
+        nq.atomic_write(producer.output / 'evidence/cold-step-returns.json', nq.canonical({'steps': step_returns}) + b'\n', 0o400)
         if result.returncode != expected:
             raise nq.Refusal(f'cold-cohort {name}: expected {expected}, observed {result.returncode}')
 

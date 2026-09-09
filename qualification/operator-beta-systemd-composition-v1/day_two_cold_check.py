@@ -25,7 +25,7 @@ def verify_manifests(manifests, first_baseline, second_baseline, nq):
         raise nq.Refusal('post-cut forward history is absent or not preserved')
 
 
-def verify(path, nq):
+def verify(path, nq, owner_json_record):
     evidence = path / 'evidence'
     here = pathlib.Path(__file__).resolve().parent
     for name in ('day_two_cold.py', 'day_two_cold_guest.py', 'day_two_restore.py'):
@@ -39,8 +39,10 @@ def verify(path, nq):
         if hashlib.sha256((path / 'input' / name).read_bytes()).hexdigest() != digest:
             raise nq.Refusal('cold-cohort input package/store identity mismatch')
     returns = nq.load_json_artifact(evidence / 'cold-step-returns.json', 'cold steps')
-    verify_steps(returns, nq)
-    admission = nq.load_json_artifact(evidence / 'cold-fresh-admission.json', 'cold admission')
+    if set(returns) != {'steps'}:
+        raise nq.Refusal('cold step record is not closed')
+    verify_steps(returns['steps'], nq)
+    admission = owner_json_record(evidence / 'cold-fresh-admission.json', 'cold admission', nq)
     diagnostic = nq.load_json_artifact(evidence / 'cold-fresh-diagnostic.json', 'cold diagnostic')
     nq.verify_diagnostic_artifact(diagnostic, profile='nq.http_endpoint', condition='unresolved', instance='http-restart', bindings=nq.load_json_artifact(evidence / 'bindings.json', 'bindings'))
     with tarfile.open(evidence / 'cold-cohort-private.tar', 'r:') as archive:
@@ -58,7 +60,14 @@ def verify(path, nq):
             return archive.extractfile(member).read()
 
         def record(name):
-            return json.loads(raw(name))
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise nq.Refusal('cold evidence has duplicate JSON fields')
+                    result[key] = value
+                return result
+            return json.loads(raw(name), object_pairs_hook=unique)
 
         for phase, binary in (
             ('OLD_ARCHIVED', OLD_BINARY), ('NEW_ONE_PREACTIVATION', NEW_BINARY),
@@ -100,7 +109,7 @@ def verify(path, nq):
                 target.write_bytes(raw(name))
                 manifests[name] = logical_manifest(target)
             verify_manifests(manifests, record('cut-one-baseline.json'), record('cut-two-baseline.json'), nq)
-        if record('RESULT.json') != nq.load_json_artifact(evidence / 'cold-cohort-result.json', 'cold result'):
+        if record('RESULT.json') != owner_json_record(evidence / 'cold-cohort-result.json', 'cold result', nq):
             raise nq.Refusal('cold public and retained procedure results disagree')
         if record('RESULT.json') != {'schema': 'constellation.m4.cold_cohort_fixture.v1', 'disposition': 'COLD_COHORT_VM_DEMONSTRATED', 'old_binary_sha256': OLD_BINARY, 'new_binary_sha256': NEW_BINARY, 'fresh_admission': True, 'preactivation_rollback': 'EXACT_OLD_BINARY_AND_ROWS_REOPENED', 'post_cut_rollback': 'NOT_EXECUTED_FORWARD_ONLY', 'interruption_scope': 'PROCESS_EXIT_AFTER_COMPLETED_STEPS_NOT_MID_DPKG', 'history_authorizes_effects': False, 'human_trial': 'NOT_RUN'}:
             raise nq.Refusal('cold procedure claim exceeds the checked scope')

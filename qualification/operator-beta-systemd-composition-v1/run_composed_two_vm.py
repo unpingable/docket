@@ -890,7 +890,7 @@ def check_run(path: pathlib.Path, nq: Any) -> None:
     verify_composition_chain(path, result, nq)
     verify_nq_and_teardown(path, result, nq)
     cold_checker = load_module("composition_cold_checker", HERE / "day_two_cold_check.py")
-    cold_checker.verify(path, nq)
+    cold_checker.verify(path, nq, owner_json_record)
     print(json.dumps({"result": "COMPOSED_RUN_REOPENED", "run_id": result["run_id"]}, sort_keys=True))
 
 
