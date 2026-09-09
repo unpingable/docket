@@ -5,11 +5,13 @@ Each invocation is an explicitly ordered fixture step. Phase records describe
 completed commands; they confer no authority and never trigger automatic retry.
 """
 import hashlib
+from contextlib import closing
 import json
 import os
 import pathlib
 import pwd
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -25,6 +27,22 @@ NEW_PACKAGE = 'bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca'
 
 def digest(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+
+def retain_restored_snapshot(source, destination):
+    """Preserve the stopped restore cut before service lifecycle adds history."""
+    destination.touch(mode=0o600, exist_ok=False)
+    with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True)) as reader:
+        with closing(sqlite3.connect(destination)) as writer:
+            reader.backup(writer)
+    with destination.open('rb') as stream:
+        os.fsync(stream.fileno())
+    descriptor = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    assert logical_manifest(source) == logical_manifest(destination)
 
 
 def main(mode):
@@ -157,6 +175,7 @@ def main(mode):
             install('/home/betaoperator/m4-old-nq.deb', OLD_PACKAGE, OLD_BINARY, 'rollback-old-install')
             nq('rollback-absent-restore', ['restore', str(ROOT / 'old-archive/db/nq.db'), str(ROOT / 'rollback.sqlite')])
             assert logical_manifest(ROOT / 'rollback.sqlite') == logical_manifest(ROOT / 'old-archive/db/nq.db')
+            retain_restored_snapshot(ROOT / 'rollback.sqlite', ROOT / 'rollback-restored.sqlite')
             config(ROOT / 'rollback.sqlite', ROOT / 'rollback-admissions')
             nq('rollback-reopen', ['status', 'export'])
             call('rollback-start', ['systemctl', 'start', 'nqd.service'])
@@ -175,13 +194,13 @@ def main(mode):
             assert digest('/usr/bin/nq') == NEW_BINARY
             # Retain both cohorts. Do not issue any old restore after new work.
             nq('forward-status', ['status', 'export'])
-            nq('forward-backup', ['backup', str(ROOT / 'forward-backup.sqlite')])
             config(ROOT / 'cut-two/nq.sqlite', ROOT / 'cut-two/admissions')
             # Service-readiness test only: fresh admission/diagnostic above was
             # one-shot. Do not silently start scheduled collection here.
             call('forward-start', ['systemctl', 'start', 'nqd.service'])
             ready('forward-ready')
             stop('forward-stop')
+            nq('forward-backup', ['backup', str(ROOT / 'forward-backup.sqlite')])
             nq('final-old-archive-verify', ['admin', 'archive-verify', str(ROOT / 'old-archive')], str(ROOT / 'old-archive/bin/nq'))
             save('RESULT.json', {'schema': 'constellation.m4.cold_cohort_fixture.v1', 'disposition': 'COLD_COHORT_VM_DEMONSTRATED', 'old_binary_sha256': OLD_BINARY, 'new_binary_sha256': NEW_BINARY, 'fresh_admission': True, 'preactivation_rollback': 'EXACT_OLD_BINARY_AND_ROWS_REOPENED', 'post_cut_rollback': 'NOT_EXECUTED_FORWARD_ONLY', 'interruption_scope': 'PROCESS_EXIT_AFTER_COMPLETED_STEPS_NOT_MID_DPKG', 'history_authorizes_effects': False, 'human_trial': 'NOT_RUN'})
             CONFIG.unlink()

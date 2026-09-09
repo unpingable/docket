@@ -21,6 +21,13 @@ admission, or actual recovery outcomes; these remain NOT_RUN until reopened.
 
 ## Procedure and historical evidence
 
+Cold VM002 completed its scripted steps but its checker refused: final restored
+and forward stores included service lifecycle status writes after the compared
+backup cuts. That result remains NOT_ACCEPTED. The corrected producer retains
+an entire pre-restart restored snapshot for comparison to the archive, and
+takes the forward backup after final service stop. No status table or row
+content is excluded. A separate run must qualify these corrected cuts.
+
 Candidate procedure, not yet qualified as a package/service transition. The
 local stopped-copy witness is `day_two_cold_cut.py`; it establishes no human
 operator trial or current authorization from historical records.

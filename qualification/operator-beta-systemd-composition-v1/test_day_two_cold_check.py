@@ -25,9 +25,9 @@ class ColdCheckerTests(unittest.TestCase):
         old = {'rows': 1, 'sha256': 'old'}
         empty = {'rows': 0, 'sha256': 'empty'}
         post = {'rows': 1, 'sha256': 'post'}
-        valid = {'old-archive/db/nq.db': old, 'rollback.sqlite': old, 'cut-one/nq.sqlite': empty, 'cut-two/nq.sqlite': post, 'forward-backup.sqlite': post}
+        valid = {'old-archive/db/nq.db': old, 'rollback-restored.sqlite': old, 'cut-one/nq.sqlite': empty, 'cut-two/nq.sqlite': post, 'forward-backup.sqlite': post}
         checker.verify_manifests(valid, empty, empty, nq)
-        for key in ('rollback.sqlite', 'cut-one/nq.sqlite', 'cut-two/nq.sqlite', 'forward-backup.sqlite'):
+        for key in ('rollback-restored.sqlite', 'cut-one/nq.sqlite', 'cut-two/nq.sqlite', 'forward-backup.sqlite'):
             changed = copy.deepcopy(valid)
             changed[key] = {**changed[key], 'sha256': 'same-count-different-content'}
             with self.subTest(key=key), self.assertRaises(ValueError):
