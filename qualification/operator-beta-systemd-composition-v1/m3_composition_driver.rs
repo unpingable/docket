@@ -93,13 +93,19 @@ fn bind_cleanup(step: &serde_json::Value, request: &Request) -> Result<(), Strin
     }
     let hold = json!({"schema":"labelwatch.maintenance-hold/v1", "operation":step["operation"],
         "database":step["source"], "manifest_sha256":cut, "application_revision":step["revision"]});
-    if request["expected_hold_sha256"] != hex_sha(&app_bytes(&hold)?) {
+    let hold_sha = hex_sha(&app_bytes(&hold)?);
+    if request["expected_hold_sha256"] != hold_sha {
         return Err("cleanup hold identity differs".into());
     }
     let mut writers = serde_json::Map::new();
     for role in ["main", "discovery"] {
         let path = step["ready_records"][role].as_str().ok_or("enrolled readiness missing")?;
         let (ready, _) = input(std::path::Path::new(path))?;
+        if ready.as_object().map(|value|value.len()) != Some(7)
+            || ready["schema"] != "labelwatch.held-writer-ready/v1" || ready["operation"] != step["operation"]
+            || ready["role"] != role || ready["hold_sha256"] != hold_sha || ready["verification_sha256"] != cut {
+            return Err("readiness belongs to another operation/role/hold/cut".into());
+        }
         writers.insert(role.into(), json!({"pid":ready["pid"], "start_ticks":ready["start_ticks"]}));
     }
     if held["writer_identities"] != Value::Object(writers) { return Err("cleanup writer identities differ".into()); }

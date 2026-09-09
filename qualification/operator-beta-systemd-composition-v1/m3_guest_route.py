@@ -94,6 +94,14 @@ def bind_cleanup_request(step, request):
     expected_writers = {role: {key: value[key] for key in ('pid', 'start_ticks')} for role, value in ready.items()}
     hold = {'schema': 'labelwatch.maintenance-hold/v1', 'operation': step['operation'], 'database': step['source'],
             'manifest_sha256': required['expected_cut_sha256'], 'application_revision': step['revision']}
+    if set(ready) != {'main', 'discovery'}:
+        raise ValueError('both exact writer roles required')
+    for role, value in ready.items():
+        if (set(value) != {'schema', 'operation', 'role', 'pid', 'start_ticks', 'hold_sha256', 'verification_sha256'}
+                or value['schema'] != 'labelwatch.held-writer-ready/v1' or value['operation'] != step['operation']
+                or value['role'] != role or value['hold_sha256'] != digest(canonical(hold).rstrip(b'\n'))
+                or value['verification_sha256'] != required['expected_cut_sha256']):
+            raise ValueError('readiness record belongs to another operation/role/hold/cut')
     if held['writer_identities'] != expected_writers or request['expected_hold_sha256'] != digest(canonical(hold).rstrip(b'\n')):
         raise ValueError('native cleanup writer/hold enrollment differs')
     current = step

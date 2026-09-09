@@ -115,6 +115,9 @@ class EnrolledRouteTests(unittest.TestCase):
         request = {'held_request': held, 'backup': base['backup'], 'restore': base['restore'],
                    'backup_identity': identities['backup'], 'restore_identity': identities['restored'],
                    'expected_hold_sha256': route.digest(route.canonical(hold).rstrip(b'\n'))}
+        for number, role in enumerate(('main', 'discovery'), start=10):
+            Path(ready[role]).write_bytes(route.canonical({'schema': 'labelwatch.held-writer-ready/v1', 'operation': base['operation'], 'role': role,
+                'pid': number, 'start_ticks': number * 100, 'hold_sha256': request['expected_hold_sha256'], 'verification_sha256': cut}))
         route.bind_cleanup_request(cleanup, request)
         for field, value in [('operation', 'other-otherwise-valid-operation'), ('replacement_inode', 99), ('expected_cut_sha256', '0' * 64)]:
             substituted = copy.deepcopy(request)
@@ -125,6 +128,16 @@ class EnrolledRouteTests(unittest.TestCase):
         substituted['backup_identity']['inode'] = 999
         with self.assertRaises(ValueError):
             route.bind_cleanup_request(cleanup, substituted)
+        record_path = Path(ready['main'])
+        original = record_path.read_bytes()
+        import json
+        for key in ('operation', 'hold_sha256', 'verification_sha256'):
+            record = json.loads(original)
+            record[key] = 'otherwise-valid-foreign-binding'
+            record_path.write_bytes(route.canonical(record))
+            with self.assertRaisesRegex(ValueError, 'readiness record'):
+                route.bind_cleanup_request(cleanup, request)
+        record_path.write_bytes(original)
 
     def test_app_canonical_bytes_include_ascii_del_and_surrogate_escapes_without_newline(self):
         value = {'z': 'é😀\u007f\n\t\b\f\r\0\\"', 'a': [1, True, None]}
