@@ -71,16 +71,15 @@ fn app_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
         }
         Ok(out)
     }
-    let text =
-        match value {
-            Value::Null => "null".into(),
-            Value::Bool(value) => value.to_string(),
-            Value::Number(value) if value.is_i64() || value.is_u64() => value.to_string(),
-            Value::Number(_) => {
-                return Err("non-integral value outside fixed M3 manifest/binding schema".into())
-            }
-            Value::String(value) => string(value)?,
-            Value::Array(values) => format!(
+    let text = match value {
+        Value::Null => "null".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) if value.is_i64() || value.is_u64() => value.to_string(),
+        Value::Number(_) => {
+            return Err("non-integral value outside fixed M3 manifest/binding schema".into())
+        }
+        Value::String(value) => string(value)?,
+        Value::Array(values) => format!(
                 "[{}]",
                 values
                     .iter()
@@ -89,23 +88,23 @@ fn app_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
                     .collect::<Result<Vec<_>, _>>()?
                     .join(",")
             ),
-            Value::Object(values) => {
-                let mut entries: Vec<_> = values.iter().collect();
-                entries.sort_by(|a, b| a.0.cmp(b.0));
-                format!(
-                    "{{{}}}",
-                    entries
-                        .into_iter()
-                        .map(|(key, value)| Ok(format!(
-                            "{}:{}",
-                            string(key)?,
-                            String::from_utf8(app_bytes(value)?).expect("ASCII JSON")
-                        )))
-                        .collect::<Result<Vec<_>, String>>()?
-                        .join(",")
-                )
-            }
-        };
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            format!(
+                "{{{}}}",
+                entries
+                    .into_iter()
+                    .map(|(key, value)| Ok(format!(
+                        "{}:{}",
+                        string(key)?,
+                        String::from_utf8(app_bytes(value)?).expect("ASCII JSON")
+                    )))
+                    .collect::<Result<Vec<_>, String>>()?
+                    .join(",")
+            )
+        }
+    };
     Ok(text.into_bytes())
 }
 
