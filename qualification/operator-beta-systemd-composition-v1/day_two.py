@@ -6,7 +6,7 @@ import pathlib
 def exercise(producer, nq, guests):
     here = pathlib.Path(__file__).resolve().parent
     for guest in guests:
-        producer.state('day_two_' + guest.role, 'execute fixed packaged-owner maintenance; retain guest on failure')
+        producer.state('day_two_' + guest.role, 'execute fixed packaged-owner maintenance; retain overlays/logs on failure')
         producer.scp_to(guest, [here / 'day_two_guest.py', here / 'day_two_restore.py'], '/home/betaoperator/')
         producer.ssh(guest, "sudo install -d -o root -g root -m 0755 /usr/local/libexec/constellation-m4; "
                      "sudo install -o root -g root -m 0444 /home/betaoperator/day_two_guest.py /home/betaoperator/day_two_restore.py /usr/local/libexec/constellation-m4/; "

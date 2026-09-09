@@ -11,6 +11,7 @@ import os
 import pathlib
 import pwd
 import subprocess
+import sys
 import time
 from day_two_restore import logical_manifest
 
@@ -119,8 +120,14 @@ def main():
         (ROOT / 'RESULT.json').write_text(json.dumps(result, sort_keys=True) + '\n')
         CONFIG.unlink()
     except BaseException:
-        subprocess.run(['systemctl', 'stop', 'nqd.service'], capture_output=True, timeout=90)
-        (ROOT / 'INTERRUPTED.json').write_text(json.dumps({'disposition': 'RETAIN_AND_INSPECT_NO_AUTOMATIC_RESUME', 'completed_commands': records}) + '\n')
+        stop = subprocess.run(['systemctl', 'stop', 'nqd.service'], capture_output=True, timeout=90)
+        interrupted = json.dumps({'disposition': 'RETAIN_AND_INSPECT_NO_AUTOMATIC_RESUME', 'completed_commands': records, 'stop_exit': stop.returncode}) + '\n'
+        (ROOT / 'INTERRUPTED.json').write_text(interrupted)
+        # SSH's existing host log retains this bounded failure record even
+        # when systemd later stops the producer's guest process group.
+        print(interrupted, file=sys.stderr)
+        journal = subprocess.run(['journalctl', '--no-pager', '-u', 'nqd.service', '-n', '100'], capture_output=True, timeout=30)
+        sys.stderr.buffer.write(journal.stdout[:65536])
         raise
 
 
