@@ -455,6 +455,8 @@ def producer_class(nq: Any) -> type:
         def teardown(self, control: Any, target: Any) -> None:
             day_two = load_module("composition_day_two", HERE / "day_two.py")
             day_two.exercise(self, nq, (control, target))
+            cold = load_module("composition_day_two_cold", HERE / "day_two_cold.py")
+            cold.exercise(self, nq, control)
             result = self.ssh(
                 target,
                 f"sudo dpkg -r {COMPOSITION_PACKAGE_NAME}; "
