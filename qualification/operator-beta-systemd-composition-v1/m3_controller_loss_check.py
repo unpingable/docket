@@ -164,6 +164,23 @@ def check(directory, driver, driver_sha, nq, nq_sha):
     sys.path.insert(0, '/opt/constellation-m3/labelwatch/src')
     from labelwatch.maintenance_artifacts import verify_closed
     from labelwatch.maintenance_step import reconcile
+    from labelwatch.maintenance_hold import process_start_ticks
+    writer_observations = {}
+    if action in ('verify-service', 'cleanup', 'release', 'reconcile-cleanup'):
+        require(set(producer['writers']) == {'main', 'discovery'}, 'required writer enrollment absent')
+        ready = read(directory / 'WRITER-READINESS.json')
+        require(set(ready) == {'main', 'discovery'} and len({item['pid'] for item in ready.values()}) == 2,
+            'two distinct writer readiness identities required')
+        for role, enrolled_writer in producer['writers'].items():
+            query = subprocess.run(['systemctl', 'show', enrolled_writer['unit'],
+                '--property=MainPID', '--property=ActiveState'], capture_output=True, text=True, timeout=10)
+            require(query.returncode == 0, 'actual writer unit state not observable')
+            values = dict(line.split('=', 1) for line in query.stdout.splitlines() if '=' in line)
+            require(values.get('ActiveState') == 'active' and int(values['MainPID']) == ready[role]['pid'] and
+                process_start_ticks(ready[role]['pid']) == ready[role]['start_ticks'],
+                'actual enrolled writer is absent or substituted')
+            writer_observations[role] = {'pid': ready[role]['pid'], 'start_ticks': ready[role]['start_ticks'],
+                'unit': enrolled_writer['unit'], 'source': 'SYSTEMD_AND_OS_PROCESS_IDENTITY'}
     current = reconcile(step)
     expected, held = application_expected(action, cut)
     require(tuple(Path(step[key]).exists() for key in ('source', 'original', 'staging')) == expected, 'actual application replacement/cleanup state differs')
@@ -178,6 +195,7 @@ def check(directory, driver, driver_sha, nq, nq_sha):
     native = native_reexecution(directory, nq, nq_sha)
     return {'case': producer['case'], 'owner_reopened': True, 'original_spends': 1,
         'actual_owner_state': next(iter(recovered['after']['state'])),
+        'writer_observations': writer_observations,
         'actual_companion_exit_observed': True, 'application_recovery': current,
         'native_reexecution': native, 'new_effect_authority': 'NONE',
         'qualification': 'SCOPED_CONTROLLER_LOSS_CHECKS_REQUIRE_INDEPENDENT_REVIEW'}

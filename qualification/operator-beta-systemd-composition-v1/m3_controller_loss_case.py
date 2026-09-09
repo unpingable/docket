@@ -100,6 +100,7 @@ class LossCase(Case):
         retain(self.output / 'PRODUCER.json', {'schema': 'constellation.m3-controller-loss-case/v1',
             'case': self.name, 'action': action, 'cut': cut, 'expired_cleanup': expired,
             'actions': self.actions, 'barrier_directory': str(directory),
+            'writers': self.writers,
             'terminal_claim': 'AWAITING_INDEPENDENT_OWNER_AND_APPLICATION_CHECK',
             'teardown': 'NOT_RUN_RETAINED_CASE_ONLY'})
 
