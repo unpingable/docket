@@ -209,6 +209,27 @@ def check_step(candidate_path, directory):
             'claim': 'OCCURRENCE_CORRESPONDENCE_ONLY_NOT_RESOURCE_RELIEF'}
 
 
+def expected_later_occurrences(producer):
+    """Closed scenario requirements, not a reconstruction from reported actions."""
+    from m3_later_cases import PREVIOUS, cases
+    require(producer['schema'] == 'constellation.m3-later-case-producer/v1',
+            'ordinary checker cannot qualify another producer family')
+    name = producer['case']
+    if name == 'cleanup-foreign-operation-receipt-donor':
+        action, cut = 'verify-service', None
+    else:
+        require(name in cases(), 'unknown later case')
+        action, cut = cases()[name]
+    expected = [('cleanup', 'after_cleanup_unlink') if item == 'cleanup-cut' else (item, None)
+                for item in PREVIOUS[action] if item != 'writers']
+    expected.append((action, cut))
+    if name == 'post-write-stale-rollback':
+        expected.append(('rollback-pre-ingest', None))
+    require([(item['action'], item.get('cut')) for item in producer['actions']] == expected,
+            'reported actions/cuts differ from required scenario')
+    return expected
+
+
 def check_case(directory):
     directory = Path(directory)
     producer = read(directory / 'PRODUCER.json')
@@ -216,12 +237,21 @@ def check_case(directory):
     if producer['schema'] == 'constellation.m3-stage-case-producer/v1':
         results.append(check_step(producer['candidate'], directory / 'admitted-step'))
     else:
-        for occurrence in producer['actions']:
+        expected = expected_later_occurrences(producer)
+        receipt_refusals = {'cleanup-missing-receipt', 'cleanup-stale-receipt',
+                            'cleanup-substituted-receipt', 'cleanup-foreign-operation-receipt'}
+        for index, occurrence in enumerate(producer['actions']):
+            action, required_cut = expected[index]
+            final = index == len(expected) - 1
             if occurrence.get('status') == 'NOT_ADMITTED':
+                require(final and producer['case'] == 'writer-start-failure' and required_cut is None,
+                        'required occurrence was not admitted; configured cut not demonstrated')
                 require(occurrence['seal_exit'] != 0, 'not-admitted case has successful seal')
                 continue
             evidence = Path(occurrence['evidence'])
             if occurrence['driver_exit'] == 'INTAKE_REFUSED_OR_OUTCOME_UNKNOWN':
+                require(final and producer['case'] in receipt_refusals and required_cut is None,
+                        'required occurrence has intake uncertainty; configured cut not demonstrated')
                 # Explicitly do not pass an ambiguous launch as a refusal.
                 require(not (evidence / 'custody').exists(), 'intake exception may have crossed dispatch boundary')
                 results.append({'action': occurrence['action'], 'claim': 'LOCAL_INTAKE_REFUSED_NO_DRIVER_CUSTODY'})
@@ -235,7 +265,13 @@ def check_case(directory):
                         require(replay['ag_spends'] == 0 and replay['docket_attempts'] == 0, 'refusal crossed admission boundary')
                     results.append({'action': 'cleanup', 'claim': 'REFUSED_WITHOUT_EXECUTION'})
                 else:
-                    results.append(check_step(occurrence['candidate'], evidence))
+                    candidate = read(occurrence['candidate'])
+                    require(candidate['action'] == action and candidate['qualification_interruption'] == required_cut,
+                            'sealed candidate differs from required action/cut')
+                    checked = check_step(occurrence['candidate'], evidence)
+                    require(checked['action'] == action and checked['cut'] == required_cut,
+                            'observed occurrence differs from required action/cut')
+                    results.append(checked)
     postconditions = check_postconditions(directory, producer)
     return {'schema': 'constellation.m3-case-correspondence-check/v1',
             'case': producer['case'], 'occurrences': results,
