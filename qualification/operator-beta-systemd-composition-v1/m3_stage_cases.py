@@ -32,14 +32,25 @@ def execute_command(output, label, command):
     return result.stdout
 
 
+def mutate_closed_source(source):
+    """Finish the fixture-only WAL transaction before establishing its byte cut."""
+    connection = sqlite3.connect(source)
+    try:
+        if connection.execute("UPDATE maintenance_types SET value=8 WHERE key='int'").rowcount != 1:
+            raise RuntimeError('exact single-row fixture seed differs')
+        connection.commit()
+        checkpoint = connection.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        if checkpoint[0] != 0 or checkpoint[1] != checkpoint[2]:
+            raise RuntimeError('fixture seed checkpoint incomplete')
+    finally:
+        connection.close()
+
+
 def seed(case, fixture, mountpoint):
     source = fixture / 'source.sqlite'
     evidence = {'case': case, 'source_sha256_before': hashlib.sha256(source.read_bytes()).hexdigest()}
     if case == 'source-before-cut':
-        with sqlite3.connect(source) as connection:
-            changed = connection.execute("UPDATE maintenance_types SET value=8 WHERE key='int'").rowcount
-            if changed != 1:
-                raise RuntimeError('exact single-row fixture seed differs')
+        mutate_closed_source(source)
     elif case == 'compaction-failure':
         with (fixture / 'staging.sqlite').open('xb') as stream:
             stream.write(b'EXCLUSIVE_DESTINATION_MUST_REMAIN_UNCHANGED\n')

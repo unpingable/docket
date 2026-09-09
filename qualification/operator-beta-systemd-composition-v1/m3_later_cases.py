@@ -12,13 +12,13 @@ import os
 from pathlib import Path
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
 
 import m3_guest_route as route
 import m3_guest_setup as setup
+from m3_stage_cases import mutate_closed_source
 
 PREVIOUS = {
     'stage': [], 'replace': ['stage'], 'verify-installed': ['stage', 'replace'],
@@ -229,9 +229,7 @@ class Case:
             raise RuntimeError('exact expected writer readiness not established')
 
     def mutate(self):
-        with sqlite3.connect(self.base['source']) as connection:
-            if connection.execute("UPDATE maintenance_types SET value=8 WHERE key='int'").rowcount != 1:
-                raise RuntimeError('exact row substitution unavailable')
+        mutate_closed_source(self.base['source'])
 
     def run(self):
         action, cut = ('verify-service', None) if self.name.endswith('-donor') else cases()[self.name]
