@@ -1,0 +1,114 @@
+{
+  "schema": "constellation.operator_beta.composed_m1b_qualification/v1",
+  "campaign": "constellation-operator-beta-docket-systemd-composition-v1",
+  "milestone": "M1_COMPOSITION",
+  "run_id": "operator-beta-composed-m1b-run-002",
+  "disposition": "ONE_SPEND_ONE_ATTEMPT_BOUNDED_EFFECT_CUSTODY_WITH_DECLARED_LIMITATIONS",
+  "qualification": {
+    "branch": "campaign/constellation-operator-beta-docket-systemd-composition-v1-20260907",
+    "composition_subject": "eccceefc4f906830ad2ae8f4a8eca245bee3800e",
+    "composition_tree": "ace41010477db8f662dbf15b076e627d95c60a9e",
+    "checker_subject": "d6c7c8eb53424ce163bb00c778488eaf9a79f32c",
+    "checker_tree": "13c941fdc621db01fd034af4efd74de2c2e28587",
+    "published": true
+  },
+  "archive": {
+    "authoritative_path": "/var/tmp/constellation-operator-beta-composed-m1b-run-002",
+    "preservation_copy_path": "/data/git/.campaign-artifacts/docket-systemd-composition-v1/operator-beta-composed-m1b-v1/run-002",
+    "preservation_copy_role": "BYTE_IDENTICAL_NON_AUTHORITATIVE_COPY",
+    "manifest_bytes": 15908,
+    "manifest_entries": 111,
+    "manifest_sha256": "f776017d605ba12daded00e658819a0ba0fa20c40e7bf25aae8d765431b5dfce",
+    "result_bytes": 845,
+    "result_sha256": "2d5c1efacd99efd3e7916c3e24c61e25b1c8a01eb9806a9836bbf4f978e7a011"
+  },
+  "inputs": {
+    "image_sha512": "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817",
+    "nq_harness_subject": "9f1b081b7fc5b2d99fb92ee6b0ac4107c7e7dfe4",
+    "nq_package_sha256": "0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636",
+    "ag_source": "837de287497942c79966aa05c083acee9c312261",
+    "ag_package_sha256": "98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279",
+    "ag_executable_sha256": "668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068",
+    "docket_source": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b",
+    "composition_package_sha256": "5bb3f3d27a4c19cbb2c7bc80bdf69d9f5aab076d9f20cd49b59a8b8c45e4a479",
+    "composition_package_receipt_sha256": "e1b859a84e77ef94a545daaa6d3fd7acce9e0a249c998a8948306d93e109b4db"
+  },
+  "historical_decision": {
+    "decision": "sha256:7ff60a6dd2806498a8bfe30b9873de83f8fdda24c2b203bf6628ad9e6ce78004",
+    "disposition": "admitted",
+    "proposal": "sha256:3e6a0221a1bb00a8c756ce12dcfe492429084f8c0dd382219c78c33b81a89be6",
+    "observation": "sha256:11671073711a771e7f655c9e3ac23b974664177b4ccd0440231afefe8a05c334",
+    "standing_resolution": "sha256:2580d22b83fc5fa5105b1afb996ec328bf187f0e25269790933507077900fa71",
+    "policy_basis": "sha256:8efb4591045d81836fe05e9791f7f07f0f766add903cc9758d42ea0ceef90b2f",
+    "spend": "sha256:4305aeca35b989f10752db02b2ee419f9448df9f70b76d074a95c58dfc6d8aec",
+    "issuance": "sha256:8340a9ed92f0609701bafcc169eff858b9d6046aa9fc6575d913d2b6c890ac41",
+    "subject": "sha256:d41f3d97163fae0065e6dfefe5a5cde9c152e3c416a4cf63f51a63d6aecf426f",
+    "scope": "sha256:f6f209465d64921c8228709bd53605c6ffc40ea2efe91751da0b73333b600d37",
+    "work": "sha256:4f72d6494d69eb98d4dba3f826c5a9c4897f1cbfa88cb920ad671c91d6853f4f",
+    "decision_record": "RECORDED",
+    "exact_policy_catalog_content": "NOT_RECORDED",
+    "resolver_source_evidence": "NOT_RECORDED"
+  },
+  "composition": {
+    "ag_spends": 1,
+    "docket_attempts": 1,
+    "settlements": 1,
+    "attempt": "sha256:e87d9fc8d5fbe03ca777095fcadb9037c354df9891b3c4b6a1b840df4ff5066c",
+    "marker": "sha256:3a3e0026c14318d6d7ba27ff7c726645dfcab0ebb0b67000f03f0ecda1996dcc",
+    "receipt": "sha256:4fbfdf28257385473a5a83baa971611d8c81a3f2fba62b7e38618ad4f16880a9",
+    "owner_outcome": "success",
+    "duplicate_same_custody": true,
+    "ag_restart_exact": true,
+    "executor_reconcile_exact": true,
+    "docket_inspection_sha256": "3b27f4d861a57b747f88e6716c51bf6a276c5bb538fbc67e5cc59640a44fb21b",
+    "store_cut_bytes": 32768,
+    "store_cut_sha256": "5e2b9a1bb23c8309e26bf903164b0eeef0a16971f0fa6d576ee83b6ceb9167a6",
+    "store_attempt_rows": 1,
+    "store_evidence_rows": 1,
+    "owner_query_replay_equal": true,
+    "docket_query_replay_equal": true
+  },
+  "observation_history": {
+    "pre_systemd_condition": "present",
+    "pre_http_condition": "unresolved",
+    "post_systemd_condition": "explicitly_absent",
+    "post_http_condition": "explicitly_absent",
+    "restart_systemd_condition": "present",
+    "restart_http_condition": "unresolved",
+    "historical_effect": "AG_OWNER_RECEIPT_RETAINED",
+    "aggregate_postcondition": "NOT_RECORDED"
+  },
+  "teardown": {
+    "revoked_instances": 6,
+    "control_backup_sha256": "c0eb19ef2b9e46ad7f4d4c3915c149752b1a8f68a159dc51f505292334214acf",
+    "target_backup_sha256": "5ffc7723818b21a60d969daa7becd902c4ee990658332d0c04659764a96799f8",
+    "backup_sqlite_integrity": "ok",
+    "general_restore_qualified": false,
+    "host_final_observation_sha256": "8ba5c80fac142972adf29b4bc5e3170dfdf8d960715a87e9625e336a8e59700f",
+    "producer_absent": true,
+    "guests_absent": true,
+    "listeners_absent": true
+  },
+  "independent_audit": {
+    "reviewer": "Rawls:/root/second_watch_reaudit",
+    "disposition": "ACCEPTED_PROCEED",
+    "subject": "operator-beta-composed-m1b-run-002",
+    "checker_subject": "d6c7c8eb53424ce163bb00c778488eaf9a79f32c",
+    "scope": "BOUNDED_AG_DOCKET_EFFECT_CUSTODY_WITH_NQ_OBSERVATION"
+  },
+  "limitations": {
+    "signed_upstream_checksum": "NOT_QUALIFIED",
+    "exact_policy_catalog_content": "NOT_RECORDED",
+    "resolver_source_evidence": "NOT_RECORDED",
+    "aggregate_postcondition": "NOT_RECORDED",
+    "literal_distributed_exactly_once": "NOT_CLAIMED",
+    "deployment": "NOT_RUN",
+    "production": "NOT_RUN"
+  },
+  "authority": {
+    "grants_workflow_authority": false,
+    "grants_deployment_authority": false,
+    "grants_production_authority": false,
+    "authorizes_retry_or_resume": false
+  }
+}
