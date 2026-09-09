@@ -76,7 +76,9 @@ def main(mode):
         inactive(mode + '-initial-inactive')
 
     def checkpoint(value, interrupt=False):
-        save('CHECKPOINT.json', {'phase': value, 'binary_sha256': digest('/usr/bin/nq'), 'service': 'STOPPED', 'automatic_resume': False})
+        record = {'phase': value, 'binary_sha256': digest('/usr/bin/nq'), 'service': 'STOPPED', 'automatic_resume': False}
+        save('CHECKPOINT-' + value + '.json', record)
+        save('CHECKPOINT.json', record)
         if interrupt:
             # Deterministic supervisor-loss boundary after a completed durable
             # step. No package operation is interrupted in the middle.
@@ -144,6 +146,7 @@ def main(mode):
             config(cohort / 'nq.sqlite', cohort / 'admissions', watchers=True)
             manifest = json.loads((ROOT / 'old-archive/ARCHIVE.json').read_text())['manifest_sha256']
             nq(mode + '-init', ['init', '--legacy-manifest-digest', manifest])
+            assert (cohort / 'admissions').is_dir()
             assert not list((cohort / 'admissions').iterdir())
             save(mode + '-baseline.json', logical_manifest(cohort / 'nq.sqlite'))
             checkpoint('NEW_ONE_PREACTIVATION' if mode == 'cut-one' else 'NEW_TWO_PREACTIVATION', interrupt=True)
@@ -174,6 +177,8 @@ def main(mode):
             nq('forward-status', ['status', 'export'])
             nq('forward-backup', ['backup', str(ROOT / 'forward-backup.sqlite')])
             config(ROOT / 'cut-two/nq.sqlite', ROOT / 'cut-two/admissions')
+            # Service-readiness test only: fresh admission/diagnostic above was
+            # one-shot. Do not silently start scheduled collection here.
             call('forward-start', ['systemctl', 'start', 'nqd.service'])
             ready('forward-ready')
             stop('forward-stop')

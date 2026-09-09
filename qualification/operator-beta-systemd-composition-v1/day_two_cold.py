@@ -26,14 +26,23 @@ def exercise(producer, nq, control):
         shutil.copyfile(source, destination)
         destination.chmod(0o400)
         producer.scp_to(control, [destination], '/home/betaoperator/' + name)
-    producer.scp_to(control, [here / 'day_two_cold_guest.py', here / 'day_two_restore.py'], '/home/betaoperator/')
-    producer.ssh(control, 'sudo install -d -o root -g root -m 0755 /usr/local/libexec/constellation-m4-cold; '
+    for name in ('day_two_cold.py', 'day_two_cold_guest.py', 'day_two_restore.py'):
+        target = inputs / name
+        if target.exists():
+            raise nq.Refusal('cold-cohort source retention destination exists')
+        shutil.copyfile(here / name, target)
+        target.chmod(0o400)
+    producer.scp_to(control, [inputs / 'day_two_cold_guest.py', inputs / 'day_two_restore.py'], '/home/betaoperator/')
+    producer.ssh(control, 'set -eu; sudo install -d -o root -g root -m 0755 /usr/local/libexec/constellation-m4-cold; '
                  'sudo install -o root -g root -m 0444 /home/betaoperator/day_two_cold_guest.py /home/betaoperator/day_two_restore.py /usr/local/libexec/constellation-m4-cold/')
     prefix = 'sudo python3 -B /usr/local/libexec/constellation-m4-cold/day_two_cold_guest.py '
+    step_returns = []
 
     def step(name, expected=0):
         producer.state('cold_cohort_' + name, 'execute one explicit step; no automatic retry')
         result = producer.ssh(control, prefix + shlex.quote(name), check=False)
+        step_returns.append({'step': name, 'exit': result.returncode})
+        nq.atomic_write(producer.output / 'evidence/cold-step-returns.json', nq.canonical(step_returns) + b'\n', 0o400)
         if result.returncode != expected:
             raise nq.Refusal(f'cold-cohort {name}: expected {expected}, observed {result.returncode}')
 
@@ -51,7 +60,10 @@ def exercise(producer, nq, control):
             (['watcher', 'admit', 'http-restart'], 'cold-fresh-admission.json'),
             (['diagnostics', 'execute', 'http-restart'], 'cold-fresh-diagnostic.json'),
         ):
-            command = nq.nq_helper_command(arguments).replace('--config=/etc/nq/operator-beta.toml', '--config=/etc/nq/nq.toml')
+            command = nq.nq_helper_command(arguments)
+            if command.count('--config=/etc/nq/operator-beta.toml') != 1:
+                raise nq.Refusal('owner helper config seam differs from reviewed command')
+            command = command.replace('--config=/etc/nq/operator-beta.toml', '--config=/etc/nq/nq.toml')
             result = producer.ssh(control, command)
             nq.atomic_write(producer.output / 'evidence' / filename, result.stdout, 0o400)
             decoded = json.loads(result.stdout)
@@ -75,14 +87,14 @@ def exercise(producer, nq, control):
         producer.ssh(control, 'sudo cat /var/lib/nq/m4-cold/CHECKPOINT.json; '
                      'sudo journalctl --no-pager -u nqd.service -n 100', check=False)
         raise
-    producer.ssh(control, 'sudo tar -C /var/lib/nq/m4-cold -cf /home/betaoperator/m4-cold.tar .; '
+    producer.ssh(control, 'set -eu; sudo tar -C /var/lib/nq/m4-cold -cf /home/betaoperator/m4-cold.tar .; '
                  'sudo chown betaoperator:betaoperator /home/betaoperator/m4-cold.tar; chmod 0400 /home/betaoperator/m4-cold.tar')
     archive = producer.output / 'evidence/cold-cohort-private.tar'
     producer.scp_from(control, '/home/betaoperator/m4-cold.tar', archive)
     archive.chmod(0o400)
     if archive.stat().st_size > 512 * 1024 * 1024:
         raise nq.Refusal('cold-cohort archive exceeds fixture evidence bound')
-    producer.ssh(control, 'sudo test ! -e /etc/nq/nq.toml; '
+    producer.ssh(control, 'set -eu; sudo test ! -e /etc/nq/nq.toml; '
                  'sudo rm -rf /var/lib/nq/m4-cold /usr/local/libexec/constellation-m4-cold; '
                  'rm -f /home/betaoperator/m4-cold.tar /home/betaoperator/m4-old-nq.deb /home/betaoperator/m4-old-store.sqlite /home/betaoperator/day_two_cold_guest.py /home/betaoperator/day_two_restore.py')
     producer.complete_phase('cold_cohort_proved', 'existing scoped composition teardown')
