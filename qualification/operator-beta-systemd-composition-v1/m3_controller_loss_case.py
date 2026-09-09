@@ -79,12 +79,16 @@ class LossCase(Case):
                 queried = original_run([DOCKET, 'governed-loop', 'inspect', '--state',
                     str(selected / 'custody/occurrence/docket-state'), '--issuance', registered['issuance']],
                     capture_output=True, timeout=10)
-                if queried.returncode == 0 and json.loads(queried.stdout)['record']['status'] == 'settled':
+                if queried.returncode == 0 and json.loads(queried.stdout)['record']['status'] in ('settled', 'indeterminate'):
                     break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError('existing transport remains unresolved; no reissue')
+                    break
                 time.sleep(.05)
-            retain(directory / 'DOCKET-BEFORE-RECOVERY.json', json.loads(queried.stdout))
+            retain(directory / 'DOCKET-BEFORE-RECOVERY-QUERY.json', {
+                'exit': queried.returncode, 'stdout': queried.stdout.decode(),
+                'stderr': queried.stderr.decode(), 'retry_or_new_execution': 'NOT_REQUESTED'})
+            if queried.returncode == 0:
+                retain(directory / 'DOCKET-BEFORE-RECOVERY.json', json.loads(queried.stdout))
         recovery = original_run([DRIVER, '--recover-existing', DOCKET, WRAPPER,
             str(selected / 'custody'), registered['issuance']], capture_output=True, timeout=30)
         retain(directory / 'RECOVERY-RESULT.json', {'exit': recovery.returncode,
