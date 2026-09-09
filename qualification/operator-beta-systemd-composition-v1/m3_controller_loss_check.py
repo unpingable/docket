@@ -24,6 +24,14 @@ def run_json(command, data=None):
     return json.loads(result.stdout)
 
 
+def application_expected(action, cut):
+    # Fixture initialization enrolls the hold before any AG issuance. Losing
+    # the companion before stage does not remove that existing write hold.
+    if action == 'stage':
+        return (True, False, cut != 'ag-consumed-before-accept'), True
+    return cut_postcondition(action, 'before_started' if cut == 'ag-consumed-before-accept' else 'after_terminal')
+
+
 def owner_states(recovery, cut):
     before = ('dispatched' if cut == 'docket-settled-before-ag-poll' else
         'settled_observation_required' if cut == 'ag-settled-before-export' else 'authorization_consumed')
@@ -157,11 +165,7 @@ def check(directory, driver, driver_sha, nq, nq_sha):
     from labelwatch.maintenance_artifacts import verify_closed
     from labelwatch.maintenance_step import reconcile
     current = reconcile(step)
-    if action == 'stage':
-        expected = (True, False, cut != 'ag-consumed-before-accept')
-        held = cut != 'ag-consumed-before-accept'
-    else:
-        expected, held = cut_postcondition(action, 'before_started' if cut == 'ag-consumed-before-accept' else 'after_terminal')
+    expected, held = application_expected(action, cut)
     require(tuple(Path(step[key]).exists() for key in ('source', 'original', 'staging')) == expected, 'actual application replacement/cleanup state differs')
     require(current['write_hold'] is held, 'actual write hold differs from completed/absent action')
     if held or (action == 'stage' and cut == 'ag-consumed-before-accept'):
