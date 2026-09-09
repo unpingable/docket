@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -13,17 +14,52 @@ BACKUP = pathlib.Path('/mnt/constellation-m3-backup')
 WHEEL_SHA = '6abbd3e82c731c8e531714466acd5d87b5e88ac3243465337ba71d68e23ae7e3'
 
 
-def writer_unit(role):
+def writer_unit(role, target=None, failing_start=False):
     commands = {'main': 'run --ingest-interval 0 --scan-interval 0', 'discovery': 'discover-stream --backstop-interval 0'}
     if role not in commands:
         raise ValueError('unknown enrolled writer role')
+    target = TARGET_PARENT / 'run' if target is None else pathlib.Path(target)
+    if target != target.resolve() or not target.is_relative_to(TARGET_PARENT) or target == TARGET_PARENT or not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(target)):
+        raise ValueError('exact bounded fixture target required')
+    if failing_start:
+        if role != 'main':
+            raise ValueError('fixed failure case is main writer only')
+        commands[role] = 'run --ingest-interval 0 --scan-interval invalid-fixture-number'
     return ('[Unit]\nDescription=M3 disposable held writer ' + role + '\n'
         '[Service]\nType=simple\nUser=root\nGroup=root\nRestart=no\n'
         'Environment=PYTHONPATH=/opt/constellation-m3/labelwatch/src:/opt/constellation-m3/websockets.whl\n'
         'Environment=JETSTREAM_URL=ws://127.0.0.1:9\n'
-        'ExecStart=/usr/bin/python3 -m labelwatch.cli --db /var/lib/constellation-m3/run/source.sqlite ' + commands[role] + '\n'
+        'ExecStart=/usr/bin/python3 -m labelwatch.cli --db ' + str(target / 'source.sqlite') + ' ' + commands[role] + '\n'
         'WorkingDirectory=/opt/constellation-m3/labelwatch\n'
         'TimeoutStopSec=15\n[Install]\nWantedBy=multi-user.target\n')
+
+
+def enroll_case_writers(target, output, failing_main=False):
+    """Install fresh per-case units only. Starting remains an explicit test step."""
+    if os.geteuid() != 0 or output.exists():
+        raise RuntimeError('root enrollment and fresh evidence destination required')
+    # Validate both fragments before any filesystem effect.
+    fragments = {role: writer_unit(role, target, failing_main and role == 'main')
+                 for role in ('main', 'discovery')}
+    output.mkdir(mode=0o700)
+    result = {}
+    for role, fragment in fragments.items():
+        sha = hashlib.sha256(fragment.encode()).hexdigest()
+        name = 'labelwatch-m3-' + role + '-' + sha + '.service'
+        destination = pathlib.Path('/etc/systemd/system') / name
+        with destination.open('x') as stream:
+            stream.write(fragment)
+            stream.flush()
+            os.fsync(stream.fileno())
+        destination.chmod(0o644)
+        (output / name).write_text(fragment)
+        result[role] = {'unit': name, 'unit_sha256': sha, 'source': str(target),
+                        'expected_start': 'REFUSED_INVALID_CLI_ARGUMENT' if failing_main and role == 'main' else 'HELD_READY'}
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    (output / 'WRITERS.json').write_text(json.dumps({'schema': 'constellation.m3-writer-enrollment/v1',
+        'writers': result, 'started': False, 'restart': 'no',
+        'custody': 'ROOT_ENROLLED_FRAGMENT_NOT_MEASURED_BY_AG'}, sort_keys=True) + '\n')
+    return result
 
 
 def setup(revision):
