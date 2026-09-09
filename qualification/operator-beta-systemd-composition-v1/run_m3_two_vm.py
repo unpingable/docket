@@ -345,9 +345,10 @@ def make_manifest(root):
 
 
 def check_teardown(case):
+    from m3_case_teardown import stop_established
     teardown = read(case / 'TEARDOWN.json')
     require(teardown['status'] == 'SCOPED_STOP_AND_ARCHIVE' and teardown['unmount_exit'] == teardown['backup_unmount_exit'] == 0, 'case teardown incomplete')
-    require(all(item['exit'] == 0 for item in teardown['units']), 'recorded unit stop incomplete')
+    require(all(stop_established(item) for item in teardown['units']), 'recorded unit stop incomplete')
     require(composition.sha256(case / 'retained-filesystems.tar') == teardown['archive_sha256'], 'retained case bytes differ')
 
 

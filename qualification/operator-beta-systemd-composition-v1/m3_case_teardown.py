@@ -15,6 +15,36 @@ import m3_guest_route as route
 from m3_case_check import read, require
 
 
+def stop_established(record):
+    state = record.get('state', {})
+    if record.get('state_exit') != 0 or state.get('ActiveState') != 'inactive' or state.get('SubState') != 'dead' or state.get('MainPID') != '0':
+        return False
+    return ((record['exit'] == 0 and state.get('LoadState') == 'loaded') or
+            (record['exit'] in (0, 5) and state.get('LoadState') == 'not-found'))
+
+
+def stop_unit(unit):
+    try:
+        observed = subprocess.run(['systemctl', 'stop', unit], capture_output=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        return {'unit': unit, 'exit': None, 'state_exit': None,
+            'disposition': 'STOP_NOT_ESTABLISHED', 'error': str(error)}
+    record = {'unit': unit, 'exit': observed.returncode,
+        'stdout': observed.stdout.decode(errors='replace'), 'stderr': observed.stderr.decode(errors='replace')}
+    try:
+        query = subprocess.run(['systemctl', 'show', unit, '--property=LoadState',
+            '--property=ActiveState', '--property=SubState', '--property=MainPID'], capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as error:
+        record.update(state_exit=None, disposition='STOP_NOT_ESTABLISHED', error=str(error))
+        return record
+    record.update(state_exit=query.returncode, state_stdout=query.stdout.decode(errors='replace'),
+        state_stderr=query.stderr.decode(errors='replace'))
+    record['state'] = dict(line.split('=', 1) for line in record['state_stdout'].splitlines() if '=' in line)
+    record['disposition'] = ('STOPPED_OR_ALREADY_ABSENT_OBSERVED' if stop_established(record)
+        else 'STOP_NOT_ESTABLISHED')
+    return record
+
+
 def teardown(directory):
     directory = Path(directory)
     require(os.geteuid() == 0 and directory == directory.resolve() and directory.is_relative_to(route.DATA), 'exact guest case root required')
@@ -31,9 +61,9 @@ def teardown(directory):
     stopped = []
     for unit in units:
         require(unit.startswith(('labelwatch-m3-', 'labelwatch-relief-')) and '/' not in unit and unit.endswith('.service'), 'unrecognized case unit')
-        observed = subprocess.run(['systemctl', 'stop', unit], capture_output=True, timeout=20)
-        stopped.append({'unit': unit, 'exit': observed.returncode, 'stdout': observed.stdout.decode(errors='replace'), 'stderr': observed.stderr.decode(errors='replace')})
-        if observed.returncode:
+        observation = stop_unit(unit)
+        stopped.append(observation)
+        if not stop_established(observation):
             result.write_bytes(route.canonical({'status': 'STOP_INCOMPLETE_RETAINED', 'units': stopped}))
             raise RuntimeError('scoped stop incomplete; no archive/unmount attempted')
     # SIGSTOP cases are deliberately not resumed into ingestion. systemd's
