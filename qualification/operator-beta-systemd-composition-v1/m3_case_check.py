@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import sqlite3
+import re
 from m3_guest_route import validate_entry
 from pathlib import Path
 
@@ -46,6 +47,46 @@ def unit_state(path):
     return result
 
 
+def retained_invocation(directory, candidate, state, accepted):
+    window = read(directory / 'execution-window.json')
+    evidence = read(directory / 'custody/systemd-evidence.json')
+    require(window['unit'] == evidence['unit'] == candidate['unit'] and
+        window['step_sha256'] == candidate['step_sha256'], 'invocation unit/step differs')
+    require(window['machine_id'] == evidence['live_machine_identity'] == evidence['systemd_machine_identity'], 'invocation machine differs')
+    require(evidence['attempt'] == accepted['attempt'] and evidence['marker'] == accepted['executor_marker'], 'invocation attempt/marker differs')
+    require(evidence['action'] == 'start' and re.fullmatch(r'/org/freedesktop/systemd1/job/[0-9]+', evidence['job_path']), 'actual start job absent')
+    require(window['started_us'] <= evidence['started_at_unix_ms'] * 1000 + 999 <=
+        evidence['finished_at_unix_ms'] * 1000 + 999 <= window['finished_us'], 'execution window differs')
+    require((directory / 'unit-journal-structured.exit').read_text().strip() == '0', 'structured journal unavailable')
+    journal = directory / 'unit-journal-structured.stdout'
+    require(journal.is_file() and not journal.is_symlink() and journal.stat().st_size <= 2 * 1024 * 1024, 'bounded journal required')
+    identities = set()
+    for line in journal.read_text().splitlines():
+        row = json.loads(line)
+        require(isinstance(row, dict), 'journal row malformed')
+        if row.get('_MACHINE_ID') != window['machine_id']:
+            raise ValueError('journal machine mismatch')
+        stamp = int(row['__REALTIME_TIMESTAMP'])
+        require(window['started_us'] <= stamp <= window['finished_us'], 'journal outside execution window')
+        if row.get('_SYSTEMD_UNIT') == candidate['unit']:
+            identity = row.get('_SYSTEMD_INVOCATION_ID')
+        elif row.get('UNIT') == candidate['unit']:
+            identity = row.get('INVOCATION_ID')
+        else:
+            raise ValueError('journal unit mismatch')
+        if identity is not None:
+            require(isinstance(identity, str) and re.fullmatch('[0-9a-f]{32}', identity), 'journal invocation malformed')
+            identities.add(identity)
+    require(len(identities) == 1, 'missing or ambiguous retained invocation')
+    identity = next(iter(identities))
+    require(not state.get('InvocationID') or state['InvocationID'] == identity, 'current and retained invocation differ')
+    if not state.get('InvocationID'):
+        require(state.get('ActiveState') == 'inactive' and state.get('SubState') == 'dead'
+            and evidence['outcome_code'] == 'start_unit_completed' and evidence['job_result'] == 'done',
+            'absent current invocation without completed oneshot evidence')
+    return identity
+
+
 def custody(directory, candidate):
     directory = Path(directory)
     enrolled = read(directory / 'enrollment.json')
@@ -66,7 +107,7 @@ def custody(directory, candidate):
     require(issuance['subject'] == enrolled['subject'] and issuance['scope'] == enrolled['scope'], 'subject/scope correspondence differs')
     state = unit_state(directory / 'unit-state.stdout')
     require(state.get('NRestarts') == '0', 'unexpected systemd retry')
-    require(bool(state.get('InvocationID')), 'actual unit invocation absent')
+    retained_invocation(directory, candidate, state, accepted)
     return state, settled
 
 
