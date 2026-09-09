@@ -91,7 +91,11 @@ def run(binary, source, output):
     source_status = invoke('status-source', ['status', 'export'])
     config.write_text(config_before.decode().replace(str(copied), str(restored)))
     restored_status = invoke('status-restored', ['status', 'export'])
-    assert source_status == restored_status
+    source_view, restored_view = json.loads(source_status), json.loads(restored_status)
+    # The owner labels read time separately from durable components. Preserve
+    # both outputs, but never require two sequential reads to share a clock.
+    assert source_view.pop('generated_at') and restored_view.pop('generated_at')
+    assert source_view == restored_view
     assert digest(source) == original_digest
     result = {"scope": "copied accepted two-VM NQ stores; no service or authority activation", "source_sha256": original_digest, "binary_sha256": digest(binary), "logical_manifest": before, "cases": records, "disposition": "RESTORE_AND_EXACT_LOGICAL_DATA_PRESERVATION_DEMONSTRATED", "daemon_restart": "NOT_RUN", "application_restore": "NOT_RUN", "historical_restore_grants_new_authority": False}
     (output / 'RESULT.json').write_bytes(canonical(result) + b'\n')
