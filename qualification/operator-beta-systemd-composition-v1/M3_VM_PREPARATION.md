@@ -19,16 +19,19 @@ archived/stopped. Checker code and its imports must be enrolled root-owned immut
 as a separate B tree; checking its main-script digest does not replace whole-tree
 source custody. Guest setup's protected-root premise remains explicit.
 
-## Dependency/order and remaining source work
+## Implemented host seam; final execution gates
 
-1. Root reviews this fixed input/batch contract and freezes producer A/checker B.
-2. Add the thin host adapter using existing NQ VM lifecycle and ordinary composition
-   baseline. Run M3 batch after baseline evidence, before bounded teardown. Do not
+1. Root independently reviews the source and freezes producer A/checker B.
+2. `run_m3_two_vm.py` uses existing NQ VM lifecycle and ordinary composition
+   baseline. M3 enrollment/batch follows baseline evidence **and reboot**, before bounded teardown. It does not
    call the inherited M4 day-two/cold hooks: those are a separate campaign.
 3. Enroll exact app archive, A/B source trees, universal wheel and driver package;
    retain/recheck copied hashes. Use existing package-install and SSH mechanisms.
 4. Retain full stopped-case archives and checker records before guest destruction.
-   A failed case leaves its exact guest state for bounded reconciliation; no rerun.
+   A failed phase collects bounded best-effort owner state, journal and partial
+   filesystem bytes while SSH remains available; no rerun or cleanup. This is
+   not an atomic content cut. Default host control-group shutdown may stop QEMU;
+   continued live-guest custody and power-loss preservation of tmpfs are not claimed.
 5. Give M3 its own terminal disposition and host manifest/teardown checks. Baseline
    success, helper completion and completed transport do not establish M3 success.
 6. Independent source review, preflight-only checks, then root-coordinated launch.
@@ -37,6 +40,23 @@ No new daemon, persistence authority or orchestration substrate is required. The
 batch is a finite qualification script around existing AG/Docket helper units.
 An actual lost companion supervisor remains a separate required execution case;
 helper exit77 alone does not qualify controller-loss recovery.
+
+B changes only two literal A head/tree pins in the host script; preflight compares
+the entire Git delta and normalized host bytes. All imports remain identical.
+Copied inputs are checked against accepted digests; source archives bind exact
+clean Git heads under frozen source custody. Guest enrollment checks root-owned,
+non-shared-writable source parents. This is not authenticated remote attestation.
+The independent host checker recomputes A/B Git archives, verifies the separate
+M3 manifest and extracted evidence correspondence, reruns retained native factual
+inputs using the exact packaged image, and reopens the ordinary owner store chain.
+Live inode/service assertions remain the exact pre-teardown guest checker's
+observations; archived contents cannot reestablish live inode custody.
+
+Normal teardown stops recorded case units, archives/unmounts their tmpfs, removes
+fixture packages and powers guests off using the existing scoped lifecycle.
+Source trees and stopped unit fragments remain in retained offline guest disks;
+this does not assert complete guest filesystem removal. M4 cold/day-two hooks
+remain preserved in source but are not invoked by this M3 derivative.
 
 ## Resource/launch proposal — not authorization
 
