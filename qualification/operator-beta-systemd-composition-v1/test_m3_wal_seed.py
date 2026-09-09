@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from m3_vm_inputs import APP_HEAD
 
 import m3_stage_cases as stage
 from m3_later_cases import Case
@@ -23,7 +24,7 @@ class ActualInitializerWalTests(unittest.TestCase):
         for mode in ('legacy-control', 'stage', 'later'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir='/data/git') as target, tempfile.TemporaryDirectory(dir='/tmp') as backup:
                 fixture = Path(target) / 'operation'
-                enrollment.initialize(fixture, Path(backup), '17a2dedb2528025ec0c05b173d9be9b4b8b4ba53')
+                enrollment.initialize(fixture, Path(backup), APP_HEAD)
                 database = fixture / 'source.sqlite'
                 connection = sqlite3.connect(database)
                 try:
