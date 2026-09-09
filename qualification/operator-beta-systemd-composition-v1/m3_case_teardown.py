@@ -17,10 +17,43 @@ from m3_case_check import read, require
 
 def stop_established(record):
     state = record.get('state', {})
-    if record.get('state_exit') != 0 or state.get('ActiveState') != 'inactive' or state.get('SubState') != 'dead' or state.get('MainPID') != '0':
+    if record.get('state_exit') != 0 or state.get('MainPID') != '0' or state.get('ControlPID') != '0':
         return False
-    return ((record['exit'] == 0 and state.get('LoadState') == 'loaded') or
-            (record['exit'] in (0, 5) and state.get('LoadState') == 'not-found'))
+    terminal = (state.get('ActiveState'), state.get('SubState'))
+    group = record.get('cgroup', {})
+    if group.get('control_group') != state.get('ControlGroup') or group.get('observation') not in ('NOT_ASSIGNED', 'ABSENT', 'EMPTY'):
+        return False
+    return ((record['exit'] == 0 and state.get('LoadState') == 'loaded' and state.get('KillMode') == 'control-group' and
+             terminal in (('inactive', 'dead'), ('failed', 'failed'))) or
+            (record['exit'] in (0, 5) and state.get('LoadState') == 'not-found' and
+             terminal == ('inactive', 'dead') and group['observation'] == 'NOT_ASSIGNED'))
+
+
+def observe_cgroup(control_group, root=Path('/sys/fs/cgroup')):
+    """Bounded stopped-unit corroboration, not general host process liveness."""
+    result = {'control_group': control_group, 'observation': 'NOT_OBSERVABLE'}
+    if control_group == '':
+        result['observation'] = 'NOT_ASSIGNED'
+        return result
+    try:
+        if not isinstance(control_group, str) or not control_group.startswith('/') or control_group == '/' or '..' in control_group.split('/') or '.' in control_group.split('/'):
+            raise ValueError('invalid exact unit cgroup path')
+        root = root.resolve(strict=True)
+        (root / 'cgroup.controllers').read_text()  # explicit unified-v2 premise
+        path = root / control_group.lstrip('/')
+        if path.resolve() != path or not path.is_relative_to(root):
+            raise ValueError('cgroup path symlink or scope change')
+        try:
+            path.stat()
+        except FileNotFoundError:
+            result['observation'] = 'ABSENT'
+            return result
+        raw = (path / 'cgroup.events').read_text()
+        values = dict(line.split() for line in raw.splitlines())
+        result.update(events=raw, observation='EMPTY' if values.get('populated') == '0' else 'POPULATED' if values.get('populated') == '1' else 'NOT_OBSERVABLE')
+    except (OSError, ValueError) as error:
+        result['error'] = str(error)
+    return result
 
 
 def stop_unit(unit):
@@ -33,13 +66,16 @@ def stop_unit(unit):
         'stdout': observed.stdout.decode(errors='replace'), 'stderr': observed.stderr.decode(errors='replace')}
     try:
         query = subprocess.run(['systemctl', 'show', unit, '--property=LoadState',
-            '--property=ActiveState', '--property=SubState', '--property=MainPID'], capture_output=True, timeout=10)
+            '--property=ActiveState', '--property=SubState', '--property=MainPID', '--property=ControlPID',
+            '--property=ControlGroup', '--property=Result', '--property=ExecMainStatus',
+            '--property=KillMode'], capture_output=True, timeout=10)
     except (subprocess.TimeoutExpired, OSError) as error:
         record.update(state_exit=None, disposition='STOP_NOT_ESTABLISHED', error=str(error))
         return record
     record.update(state_exit=query.returncode, state_stdout=query.stdout.decode(errors='replace'),
         state_stderr=query.stderr.decode(errors='replace'))
     record['state'] = dict(line.split('=', 1) for line in record['state_stdout'].splitlines() if '=' in line)
+    record['cgroup'] = observe_cgroup(record['state'].get('ControlGroup'))
     record['disposition'] = ('STOPPED_OR_ALREADY_ABSENT_OBSERVED' if stop_established(record)
         else 'STOP_NOT_ESTABLISHED')
     return record
