@@ -34,6 +34,7 @@ def main():
         (ROOT / (name + '.stderr')).write_bytes(result.stderr)
         records.append({'case': name, 'exit': result.returncode})
         if (result.returncode == 0) != success:
+            sys.stderr.buffer.write(result.stderr[:65536])
             raise RuntimeError(f'{name}: unexpected exit {result.returncode}')
         return result.stdout
 
@@ -109,7 +110,9 @@ def main():
         # repair or unknown state is reclassified as a successful start.
         stopped('invalid-config-stop')
         install_config(restored_config)
-        call('reset-failed', ['systemctl', 'reset-failed', 'nqd.service'])
+        # stop already established inactive and canceled restart scheduling.
+        # reset-failed is not required to load/start an inactive unit and may
+        # itself fail when systemd has unloaded that unit after stop.
         nq('recovery-config-check', ['config', 'check'])
         call('recovery-start', ['systemctl', 'start', 'nqd.service'])
         active('recovery-active')
