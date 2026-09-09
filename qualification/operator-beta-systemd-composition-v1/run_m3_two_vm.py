@@ -20,8 +20,8 @@ from m3_guest_matrix import inventory
 
 HERE = Path(__file__).resolve().parent
 # Frozen checker descendant fills these; producer records its actual subject.
-PRODUCER_HEAD = 'UNFROZEN'
-PRODUCER_TREE = 'UNFROZEN'
+PRODUCER_HEAD = 'ff363e9a7be89b19eb8a4e9f1d8b5ab7547f45ef'
+PRODUCER_TREE = 'd4b0f34c42afdf1583c2ac131ef81e42850027ce'
 M3_ROOT = '/var/lib/constellation-m3'
 MAX_ARCHIVE = 512 * 1024 * 1024
 MATRIX_UNIT = 'constellation-m3-matrix.service'
