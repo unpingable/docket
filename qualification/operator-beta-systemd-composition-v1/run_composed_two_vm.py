@@ -93,6 +93,41 @@ def exact_composition_repository(subject: str, nq: Any) -> dict[str, str]:
     return {"head": head, "tree": tree}
 
 
+def packaged_qualification_facts(repository: pathlib.Path, nq: Any) -> dict[str, Any]:
+    """Bind the packaged driver to its build subject, not a later M3 source file.
+
+    The current admitted build-tool bytes must still match the exact receipt.
+    Its compiled ordinary driver comes from the fixed native source revision;
+    another package independently binds the M3-enabled driver.
+    """
+    relative = builder.DRIVER_RELATIVE.as_posix()
+    tree = nq.run(["git", "rev-parse", builder.DOCKET_HEAD + "^{tree}"],
+                  cwd=repository).stdout.decode().strip()
+    if tree != builder.DOCKET_TREE:
+        raise nq.Refusal("packaged driver source tree differs from declared build subject")
+    entry = nq.run(["git", "ls-tree", builder.DOCKET_HEAD, "--", relative],
+                   cwd=repository).stdout.decode().strip()
+    fields = entry.split()
+    if len(fields) != 4 or fields[0] != "100644" or fields[1] != "blob" or fields[3] != relative:
+        raise nq.Refusal("packaged driver is not the exact regular source blob")
+    raw = nq.run(["git", "show", builder.DOCKET_HEAD + ":" + relative],
+                 cwd=repository).stdout
+    if not raw or len(raw) > 1024 * 1024:
+        raise nq.Refusal("packaged driver source exceeds declared bound")
+    return {
+        "builder": {"path": builder.BUILDER_RELATIVE.as_posix(),
+                    "sha256": sha256(repository / builder.BUILDER_RELATIVE)},
+        "driver": {"path": relative, "sha256": hashlib.sha256(raw).hexdigest()},
+    }
+
+
+def verify_packaged_qualification(repository: pathlib.Path, nq: Any, expected: Any) -> dict[str, Any]:
+    qualification = packaged_qualification_facts(repository, nq)
+    if expected != qualification:
+        raise nq.Refusal("composition qualification sources differ from the build receipt")
+    return qualification
+
+
 def verify_fixture_inputs(args: argparse.Namespace, nq: Any) -> dict[str, Any]:
     nq.regular_file(args.composition_deb, "composition fixture package")
     nq.regular_file(args.composition_receipt, "composition fixture receipt")
@@ -131,14 +166,19 @@ def verify_fixture_inputs(args: argparse.Namespace, nq: Any) -> dict[str, Any]:
             raise nq.Refusal(str(error)) from error
     if receipt.get("package") != package:
         raise nq.Refusal("composition package differs from its exact build receipt")
-    qualification = builder.qualification_facts(HERE.parents[1])
-    if receipt.get("qualification") != qualification:
-        raise nq.Refusal("composition qualification sources differ from the build receipt")
+    qualification = verify_packaged_qualification(HERE.parents[1], nq, receipt.get("qualification"))
     return {
         "package_sha256": package_sha,
         "receipt_sha256": receipt_sha,
         "ag_source": builder.AG_HEAD,
         "docket_source": builder.DOCKET_HEAD,
+        "qualification_source": {
+            "compiled_driver_head": builder.DOCKET_HEAD,
+            "compiled_driver_tree": builder.DOCKET_TREE,
+            "compiled_driver_sha256": qualification["driver"]["sha256"],
+            "admitted_builder_sha256": qualification["builder"]["sha256"],
+            "scope": "EXACT_ORDINARY_PACKAGE_BUILD_INPUTS_NOT_CURRENT_M3_DRIVER",
+        },
         "binaries": receipt["binaries"],
     }
 
