@@ -226,6 +226,12 @@ fn bind_cleanup(step: &serde_json::Value, request: &Request) -> Result<(), Strin
 }
 
 fn run() -> Result<(), String> {
+    if std::env::args().nth(1).as_deref() == Some("--recover-existing") {
+        return composition::recover_existing(std::env::args().skip(2));
+    }
+    if std::env::args().nth(1).as_deref() == Some("--inspect-existing") {
+        return composition::inspect_existing(std::env::args().skip(2));
+    }
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.len() != 10 {
         return Err("expected DOCKET AG_EFFECTD OUTPUT RUN MACHINE UNIT SUBJECT SCOPE ENROLLMENT ENROLLMENT_SHA256".into());

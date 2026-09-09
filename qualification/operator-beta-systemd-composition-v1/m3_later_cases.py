@@ -82,7 +82,9 @@ def command(output, label, args, *, required=True, timeout=40):
 
 class Case:
     def __init__(self, name, revision, nq, nq_sha):
-        if (name not in cases() and name != 'cleanup-foreign-operation-receipt-donor') or os.geteuid() != 0:
+        from m3_loss_barrier import case_inventory
+        if (name not in cases() and name not in case_inventory()
+                and name != 'cleanup-foreign-operation-receipt-donor') or os.geteuid() != 0:
             raise ValueError('closed guest case and root enrollment required')
         if len(revision) != 40 or any(c not in '0123456789abcdef' for c in revision) or len(nq_sha) != 64 or any(c not in '0123456789abcdef' for c in nq_sha):
             raise ValueError('exact source and native image pins required')
