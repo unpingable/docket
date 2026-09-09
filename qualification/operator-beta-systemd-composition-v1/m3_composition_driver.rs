@@ -36,6 +36,105 @@ fn now() -> u64 {
         .as_millis().try_into().expect("wall-clock milliseconds exceed u64")
 }
 
+fn input(path: &std::path::Path) -> Result<(serde_json::Value, Vec<u8>), String> {
+    let raw = nq_app::bounded_input::read(path, 2 * 1024 * 1024).map_err(|e|e.to_string())?;
+    let value = nq_protocol::decode_json_document(&raw, 2 * 1024 * 1024).map_err(|e|e.to_string())?;
+    Ok((value, raw))
+}
+
+fn hex_sha(raw: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(raw))
+}
+
+// Exact Python ensure_ascii JSON for this closed fixture's integer/string
+// records, without a trailing newline. Non-integral numbers are not part of
+// its manifest/binding schema and are refused rather than normalized by JCS.
+fn app_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    use serde_json::Value;
+    fn string(text: &str) -> Result<String, String> {
+        let encoded = serde_json::to_string(text).map_err(|e|e.to_string())?;
+        let mut out = String::new();
+        for character in encoded.chars() {
+            if u32::from(character) >= 127 {
+                let mut units = [0; 2];
+                for word in character.encode_utf16(&mut units) { out.push_str(&format!("\\u{word:04x}")); }
+            } else { out.push(character); }
+        }
+        Ok(out)
+    }
+    let text = match value {
+        Value::Null => "null".into(), Value::Bool(value) => value.to_string(),
+        Value::Number(value) if value.is_i64() || value.is_u64() => value.to_string(),
+        Value::Number(_) => return Err("non-integral value outside fixed M3 manifest/binding schema".into()),
+        Value::String(value) => string(value)?,
+        Value::Array(values) => format!("[{}]", values.iter().map(|value|app_bytes(value).map(|raw|String::from_utf8(raw).expect("ASCII JSON"))).collect::<Result<Vec<_>,_>>()?.join(",")),
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.iter().collect();
+            entries.sort_by(|a,b|a.0.cmp(b.0));
+            format!("{{{}}}", entries.into_iter().map(|(key,value)|Ok(format!("{}:{}", string(key)?, String::from_utf8(app_bytes(value)?).expect("ASCII JSON")))).collect::<Result<Vec<_>,String>>()?.join(","))
+        }
+    };
+    Ok(text.into_bytes())
+}
+
+fn bind_cleanup(step: &serde_json::Value, request: &Request) -> Result<(), String> {
+    use serde_json::{json, Value};
+    let request = serde_json::to_value(request).map_err(|e|e.to_string())?;
+    let held = &request["held_request"];
+    for (request_key, step_key) in [("operation", "operation"), ("source", "source"), ("original", "original"),
+        ("application_revision", "revision"), ("original_identity", "source_identity")] {
+        if held[request_key] != step[step_key] { return Err("cleanup factual request belongs to another step".into()); }
+    }
+    let cut = hex_sha(&app_bytes(&step["expected"])?);
+    if held["expected_cut_sha256"] != cut || held["phase"] != "pre_ingest"
+        || request["backup"] != step["backup"] || request["restore"] != step["restore"] {
+        return Err("cleanup factual cut/phase/paths differ".into());
+    }
+    let hold = json!({"schema":"labelwatch.maintenance-hold/v1", "operation":step["operation"],
+        "database":step["source"], "manifest_sha256":cut, "application_revision":step["revision"]});
+    if request["expected_hold_sha256"] != hex_sha(&app_bytes(&hold)?) {
+        return Err("cleanup hold identity differs".into());
+    }
+    let mut writers = serde_json::Map::new();
+    for role in ["main", "discovery"] {
+        let path = step["ready_records"][role].as_str().ok_or("enrolled readiness missing")?;
+        let (ready, _) = input(std::path::Path::new(path))?;
+        writers.insert(role.into(), json!({"pid":ready["pid"], "start_ticks":ready["start_ticks"]}));
+    }
+    if held["writer_identities"] != Value::Object(writers) { return Err("cleanup writer identities differ".into()); }
+    let mut basis = step.as_object().ok_or("step is not an object")?.clone();
+    for key in ["action", "predecessor", "predecessor_sha256", "ready_records"] { basis.remove(key); }
+    let binding = hex_sha(&app_bytes(&Value::Object(basis))?);
+    let mut current = step.clone();
+    let mut replacement = None;
+    for _ in 0..4 {
+        let path = current["predecessor"].as_str().ok_or("cleanup predecessor missing")?;
+        let (previous, raw) = input(std::path::Path::new(path))?;
+        if current["predecessor_sha256"] != hex_sha(&raw) || previous["operation"] != step["operation"] || previous["binding_sha256"] != binding {
+            return Err("cleanup predecessor custody differs".into());
+        }
+        if replacement.is_none() { replacement = Some(previous["detail"]["replacement"]["identity"].clone()); }
+        if previous["action"] == "stage" {
+            let replacement = replacement.ok_or("replacement identity missing")?;
+            if held["replacement_device"] != replacement["device"] || held["replacement_inode"] != replacement["inode"]
+                || request["backup_identity"] != previous["detail"]["backup"]["backup"]["identity"]
+                || request["restore_identity"] != previous["detail"]["backup"]["restored"]["identity"] {
+                return Err("cleanup copy/replacement identity differs from actual predecessors".into());
+            }
+            return Ok(());
+        }
+        let sha = previous["step_sha256"].as_str().ok_or("predecessor step identity missing")?;
+        if sha.len() != 64 || !sha.bytes().all(|b|b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { return Err("malformed predecessor identity".into()); }
+        let path = std::path::Path::new(step["source"].as_str().ok_or("source absent")?).parent().ok_or("source parent absent")?
+            .join("enrollment-candidates").join(sha).join("step.json");
+        let (next, raw) = input(&path)?;
+        if hex_sha(&raw) != sha { return Err("predecessor input bytes differ".into()); }
+        current = next;
+    }
+    Err("exact staging predecessor not found in bounded chain".into())
+}
+
 fn run() -> Result<(), String> {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.len() != 10 {
@@ -73,6 +172,7 @@ fn run() -> Result<(), String> {
         return Err("exact M3 unit/step/subject/scope enrollment differs".into());
     }
     if enrollment.action == "cleanup" {
+        bind_cleanup(&step, enrollment.request.as_ref().ok_or("cleanup request absent")?)?;
         let mut resolver = observation::NativeCleanupObservation {
             enrolled: observation::EnrolledCleanup {
                 receipt: enrollment.receipt.ok_or("cleanup receipt absent")?,
@@ -119,5 +219,17 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("M3 composition refused: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixed_manifest_bytes_match_python_ascii_encoding_without_newline() {
+        let value = serde_json::json!({"z":"é😀\u{7f}\n\t\u{8}\u{c}\r\u{0}\\\"", "a":[1,true,null]});
+        let expected = br#"{"a":[1,true,null],"z":"\u00e9\ud83d\ude00\u007f\n\t\b\f\r\u0000\\\""}"#;
+        assert_eq!(super::app_bytes(&value).unwrap(), expected);
+        assert!(!super::app_bytes(&value).unwrap().ends_with(b"\n"));
+        assert!(super::app_bytes(&serde_json::json!(1.25)).is_err());
     }
 }

@@ -60,17 +60,17 @@ def validate_candidate(candidate, step_raw):
             or candidate['unit'] != unit_name(candidate)):
         raise ValueError('candidate metadata differs from exact hashed step')
     if (Path(candidate['labelwatch_source']) != ROOT / 'labelwatch'
-            or candidate['python'] != '/usr/bin/python3'
+            or candidate['python'] != str(Path('/usr/bin/python3').resolve())
             or not Path(step['source']).is_relative_to(DATA)):
         raise ValueError('unrecognized source/interpreter/fixture target enrollment')
     if Path(candidate['expected_result']) != Path(step['journal']) / (candidate['step_sha256'] + '.completed.json'):
         raise ValueError('candidate terminal path differs from hashed step journal')
-    command = '/usr/bin/python3 -m labelwatch.maintenance_step'
+    command = candidate['python'] + ' -m labelwatch.maintenance_step'
     cut = candidate['qualification_interruption']
     if cut:
-        command = '/usr/bin/python3 ' + str(ROOT / 'labelwatch/qualification/m3-admission/interrupted_step.py')
+        command = candidate['python'] + ' ' + str(ROOT / 'labelwatch/qualification/m3-admission/interrupted_step.py')
     if candidate['qualification_restore_substitution']:
-        command = '/usr/bin/python3 ' + str(ROOT / 'labelwatch/qualification/m3-admission/restore_substitution_step.py')
+        command = candidate['python'] + ' ' + str(ROOT / 'labelwatch/qualification/m3-admission/restore_substitution_step.py')
     command += ' --step ' + candidate['step'] + ' --expected-sha256 ' + candidate['step_sha256']
     if cut:
         command += ' --cut ' + cut
@@ -81,6 +81,45 @@ def validate_candidate(candidate, step_raw):
     if enrolled_unit(candidate) != expected:
         raise ValueError('sealed unit does not execute the exact enrolled step/mode')
     return step
+
+
+def bind_cleanup_request(step, request):
+    held = request['held_request']
+    required = {'operation': step['operation'], 'source': step['source'], 'original': step['original'],
+                'application_revision': step['revision'], 'original_identity': step['source_identity'],
+                'expected_cut_sha256': digest(canonical(step['expected']).rstrip(b'\n')), 'phase': 'pre_ingest'}
+    if any(held.get(key) != value for key, value in required.items()) or request['backup'] != step['backup'] or request['restore'] != step['restore']:
+        raise ValueError('native cleanup request belongs to another step/operation/cut')
+    ready = {role: json.loads(Path(path).read_bytes()) for role, path in step['ready_records'].items()}
+    expected_writers = {role: {key: value[key] for key in ('pid', 'start_ticks')} for role, value in ready.items()}
+    hold = {'schema': 'labelwatch.maintenance-hold/v1', 'operation': step['operation'], 'database': step['source'],
+            'manifest_sha256': required['expected_cut_sha256'], 'application_revision': step['revision']}
+    if held['writer_identities'] != expected_writers or request['expected_hold_sha256'] != digest(canonical(hold).rstrip(b'\n')):
+        raise ValueError('native cleanup writer/hold enrollment differs')
+    current = step
+    stage = replacement = None
+    binding = digest(canonical({key: value for key, value in step.items() if key not in {'action', 'predecessor', 'predecessor_sha256', 'ready_records'}}).rstrip(b'\n'))
+    for _ in range(4):
+        previous_raw = Path(current['predecessor']).read_bytes()
+        previous = json.loads(previous_raw)
+        if digest(previous_raw) != current['predecessor_sha256'] or previous['operation'] != step['operation'] or previous['binding_sha256'] != binding:
+            raise ValueError('cleanup predecessor custody differs')
+        if replacement is None:
+            replacement = previous['detail']['replacement']['identity']
+        if previous['action'] == 'stage':
+            stage = previous
+            break
+        input_path = Path(step['source']).parent / 'enrollment-candidates' / previous['step_sha256'] / 'step.json'
+        raw = input_path.read_bytes()
+        if digest(raw) != previous['step_sha256']:
+            raise ValueError('predecessor input identity differs')
+        current = json.loads(raw)
+    if stage is None:
+        raise ValueError('bounded exact staging predecessor absent')
+    if (held['replacement_device'] != replacement['device'] or held['replacement_inode'] != replacement['inode']
+            or request['backup_identity'] != stage['detail']['backup']['backup']['identity']
+            or request['restore_identity'] != stage['detail']['backup']['restored']['identity']):
+        raise ValueError('native copy/replacement identities differ from stage/service evidence')
 
 
 def execute(candidate_path, output, cleanup):
@@ -102,7 +141,11 @@ def execute(candidate_path, output, cleanup):
         if cleanup is None:
             raise ValueError('cleanup requires actual native source/request/receipt')
         receipt = json.loads((cleanup / 'cleanup-receipt.json').read_bytes())
-        enrollment.update(receipt=str(cleanup / 'cleanup-receipt.json'), receipt_id=receipt['receipt_id'], request=json.loads((cleanup / 'cleanup-request.json').read_bytes()))
+        request = json.loads((cleanup / 'cleanup-request.json').read_bytes())
+        bind_cleanup_request(step, request)
+        if receipt['request'] != request:
+            raise ValueError('native receipt request differs from enrolled request')
+        enrollment.update(receipt=str(cleanup / 'cleanup-receipt.json'), receipt_id=receipt['receipt_id'], request=request)
     elif cleanup is not None:
         raise ValueError('native cleanup receipt attached to another action')
     enrollment_raw = canonical(enrollment)
