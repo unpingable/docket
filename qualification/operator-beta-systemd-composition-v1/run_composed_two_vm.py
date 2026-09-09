@@ -27,13 +27,15 @@ from typing import Any
 
 HERE = pathlib.Path(__file__).resolve().parent
 BUILDER_PATH = HERE / "build_bookworm_fixture.py"
-NQ_HEAD = "7886222f20ebc76516300985cbf09b36c2b294e0"
-NQ_TREE = "cf5f2e281d0efc20882114b29cc5c414298b5e8e"
-NQ_QUALIFIED_HARNESS = "7886222f20ebc76516300985cbf09b36c2b294e0"
-COMPOSITION_OWNER_SUBJECT = "8ac6ea566c2b530f03ee307f0149d2e860fd2583"
-COMPOSITION_OWNER_TREE = "8da5d562c0e14e6804a54ad1e1a84e3741bd05ba"
-COMPOSITION_PACKAGE_SHA256 = "45a18d7c0d7a70933c6a7e2f6c56c190203d1a4afee9b1ec5097065d848d168e"
-COMPOSITION_RECEIPT_SHA256 = "8d69bb44685d68497724a4cf27940344eae62b6a5964fd7b3e82637bf85c736f"
+NQ_HEAD = "e0151d0c090be7ce56e00f7d293440dbe43bf4a4"
+NQ_TREE = "2dbe73cb0fca01b0dbdbd55b7025ab135213af15"
+NQ_QUALIFIED_HARNESS = "e0151d0c090be7ce56e00f7d293440dbe43bf4a4"
+# Checker-only pins: the final checker descendant binds its frozen producer A.
+# The producer records actual admitted HEAD/tree, never these checker constants.
+COMPOSITION_OWNER_SUBJECT = "b255fc84d72f38138c4614321c6ce7a06dead860"
+COMPOSITION_OWNER_TREE = "a2a04e41c9ea85181f0286240dcc56eb0a7f1d49"
+COMPOSITION_PACKAGE_SHA256 = "54ac28c11c1b7cb54f621217c786086d481a4ccbae41a4bc15546995471f9bd5"
+COMPOSITION_RECEIPT_SHA256 = "0d02551ae4666e129f759a6e643037f2fb514aaef7b0c78850f17b03714b050b"
 COMPOSITION_PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
 COMPOSITION_PACKAGE_VERSION = "0.1.0-1"
 REMOTE_COMPOSITION_ROOT = "/var/lib/constellation-operator-beta-composition"
@@ -859,6 +861,7 @@ def check_run(path: pathlib.Path, nq: Any) -> None:
         or result.get("disposition")
         != "ONE_SPEND_ONE_ATTEMPT_BOUNDED_EFFECT_CUSTODY_WITH_DECLARED_LIMITATIONS"
         or result.get("nq_harness_subject") != NQ_HEAD
+        or result.get("composition_subject") != COMPOSITION_OWNER_SUBJECT
         or result.get("composition_package_sha256") != COMPOSITION_PACKAGE_SHA256
         or result.get("signed_upstream_checksum") != "NOT_QUALIFIED"
         or result.get("docket_database_occurrence") != "RECORDED"
@@ -938,7 +941,7 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
     if (
         recovery.get("harness_subject") != NQ_HEAD
         or recovery.get("accepted_package_result")
-        != "8865dcad23f17a1f26716161554530237e04bb9e"
+        != "491914640612960e393e8da7c1c0d1280002330c"
         or not isinstance(recovery.get("input_facts"), dict)
         or set(recovery["input_facts"])
         != {
@@ -963,7 +966,7 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
         or recovery["input_facts"].get("image_sha512")
         != "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817"
         or recovery["input_facts"].get("nq_deb_sha256")
-        != "8c41c2b4d320770c6a04b09649b4c229fb00e86f64689c3c2f3f1c2a4d4e3019"
+        != "bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca"
         or not isinstance(recovery["input_facts"].get("free_bytes"), int)
         or recovery["input_facts"]["free_bytes"] < 0
         or not isinstance(producer, dict)
@@ -990,13 +993,13 @@ def check_refusal(path: pathlib.Path, nq: Any) -> None:
         or fixture.get("ag_source")
         != "bf6adde2792a886d1ba75d97ca77efb8e914f4f5"
         or fixture.get("docket_source")
-        != "6c57926d2560c47c681691e006fbbfe244c6993e"
+        != "09ba85fdf0c05b7e1664ebea84cdbb611a0ceda4"
         or fixture.get("package_sha256") != COMPOSITION_PACKAGE_SHA256
         or fixture.get("receipt_sha256") != COMPOSITION_RECEIPT_SHA256
         or not isinstance(fixture.get("binaries"), dict)
         or set(fixture["binaries"]) != {"composition-driver", "docket"}
         or fixture["binaries"]["composition-driver"].get("sha256")
-        != "0a0e4d200156b20e52d75f643074aa4d0ee82928c55a746ee464a62d6e4ca320"
+        != "4ce5ee7a73d7b2c1d3abd00e23302cbc0032c44088af49872c7a87a8d5525a4c"
         or fixture["binaries"]["docket"].get("sha256")
         != "4134dba8a5437782669d7a694acacb61ac49628f6a805ddbce2e7a1f9a3c95b1"
         or not isinstance(repository, dict)

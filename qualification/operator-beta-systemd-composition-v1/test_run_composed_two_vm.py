@@ -32,12 +32,37 @@ adapter = load("composition_adapter_test", HERE / "run_composed_two_vm.py")
 nq = load(
     "composition_nq_test",
     pathlib.Path(
-        "/data/git/.worktrees/nq-ng-classic-retirement-composition-20260908/qualification/operator-beta-m1b-v1/run_two_vm.py"
+        "/data/git/.worktrees/nq-m4-harness-20260909/qualification/operator-beta-m1b-v1/run_two_vm.py"
     ),
 )
 
 
 class CompositionAdapterTests(unittest.TestCase):
+    def test_positive_result_refuses_otherwise_matching_foreign_producer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            result = {
+                'schema': 'constellation.operator_beta.composed_m1b_run_result.v1',
+                'run_id': 'bounded-subject-control', 'completed_at': '2026-09-09T00:00:00Z',
+                'disposition': 'ONE_SPEND_ONE_ATTEMPT_BOUNDED_EFFECT_CUSTODY_WITH_DECLARED_LIMITATIONS',
+                'nq_harness_subject': adapter.NQ_HEAD,
+                'composition_subject': '0' * 40,
+                'composition_package_sha256': adapter.COMPOSITION_PACKAGE_SHA256,
+                'signed_upstream_checksum': 'NOT_QUALIFIED',
+                'docket_database_occurrence': 'RECORDED',
+                'authorization_consumption': 'RECORDED',
+                'effect_enactment': 'RECORDED_SUCCESS',
+                'aggregate_postcondition': 'NOT_RECORDED',
+                'literal_distributed_exactly_once': 'NOT_CLAIMED',
+                'deployment': 'NOT_RUN', 'production': 'NOT_RUN',
+                'manifest_sha256': '1' * 64,
+            }
+            with mock.patch.object(adapter, 'reopen_manifest', return_value=({}, {})), \
+                 mock.patch.object(adapter, 'canonical_record', return_value=result), \
+                 mock.patch.object(adapter, 'sha256', return_value='1' * 64):
+                with self.assertRaisesRegex(nq.Refusal, 'closed bounded disposition'):
+                    adapter.check_run(root, nq)
+
     def refusal_records(self, root: pathlib.Path) -> tuple[dict, dict]:
         refusal = {
             "schema": "constellation.operator_beta.m1b_refusal.v1",
@@ -54,7 +79,7 @@ class CompositionAdapterTests(unittest.TestCase):
             "host": "local-fixture",
             "working_directory": str(root),
             "harness_subject": adapter.NQ_HEAD,
-            "accepted_package_result": "8865dcad23f17a1f26716161554530237e04bb9e",
+            "accepted_package_result": "491914640612960e393e8da7c1c0d1280002330c",
             "input_facts": {
                 "ag_deb_sha256": "80ea7ad067da9d5ed1f07b39fb7ee41eef58680f3af15fad64c6b1bf05c1045c",
                 "ag_executable_sha256": "7c45c79de452ab838cf79575872b0797eafbe27c7904b113e560967d11eef75e",
@@ -63,18 +88,18 @@ class CompositionAdapterTests(unittest.TestCase):
                                            "tree": adapter.COMPOSITION_OWNER_TREE},
                 "composition_fixture": {
                     "ag_source": "bf6adde2792a886d1ba75d97ca77efb8e914f4f5",
-                    "docket_source": "6c57926d2560c47c681691e006fbbfe244c6993e",
+                    "docket_source": "09ba85fdf0c05b7e1664ebea84cdbb611a0ceda4",
                     "package_sha256": adapter.COMPOSITION_PACKAGE_SHA256,
                     "receipt_sha256": adapter.COMPOSITION_RECEIPT_SHA256,
                     "binaries": {
-                        "composition-driver": {"sha256": "0a0e4d200156b20e52d75f643074aa4d0ee82928c55a746ee464a62d6e4ca320"},
+                        "composition-driver": {"sha256": "4ce5ee7a73d7b2c1d3abd00e23302cbc0032c44088af49872c7a87a8d5525a4c"},
                         "docket": {"sha256": "4134dba8a5437782669d7a694acacb61ac49628f6a805ddbce2e7a1f9a3c95b1"},
                     },
                 },
                 "free_bytes": 30000000000,
                 "image_checksum_signature": "UPSTREAM_DETACHED_SIGNATURE_NOT_PUBLISHED",
                 "image_sha512": "490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817",
-                "nq_deb_sha256": "8c41c2b4d320770c6a04b09649b4c229fb00e86f64689c3c2f3f1c2a4d4e3019",
+                "nq_deb_sha256": "bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca",
             },
             "protocols": {"docket_transport": "gwr.executor-transport/v1"},
             "phase": "refused",

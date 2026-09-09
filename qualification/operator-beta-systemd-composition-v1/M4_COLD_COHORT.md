@@ -1,5 +1,26 @@
 # M4 cold-cohort cut: bounded operator procedure
 
+## Final beta input preparation (2026-09-09)
+
+This derivative uses the independently inspected NQ Bookworm package
+`bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca`,
+runtime source `920dc7621f5cdf768473cef26311294fdf6cf61c`, and packaged
+`nq` executable `370c4fdff391886460a56747c9b894ba4bd53a2f37b796bfb7f7966d1229bd82`.
+NQ owner-result `491914640612960e393e8da7c1c0d1280002330c` is the package
+evidence pointer, not the compiled runtime identity. Derivative VM harness
+`e0151d0c090be7ce56e00f7d293440dbe43bf4a4` changes only enrolled pins relative
+to the accepted retirement producer. Original M2/retirement/VM002 records are
+historical inputs and have not been amended or extended to this candidate.
+
+The current ordinary composition fixture is rebuilt against exact Docket
+`09ba85fdf0c05b7e1664ebea84cdbb611a0ceda4` and AG runtime `bf6adde` rather
+than treating a prior receipt's driver hash as covering changed source. Package
+hashes and producer/checker identities must be frozen before a new VM run.
+Host source controls do not establish the cold package transition, fresh
+admission, or actual recovery outcomes; these remain NOT_RUN until reopened.
+
+## Procedure and historical evidence
+
 Candidate procedure, not yet qualified as a package/service transition. The
 local stopped-copy witness is `day_two_cold_cut.py`; it establishes no human
 operator trial or current authorization from historical records.
