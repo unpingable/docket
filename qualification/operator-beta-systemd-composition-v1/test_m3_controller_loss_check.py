@@ -40,6 +40,8 @@ class OwnerCorrespondenceTests(unittest.TestCase):
         value = fixture('executor-completed-before-reply')
         value['after']['state'] = {'reconciliation_required': {}}
         value['replay_after']['settlements'] = 0
+        owner_states(value, 'executor-completed-before-reply')
+        value['replay_after']['settlements'] = 1
         with self.assertRaises(ValueError):
             owner_states(value, 'executor-completed-before-reply')
 

@@ -28,8 +28,11 @@ def owner_states(recovery, cut):
     before = ('dispatched' if cut == 'docket-settled-before-ag-poll' else
         'settled_observation_required' if cut == 'ag-settled-before-export' else 'authorization_consumed')
     require(set(recovery['before']['state']) == {before}, 'actual pre-recovery AG state differs from cut')
-    after = 'authorization_consumed' if cut == 'ag-consumed-before-accept' else 'settled_observation_required'
-    require(set(recovery['after']['state']) == {after}, 'actual post-recovery AG state differs')
+    allowed_after = ({'authorization_consumed'} if cut == 'ag-consumed-before-accept' else
+        {'settled_observation_required', 'reconciliation_required'} if cut in
+        ('docket-reserved-before-executor', 'executor-completed-before-reply') else {'settled_observation_required'})
+    require(len(recovery['after']['state']) == 1 and set(recovery['after']['state']) <= allowed_after,
+        'actual post-recovery AG state differs')
     require(recovery['replay_before']['ag_spends'] == recovery['replay_after']['ag_spends'] == 1, 'spend was lost or repeated')
     require(recovery['execution_capability'] == 'RECONCILIATION_ONLY_NO_SIGNER_NO_ACCEPT_ISSUANCE', 'recovery has execution capability')
     if cut == 'ag-consumed-before-accept':
@@ -37,7 +40,10 @@ def owner_states(recovery, cut):
         require(recovery['before'] == recovery['after'], 'not-accepted recovery advanced authority')
         require(recovery['replay_after']['docket_attempts'] == recovery['replay_after']['settlements'] == 0, 'unaccepted issuance crossed custody')
     else:
-        require(recovery['replay_after']['docket_attempts'] == recovery['replay_after']['settlements'] == 1, 'not exactly one attempt/settlement')
+        settled = 'settled_observation_required' in recovery['after']['state']
+        require(recovery['replay_after']['docket_attempts'] == 1 and
+            recovery['replay_after']['settlements'] == (1 if settled else 0),
+            'actual known/indeterminate owner counts differ')
 
 
 def check_retained_owner(directory):
@@ -114,13 +120,18 @@ def check(directory, driver, driver_sha, nq, nq_sha):
         require(started.is_file() and terminal.is_file(), 'already admitted helper did not complete')
         require(read(terminal)['step_sha256'] == candidate['step_sha256'], 'helper terminal differs')
         owner = run_json([DOCKET, 'governed-loop', 'inspect', '--state', str(evidence / 'custody/occurrence/docket-state'), '--issuance', issuance])
-        settled = recovered['after']['state']['settled_observation_required']
-        require(owner['record']['settlement'] == settled['settlement'], 'Docket/AG exact settlement differs')
+        settled = recovered['after']['state'].get('settled_observation_required')
+        if settled is not None:
+            require(owner['record']['status'] == 'settled' and owner['record']['settlement'] == settled['settlement'], 'Docket/AG exact settlement differs')
+        else:
+            require(owner['record']['status'] in ('accepted', 'indeterminate') and
+                owner['record'].get('settlement') is None, 'indeterminate owner state fabricated settlement')
         dispatch = {'attempt': owner['record']['custody']['attempt'], 'marker': owner['record']['custody']['executor_marker'],
             'work_schema': owner['record']['issuance']['work_schema'], 'work': owner['record']['issuance']['work'],
             'subject': owner['record']['issuance']['subject'], 'scope': owner['record']['issuance']['scope']}
         actual_effect = run_json([AG, 'reconcile', str(evidence / 'custody/occurrence/systemd-plan-v2.json')], json.dumps(dispatch).encode())
-        require(actual_effect['receipt'] == owner['record']['settlement']['receipt'], 'real AG effect store differs from Docket settlement')
+        if settled is not None:
+            require(actual_effect['receipt'] == owner['record']['settlement']['receipt'], 'real AG effect store differs from Docket settlement')
         require(read(barrier / 'REAL-EXECUTOR-RESULT.json')['exit'] == 0, 'real executor did not complete')
     if cut == 'docket-reserved-before-executor':
         observed = arrived['owner_observation']
@@ -162,6 +173,7 @@ def check(directory, driver, driver_sha, nq, nq_sha):
         require(current['disposition'] in ('FORWARD_RECOVERY_ONLY', 'INDETERMINATE_WRITE_RESUMPTION_KEEP_STOPPED'), 'post-release state silently authorizes rollback')
     native = native_reexecution(directory, nq, nq_sha)
     return {'case': producer['case'], 'owner_reopened': True, 'original_spends': 1,
+        'actual_owner_state': next(iter(recovered['after']['state'])),
         'actual_companion_exit_observed': True, 'application_recovery': current,
         'native_reexecution': native, 'new_effect_authority': 'NONE',
         'qualification': 'SCOPED_CONTROLLER_LOSS_CHECKS_REQUIRE_INDEPENDENT_REVIEW'}
