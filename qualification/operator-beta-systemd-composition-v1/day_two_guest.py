@@ -60,22 +60,34 @@ def main():
         state = call(name + '-state', ['systemctl', 'show', 'nqd.service', '--property=ActiveState', '--value'])
         assert state.strip() == b'inactive'
 
+    def ready(name):
+        # A pathname or Type=simple start is not a responding owner API.
+        deadline = time.monotonic() + 20
+        attempt = 0
+        while time.monotonic() < deadline:
+            attempt += 1
+            result = subprocess.run(['curl', '--max-time', '2', '--fail', '--silent', '--show-error', '--unix-socket', '/run/nq/nqd.sock', 'http://localhost/v3/status'], capture_output=True, timeout=3)
+            label = name + '-' + str(attempt)
+            (ROOT / (label + '.stdout')).write_bytes(result.stdout)
+            (ROOT / (label + '.stderr')).write_bytes(result.stderr)
+            records.append({'case': label, 'exit': result.returncode})
+            if result.returncode == 0:
+                response = json.loads(result.stdout)
+                assert response['schema'] == 'nq.status_snapshot.v3'
+                return response
+            time.sleep(0.1)
+        raise RuntimeError(name + ': no successful fresh owner status response')
+
     try:
         stopped('initial-stop')
         install_config(config)
         nq('valid-config', ['config', 'check'])
         call('start', ['systemctl', 'start', 'nqd.service'])
         active('active-first')
-        # Type=simple start completion does not establish socket readiness.
-        deadline = time.monotonic() + 20
-        while not pathlib.Path('/run/nq/nqd.sock').exists():
-            if time.monotonic() >= deadline:
-                raise RuntimeError('nqd socket readiness timed out')
-            time.sleep(0.1)
-        first = json.loads(call('inspect-unix', ['curl', '--fail', '--silent', '--show-error', '--unix-socket', '/run/nq/nqd.sock', 'http://localhost/v3/status']))
-        assert first['schema'] == 'nq.status_snapshot.v3'
+        ready('inspect-first')
         call('restart', ['systemctl', 'restart', 'nqd.service'])
         active('active-after-restart')
+        ready('inspect-after-restart')
         stopped('maintenance-stop')
         nq('backup', ['backup', str(ROOT / 'backup.sqlite')])
         nq('restore', ['restore', str(ROOT / 'backup.sqlite'), str(ROOT / 'restored.sqlite')])
@@ -90,6 +102,8 @@ def main():
         nq('already-current-upgrade', ['admin', 'upgrade', '--backup-directory', str(ROOT / 'upgrade-backups')])
         install_config(b'schema = [invalid\n')
         call('invalid-start-refused', ['systemctl', 'start', 'nqd.service'], False)
+        call('invalid-start-unit-result', ['systemctl', 'show', 'nqd.service', '--property=Result', '--property=ExecMainStatus', '--property=ExecStartPre'])
+        call('invalid-start-journal', ['journalctl', '--no-pager', '-u', 'nqd.service', '--output=short-iso', '-n', '100'])
         # Stop cancels the packaged Restart=on-failure loop. No automatic
         # repair or unknown state is reclassified as a successful start.
         stopped('invalid-config-stop')
@@ -98,6 +112,7 @@ def main():
         nq('recovery-config-check', ['config', 'check'])
         call('recovery-start', ['systemctl', 'start', 'nqd.service'])
         active('recovery-active')
+        ready('inspect-recovery')
         stopped('final-stop')
         call('journal', ['journalctl', '--no-pager', '-u', 'nqd.service', '--output=short-iso', '-n', '200'])
         result = {'schema': 'constellation.m4.day_two_fixture.v1', 'disposition': 'DAY_TWO_PROCEDURE_DEMONSTRATED', 'cases': records, 'service': 'nqd.service', 'scheduled_watchers': 0, 'upgrade': 'ALREADY_CURRENT_ONLY', 'binary_upgrade': 'NOT_RUN', 'restored_history_authorizes_effects': False, 'human_operator_trial': 'NOT_RUN', 'restored_typed_row_manifest': backup_manifest, 'source_store_sha256_after': hashlib.sha256(STORE.read_bytes()).hexdigest()}

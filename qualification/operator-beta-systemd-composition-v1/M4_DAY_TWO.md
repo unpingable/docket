@@ -18,6 +18,8 @@ demonstrated both roles' complete typed-row/schema preservation, refused
 existing-destination and corrupt-source restores, unchanged config on invalid
 apply, and equal durable status. Read-time `generated_at` remains separate.
 Raw private evidence is under the campaign's `m4/restore-002-*` directories.
+Its SQLite immutable read mode is valid only for these quiescent standalone
+snapshots, never for a running store with uncollected WAL state.
 
 The new VM candidate adds actual packaged `nqd.service` start, Unix API
 inspection, restart, stop, online backup, absent-destination restore,
