@@ -32,8 +32,8 @@ NQ_TREE = "2dbe73cb0fca01b0dbdbd55b7025ab135213af15"
 NQ_QUALIFIED_HARNESS = "e0151d0c090be7ce56e00f7d293440dbe43bf4a4"
 # Checker-only pins: the final checker descendant binds its frozen producer A.
 # The producer records actual admitted HEAD/tree, never these checker constants.
-COMPOSITION_OWNER_SUBJECT = "b255fc84d72f38138c4614321c6ce7a06dead860"
-COMPOSITION_OWNER_TREE = "a2a04e41c9ea85181f0286240dcc56eb0a7f1d49"
+COMPOSITION_OWNER_SUBJECT = "1d6cb0b112f7474faf0ab12630cbbe37cf18536b"
+COMPOSITION_OWNER_TREE = "d0dbc84eca8c48607080bab697d7ed52408ed085"
 COMPOSITION_PACKAGE_SHA256 = "54ac28c11c1b7cb54f621217c786086d481a4ccbae41a4bc15546995471f9bd5"
 COMPOSITION_RECEIPT_SHA256 = "0d02551ae4666e129f759a6e643037f2fb514aaef7b0c78850f17b03714b050b"
 COMPOSITION_PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
