@@ -18,9 +18,9 @@ from day_two_restore import logical_manifest
 ROOT = pathlib.Path('/var/lib/nq/m4-cold')
 CONFIG = pathlib.Path('/etc/nq/nq.toml')
 OLD_BINARY = '03778e0e9ea19366c920c98d041436d30f92b83abf0745766ef446c811e65cd9'
-NEW_BINARY = 'a672ef6aad196e989989a62bb0281e81a8918be8d824fe1caf94913505822427'
+NEW_BINARY = '370c4fdff391886460a56747c9b894ba4bd53a2f37b796bfb7f7966d1229bd82'
 OLD_PACKAGE = '0fd1ce9e1be48b56ba5e526993a94c4682499bb9dbd9304dffd4500c01603636'
-NEW_PACKAGE = '8c41c2b4d320770c6a04b09649b4c229fb00e86f64689c3c2f3f1c2a4d4e3019'
+NEW_PACKAGE = 'bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca'
 
 
 def digest(path):
