@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from m3_controller_loss_check import owner_states, check_retained_owner
+from m3_controller_loss_check import owner_states, check_retained_owner, application_expected
 from m3_loss_barrier import case_inventory, release_identity
 
 
@@ -24,6 +24,12 @@ def fixture(cut):
 
 
 class OwnerCorrespondenceTests(unittest.TestCase):
+    def test_pre_stage_loss_preserves_already_enrolled_hold(self):
+        self.assertEqual(application_expected('stage', 'ag-consumed-before-accept'),
+            ((True, False, False), True))
+        self.assertEqual(application_expected('stage', 'ag-settled-before-export'),
+            ((True, False, True), True))
+
     def test_closed_five_cut_owner_shapes(self):
         from m3_loss_barrier import CUTS
         for cut in CUTS:
