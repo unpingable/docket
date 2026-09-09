@@ -20,6 +20,7 @@ struct Enrollment {
     action: String,
     unit: String,
     step_sha256: String,
+    step: PathBuf,
     qualification_interruption: Option<String>,
     qualification_restore_substitution: bool,
     subject: String,
@@ -48,6 +49,13 @@ fn run() -> Result<(), String> {
         return Err("exact root enrollment bytes differ".into());
     }
     let enrollment: Enrollment = nq_protocol::decode_json_document(&raw, 2 * 1024 * 1024).map_err(|e| e.to_string())?;
+    let step_raw = nq_app::bounded_input::read(&enrollment.step, 2 * 1024 * 1024).map_err(|e|e.to_string())?;
+    let step: serde_json::Value = nq_protocol::decode_json_document(&step_raw, 2 * 1024 * 1024).map_err(|e|e.to_string())?;
+    if format!("{:x}", Sha256::digest(&step_raw)) != enrollment.step_sha256
+        || step["schema"] != "labelwatch.sqlite-relief-step/v1"
+        || step["action"] != enrollment.action {
+        return Err("admission action differs from exact executed step bytes".into());
+    }
     let suffix = match (enrollment.qualification_interruption.as_deref(), enrollment.qualification_restore_substitution) {
         (None, false) => String::new(),
         (None, true) if enrollment.action == "stage" => "-q-restore-substitution".into(),

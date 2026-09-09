@@ -1,6 +1,7 @@
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import m3_guest_route as route
 
 
@@ -51,6 +52,23 @@ class EnrolledRouteTests(unittest.TestCase):
         self.candidate['action'] = 'cleanup'
         with self.assertRaises(ValueError):
             route.unit_name(self.candidate)
+
+    def test_cleanup_action_cannot_be_relabelled_as_fixture_admission(self):
+        step = {'schema': 'labelwatch.sqlite-relief-step/v1', 'action': 'cleanup', 'revision': 'b' * 40}
+        raw = route.canonical(step)
+        candidate = dict(self.candidate, schema='labelwatch.m3-enrollment-candidate/v1',
+                         source_revision='b' * 40, status='NOT_ENROLLED_NOT_AUTHORIZED',
+                         step_sha256=route.digest(raw), action='stage')
+        candidate['unit'] = route.unit_name(candidate)
+        with patch.object(route, 'enrolled_unit') as fragment:
+            with self.assertRaisesRegex(ValueError, 'metadata differs'):
+                route.validate_candidate(candidate, raw)
+            fragment.assert_not_called()
+
+    def test_malformed_digest_rejected_before_unit_path_construction(self):
+        for sha in ('../other', 'A' * 64, 'g' * 64, 'a' * 63):
+            with self.assertRaises(ValueError):
+                route.unit_name(dict(self.candidate, step_sha256=sha))
 
 
 if __name__ == '__main__':

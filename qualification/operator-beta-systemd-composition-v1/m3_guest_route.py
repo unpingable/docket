@@ -24,6 +24,9 @@ def digest(raw):
 
 
 def unit_name(candidate):
+    sha = candidate['step_sha256']
+    if not isinstance(sha, str) or len(sha) != 64 or any(c not in '0123456789abcdef' for c in sha):
+        raise ValueError('exact lowercase step digest required')
     cut = candidate['qualification_interruption']
     restore = candidate['qualification_restore_substitution']
     if (cut is not None and cut not in CUTS) or type(restore) is not bool or (cut and restore):
@@ -46,6 +49,40 @@ def enrolled_unit(candidate):
     return raw
 
 
+def validate_candidate(candidate, step_raw):
+    step = json.loads(step_raw)
+    if (candidate['schema'] != 'labelwatch.m3-enrollment-candidate/v1'
+            or step['schema'] != 'labelwatch.sqlite-relief-step/v1'
+            or candidate['action'] != step['action']
+            or candidate['source_revision'] != step['revision']
+            or candidate['status'] != 'NOT_ENROLLED_NOT_AUTHORIZED'
+            or digest(step_raw) != candidate['step_sha256']
+            or candidate['unit'] != unit_name(candidate)):
+        raise ValueError('candidate metadata differs from exact hashed step')
+    if (Path(candidate['labelwatch_source']) != ROOT / 'labelwatch'
+            or candidate['python'] != '/usr/bin/python3'
+            or not Path(step['source']).is_relative_to(DATA)):
+        raise ValueError('unrecognized source/interpreter/fixture target enrollment')
+    if Path(candidate['expected_result']) != Path(step['journal']) / (candidate['step_sha256'] + '.completed.json'):
+        raise ValueError('candidate terminal path differs from hashed step journal')
+    command = '/usr/bin/python3 -m labelwatch.maintenance_step'
+    cut = candidate['qualification_interruption']
+    if cut:
+        command = '/usr/bin/python3 ' + str(ROOT / 'labelwatch/qualification/m3-admission/interrupted_step.py')
+    if candidate['qualification_restore_substitution']:
+        command = '/usr/bin/python3 ' + str(ROOT / 'labelwatch/qualification/m3-admission/restore_substitution_step.py')
+    command += ' --step ' + candidate['step'] + ' --expected-sha256 ' + candidate['step_sha256']
+    if cut:
+        command += ' --cut ' + cut
+    expected = ('[Unit]\nDescription=M3 exact enrolled fixture step\n'
+        '[Service]\nType=oneshot\nUser=root\nGroup=root\nRestart=no\n'
+        'TimeoutStartSec=25\nEnvironment=PYTHONPATH=' + str(ROOT / 'labelwatch/src') + '\n'
+        'ExecStart=' + command + '\n[Install]\nWantedBy=multi-user.target\n').encode()
+    if enrolled_unit(candidate) != expected:
+        raise ValueError('sealed unit does not execute the exact enrolled step/mode')
+    return step
+
+
 def execute(candidate_path, output, cleanup):
     if os.geteuid() != 0 or output.exists():
         raise RuntimeError('requires root fixture enrollment and absent evidence destination')
@@ -54,13 +91,22 @@ def execute(candidate_path, output, cleanup):
             raise ValueError('physical path outside enrolled fixture data root')
     candidate = json.loads(candidate_path.read_bytes())
     step_raw = Path(candidate['step']).read_bytes()
-    step = json.loads(step_raw)
-    if digest(step_raw) != candidate['step_sha256'] or candidate['unit'] != unit_name(candidate):
-        raise ValueError('step/unit identity differs')
-    if Path(candidate['labelwatch_source']) != ROOT / 'labelwatch':
-        raise ValueError('unrecognized enrolled application source')
-    output.mkdir(mode=0o700)
+    step = validate_candidate(candidate, step_raw)
     raw_unit = enrolled_unit(candidate)
+    subject = 'sha256:' + digest(canonical({'schema': 'constellation.m3-subject/v1', 'operation': step['operation'], 'source': step['source'], 'revision': step['revision']}))
+    scope = 'sha256:' + digest(canonical({'schema': 'constellation.m3-scope/v1', 'action': candidate['action'], 'step_sha256': candidate['step_sha256'], 'unit': candidate['unit'], 'unit_sha256': digest(raw_unit)}))
+    enrollment = {'schema': 'constellation.m3-driver-enrollment/v1', 'action': candidate['action'], 'unit': candidate['unit'], 'step_sha256': candidate['step_sha256'], 'subject': subject, 'scope': scope, 'receipt': None, 'receipt_id': None, 'request': None}
+    enrollment.update(qualification_interruption=candidate['qualification_interruption'], qualification_restore_substitution=candidate['qualification_restore_substitution'])
+    enrollment['step'] = candidate['step']
+    if candidate['action'] == 'cleanup':
+        if cleanup is None:
+            raise ValueError('cleanup requires actual native source/request/receipt')
+        receipt = json.loads((cleanup / 'cleanup-receipt.json').read_bytes())
+        enrollment.update(receipt=str(cleanup / 'cleanup-receipt.json'), receipt_id=receipt['receipt_id'], request=json.loads((cleanup / 'cleanup-request.json').read_bytes()))
+    elif cleanup is not None:
+        raise ValueError('native cleanup receipt attached to another action')
+    enrollment_raw = canonical(enrollment)
+    output.mkdir(mode=0o700)
     unit_path = Path('/etc/systemd/system') / candidate['unit']
     with unit_path.open('xb') as stream:
         stream.write(raw_unit)
@@ -72,18 +118,6 @@ def execute(candidate_path, output, cleanup):
         observed = subprocess.check_output(['systemctl', 'show', candidate['unit'], '--property=' + kind, '--value'], text=True).strip()
         if observed != {'ActiveState': 'inactive', 'UnitFileState': 'disabled'}[kind]:
             raise ValueError('unit is not fresh inactive/disabled')
-    subject = 'sha256:' + digest(canonical({'schema': 'constellation.m3-subject/v1', 'operation': step['operation'], 'source': step['source'], 'revision': step['revision']}))
-    scope = 'sha256:' + digest(canonical({'schema': 'constellation.m3-scope/v1', 'action': candidate['action'], 'step_sha256': candidate['step_sha256'], 'unit': candidate['unit'], 'unit_sha256': digest(raw_unit)}))
-    enrollment = {'schema': 'constellation.m3-driver-enrollment/v1', 'action': candidate['action'], 'unit': candidate['unit'], 'step_sha256': candidate['step_sha256'], 'subject': subject, 'scope': scope, 'receipt': None, 'receipt_id': None, 'request': None}
-    enrollment.update(qualification_interruption=candidate['qualification_interruption'], qualification_restore_substitution=candidate['qualification_restore_substitution'])
-    if candidate['action'] == 'cleanup':
-        if cleanup is None:
-            raise ValueError('cleanup requires actual native source/request/receipt')
-        receipt = json.loads((cleanup / 'cleanup-receipt.json').read_bytes())
-        enrollment.update(receipt=str(cleanup / 'cleanup-receipt.json'), receipt_id=receipt['receipt_id'], request=json.loads((cleanup / 'cleanup-request.json').read_bytes()))
-    elif cleanup is not None:
-        raise ValueError('native cleanup receipt attached to another action')
-    enrollment_raw = canonical(enrollment)
     enrollment_path = output / 'enrollment.json'
     enrollment_path.write_bytes(enrollment_raw)
     enrollment_path.chmod(0o400)
