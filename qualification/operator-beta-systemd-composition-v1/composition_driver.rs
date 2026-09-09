@@ -94,7 +94,9 @@ impl ObservationResolverV1 for Observation {
     }
 }
 
-struct Standing { expires_at: Option<u64> }
+struct Standing {
+    expires_at: Option<u64>,
+}
 
 impl StandingResolverV1 for Standing {
     fn resolve_standing(
@@ -149,8 +151,7 @@ impl Scenario {
             scope: scope.clone(),
             effect_index: 0,
             effect: CanonicalEffectV1::SystemdUnit {
-                target: TargetId::parse(FIXTURE_TARGET)
-                    .map_err(|error| error.to_string())?,
+                target: TargetId::parse(FIXTURE_TARGET).map_err(|error| error.to_string())?,
                 unit,
                 action: SystemdUnitActionV1::Start,
                 expected_active_state: "inactive".to_owned(),
@@ -237,7 +238,11 @@ struct DocketFiles {
     signer: AgIssuanceSignerV1,
 }
 
-fn docket_files(root: &Path, execution_boundary: Option<&ExecutionBoundary>, issuance: &AgIssuanceV1) -> Result<DocketFiles, String> {
+fn docket_files(
+    root: &Path,
+    execution_boundary: Option<&ExecutionBoundary>,
+    issuance: &AgIssuanceV1,
+) -> Result<DocketFiles, String> {
     let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
         .map_err(|_| "could not generate qualification Ed25519 key".to_owned())?;
     let pair = Ed25519KeyPair::from_pkcs8(key_document.as_ref())
@@ -263,12 +268,14 @@ o={"schema":"docket.governed-loop.execution-standing-resolution/v1","resolution"
 sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
 "#.to_owned();
     if let Some(boundary) = execution_boundary {
-        let encoded = serde_json::to_string(&serde_json::to_string(issuance).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        let encoded =
+            serde_json::to_string(&serde_json::to_string(issuance).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         let guard = format!("\nif i != json.loads({encoded}): raise SystemExit('exact enrolled issuance differs')\no['expires_at_unix_ms']={}\nif r['now_unix_ms'] >= {}: o['status']='expired'\n", boundary.expires_at, boundary.expires_at);
-        resolver_source = resolver_source.replace("sys.stdout.write", &(guard + "sys.stdout.write"));
+        resolver_source =
+            resolver_source.replace("sys.stdout.write", &(guard + "sys.stdout.write"));
     }
-    std::fs::write(&resolver, resolver_source)
-    .map_err(|error| error.to_string())?;
+    std::fs::write(&resolver, resolver_source).map_err(|error| error.to_string())?;
     std::fs::set_permissions(&resolver, std::fs::Permissions::from_mode(0o700))
         .map_err(|error| error.to_string())?;
     Ok(DocketFiles {
@@ -282,9 +289,18 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
 pub(crate) fn authorize(engine: &mut CampaignEngineV1, scenario: &Scenario) -> Result<(), String> {
     let mut observation = Observation;
     let mut tick = 1;
-    authorize_with_observation(engine, scenario, &mut observation,
-        ObservationRefV1::from_digest(digest("observation")), OBSERVATION_RESOLVER_ID,
-        || { tick += 1; tick }, None)
+    authorize_with_observation(
+        engine,
+        scenario,
+        &mut observation,
+        ObservationRefV1::from_digest(digest("observation")),
+        OBSERVATION_RESOLVER_ID,
+        || {
+            tick += 1;
+            tick
+        },
+        None,
+    )
 }
 
 pub(crate) fn authorize_with_observation<O: ObservationResolverV1>(
@@ -387,7 +403,15 @@ fn main() {
 #[cfg(not(feature = "m3-labelwatch"))]
 fn run() -> Result<(), String> {
     let mut tick = 5;
-    run_with_admission(std::env::args().skip(1), authorize, || { tick += 1; tick }, None)
+    run_with_admission(
+        std::env::args().skip(1),
+        authorize,
+        || {
+            tick += 1;
+            tick
+        },
+        None,
+    )
 }
 
 pub(crate) struct ExecutionBoundary {
@@ -445,9 +469,18 @@ pub(crate) fn run_with_admission(
     if let Err(error) = admit(&mut engine, &scenario) {
         #[cfg(feature = "m3-labelwatch")]
         {
-            write_canonical(&output.join("admission-refusal-state.json"), &engine.current().map_err(|e| e.to_string())?)?;
-            write_canonical(&output.join("admission-refusal-replay.json"), &engine.replay().map_err(|e| e.to_string())?)?;
-            write_canonical(&output.join("admission-refusal-history.json"), &engine.history().map_err(|e| e.to_string())?)?;
+            write_canonical(
+                &output.join("admission-refusal-state.json"),
+                &engine.current().map_err(|e| e.to_string())?,
+            )?;
+            write_canonical(
+                &output.join("admission-refusal-replay.json"),
+                &engine.replay().map_err(|e| e.to_string())?,
+            )?;
+            write_canonical(
+                &output.join("admission-refusal-history.json"),
+                &engine.history().map_err(|e| e.to_string())?,
+            )?;
         }
         return Err(error);
     }
@@ -458,7 +491,10 @@ pub(crate) fn run_with_admission(
         .ok_or("authorization did not retain an issuance")?;
     if let Some(boundary) = &execution_boundary {
         if now() >= boundary.expires_at || issuance.observation != boundary.observation {
-            return Err("native prerequisite expired or issuance observation differs before dispatch".into());
+            return Err(
+                "native prerequisite expired or issuance observation differs before dispatch"
+                    .into(),
+            );
         }
     }
     let files = docket_files(&scenario.root, execution_boundary.as_ref(), &issuance)?;
