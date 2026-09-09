@@ -1,6 +1,27 @@
 # M4 cold-cohort cut: bounded operator procedure
 
-## Final beta input preparation (2026-09-09)
+## Accepted bounded cold-cohort result (2026-09-09)
+
+Cold VM003 completed and was independently reopened against producer
+`61cafd5afbe58e14210199a0baa3cf5ef7d23c09` and checker
+`6f5b38ae8684748a3605a23ad2f1d5c4a56202d9`. Acceptance covers the actual
+old-package archive, absent-destination preactivation rollback with complete
+typed-row/schema comparison, fresh-cohort admission/diagnostic, post-cut
+forward-only recovery and completed-step interruption cases. Guests and ports
+were independently confirmed absent. It does not cover mid-dpkg interruption,
+authorizing-ledger rollback, production, M3 application/provider recovery or a
+human trial; final nqd configuration intentionally has `watchers=[]`.
+
+Owner evidence: campaign artifact root
+`operator-beta-completion-20260908/m4/cold-vm-003`, with independent disposition
+`operator-beta-completion-20260908/M4-COLD-003-INDEPENDENT-RUNTIME-ACCEPTANCE.md`.
+Result SHA256 `bfb334d75c3c59473a6d6391c930489034dad4ee49f680fdd87c4411ae2eaa58`;
+manifest SHA256 `6ee791134cb83a6d3c80cf568955e8ed8deeeb494768b5f944d456882f121e3b`.
+The NQ package/runtime pins below are this accepted occurrence's exact inputs,
+not acceptance transferred to later source heads. Original VM001/002 failures
+and M2/retirement records remain unchanged.
+
+## Historical final beta input preparation (2026-09-09)
 
 This derivative uses the independently inspected NQ Bookworm package
 `bb9b89fbe87d2b9b720de497c8a8f96e00aabfeadb0a7598fe0acc8c4fed76ca`,
