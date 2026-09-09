@@ -149,7 +149,13 @@ def producer_class(nq):
             try:
                 self.m3_then_teardown(control, target)
             except Exception as error:
-                self.capture_failure(target, error)
+                try:
+                    self.capture_failure(target, error)
+                except Exception as capture_error:
+                    # Even an unavailable/full evidence destination must not
+                    # replace the original uncertain operation with success or
+                    # with a misleading collection-only outcome.
+                    print('M3 failure capture unavailable: ' + str(capture_error), file=sys.stderr)
                 raise
 
         def capture_failure(self, target, cause):

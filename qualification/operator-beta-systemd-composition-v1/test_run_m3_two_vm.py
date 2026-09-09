@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import run_m3_two_vm as host
@@ -110,6 +111,31 @@ class HostControls(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'outcome uncertain'):
                 producer.teardown('control', 'target')
             self.assertEqual(observed, ['single phase', ('capture', 'outcome uncertain')])
+            def capture_unavailable(target, error):
+                raise OSError('evidence storage unavailable')
+            producer.capture_failure = capture_unavailable
+            with self.assertRaisesRegex(RuntimeError, 'outcome uncertain'):
+                producer.teardown('control', 'target')
+
+    def test_unreachable_capture_preserves_unknown_record(self):
+        class Parent:
+            pass
+        class Guest:
+            def ssh_base(self):
+                # Actual bounded subprocess refusal; no network/guest effect.
+                return [sys.executable, '-c', 'raise SystemExit(255)']
+        nq = SimpleNamespace(canonical=lambda value: json.dumps(value).encode(),
+            atomic_write=lambda path, data, mode: path.write_bytes(data))
+        with tempfile.TemporaryDirectory() as temporary, patch.object(host.composition, 'producer_class', return_value=Parent):
+            producer = host.producer_class(nq)()
+            producer.output = Path(temporary)
+            (producer.output / 'evidence').mkdir()
+            producer.capture_failure(Guest(), RuntimeError('original uncertain operation'))
+            record = json.loads((producer.output / 'M3-FAILURE-CAPTURE.json').read_bytes())
+            self.assertEqual(record['cause'], 'original uncertain operation')
+            self.assertEqual(record['state'], 'NOT_OBSERVABLE_RETAINED_COLLECTION_ATTEMPTS')
+            self.assertEqual(record['live_guest_after_host_exit'], 'NOT_ESTABLISHED')
+            self.assertEqual([item['exit'] for item in record['commands']], [255, 255, 255])
 
     def test_matrix_refusal_cannot_be_promoted_by_success_result(self):
         with tempfile.TemporaryDirectory() as temporary:
