@@ -64,7 +64,8 @@ python3 m3_case_check.py <exact-case-directory> --nq <native-path> --nq-sha256 <
 
 Retain its stdout as `INDEPENDENT-CHECK.json` only on successful exit. The checker
 joins exact step/fragment/admission identity, one AG spend/Docket attempt and
-settlement, systemd outcome and no-restart count, actual cut markers, helper
+settlement where actually established (otherwise explicit NOT_SETTLED owner
+state), systemd outcome and no-restart count, actual cut markers, helper
 journals, retained files/content and recovery disposition. It reexecutes the
 retained native source/request on a SHA-pinned sealed executable; runtime loader
 and libraries remain the enrolled VM premise. Helper completion alone never
@@ -111,3 +112,92 @@ companion supervisor is **NOT_RUN**, not implied by helper cuts or old M2 eviden
 - Four applicable Docket gates and affected composition/runtime witnesses.
 - Human/operator trial and production-scale timing, containment and backup
   durability remain separate NOT_RUN dimensions.
+
+## Application day-two procedure — candidate, not production authorization
+
+This procedure consumes Labelwatch `17a2dedb`, NQ `920dc762`, and the candidate
+companion export/recovery contract `c167cfdbcd293c37030c92071141352366949ef4`.
+Exact packaged integration and full matrix/controller-loss acceptance remain
+required. Normal-stage has actual VM evidence, but VM001/002/003 failures remain
+retained; no aggregate application qualification or dogfood result follows.
+
+1. Enroll one exact disposable target, operation, source identity, held writer
+   cut, immutable step files/units and separate backup filesystem. Retain the
+   entry diagnosis and threshold policy before deciding maintenance is needed.
+   Missing/unknown/not-needed diagnosis is not permission to compact.
+2. Admit `stage`: independently create backup, restore that backup, compare
+   schema and typed row contents under the closed application manifest, then
+   build and verify staging. Counts alone do not prove row preservation.
+   Exclusive paths and original identity must remain bound; an integrity-only
+   check does not prove recoverability. Fixture tmpfs is not durable backup.
+3. Admit `replace`, then `verify-installed`: retain original rollback object;
+   compare the installed replacement against the declared manifest and identity.
+   Keep the write hold. This is replacement/data acceptance, not resource relief.
+4. Start only enrolled writer units and admit `verify-service` after actual
+   readiness bound to operation/hold/cut and exact PID/start. Process existence
+   or paused processes are not useful ingestion. Failed start or uncertain
+   readiness keeps the hold and does not authorize cleanup.
+5. Acquire/replay the exact current native cleanup prerequisite, joined to this
+   operation's source/original/backup/restore/cut and step. Admit `cleanup` only
+   while its original applicability remains current. Never extend freshness
+   through a new standing timestamp. Retaining the original occupies space;
+   replacement acceptance therefore precedes cleanup authorization, and neither
+   asserts final filesystem relief.
+6. Admit `release` only after cleanup's required durable completion. Observe
+   actual resumed generation and independently qualify post-release filesystem
+   margin/data/service conditions. Missing generation or insufficient margin
+   remains indeterminate/refuted as returned by the actual factual owner.
+
+### Interrupted or refused steps
+
+Never rerun a STARTED-without-completion step. Before STARTED, inspect original
+owner custody anyway: controller absence is not evidence no dispatch occurred.
+After STARTED or a backup/restore/staging fsync, retain all copies and the hold;
+unfinished stage is not an installed replacement. Between the two replacement
+renames, classify actual source/original/staging identities and keep writers
+stopped. After replacement, `rollback-pre-ingest` is a separately admitted action
+only while the exact pre-ingestion conditions still hold. Once new writes exist,
+old rollback would discard them: preserve both objects and use forward recovery,
+not overwrite with the old file.
+
+At cleanup authorization/before unlink, retain the hold and exact objects. After
+unlink without cleanup completion, separately admitted `reconcile-cleanup`
+binds the interrupted STARTED record and verifies the actual absent original;
+it completes required synchronization, not another deletion. Release-record
+cuts still require observed resumed generation; a record alone cannot establish
+data-plane resumption. Before/after terminal cuts retain both helper disposition
+and owner state. Exit77/78 proves only its exact fixture marker and checked
+filesystem boundary, never controller recovery.
+
+Temporary-space, changed-source, restored-content mismatch, exclusive staging,
+lock contention, readiness failure and failed systemd start are intentional
+negative cases. Preserve their specific helper reason and artifact state.
+Missing/stale/substituted/foreign cleanup evidence is pre-admission refusal with
+zero spend/attempt, not a failed helper. A helper report
+REFUSED_OR_OUTCOME_UNKNOWN may coexist with Docket NOT_SETTLED/indeterminate:
+do not manufacture a settlement receipt or label all owner uncertainty refused.
+
+### Existing-owner inspection and candidate recovery
+
+These commands refer only to the existing occurrence and exact enrolled binaries;
+placeholders must come from its retained checkpoint, not a new run ID. Native
+candidate `c167cfdb` exposes:
+
+```sh
+<m3-driver> --inspect-existing <docket> <ag-effectd> <existing-custody-directory> <exact-issuance>
+<docket> governed-loop inspect --state <existing-custody-directory>/occurrence/docket-state --issuance <exact-issuance>
+<m3-driver> --recover-existing <docket> <ag-effectd> <existing-custody-directory> <exact-issuance>
+```
+
+Inspect first. Recovery is an explicit candidate operation, not automatic retry:
+it may append AG/Docket reconciliation history but its port has no issuance
+signer and refuses accept_issuance. It does not mint authority, execute a new
+step, repair data or make stale facts current. Retain output separately and
+check unchanged issuance/spend plus exact owner disposition. Missing identity,
+NOT_OBSERVABLE or unresolved custody stops advancement. Existing controller-loss
+fixture wrappers are qualification tools, not operator recovery executables.
+
+Actual production target inventory/privileged inspection and any production
+maintenance action remain separately permission-gated. Neither fixture enrollment
+nor this document authorizes them. The product claim is preparation for testing
+the recurring chore, not an observed removal of that chore or a human trial.

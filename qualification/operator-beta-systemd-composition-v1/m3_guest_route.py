@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 ROOT = Path('/opt/constellation-m3')
 DATA = Path('/var/lib/constellation-m3')
@@ -193,6 +194,7 @@ def execute(candidate_path, output, cleanup):
             'policy_sha256': digest(canonical(entry['policy']).rstrip(b'\n')), 'claim': 'FIXTURE_ENTRY_EVIDENCE_NOT_NATIVE_QUALIFICATION_OR_AUTHORITY'}))
     (output / 'ENROLLMENT.json').write_bytes(canonical({'candidate': str(candidate_path), 'unit_sha256': digest(raw_unit), 'cut': candidate['qualification_interruption'], 'restore_substitution': candidate['qualification_restore_substitution'], 'step_sha256': candidate['step_sha256'], 'admission_basis': 'NATIVE_CLEANUP_RECEIPT' if cleanup else 'DEVELOPMENTAL_FIXTURE_ONLY', 'fragment_custody': 'ROOT_ENROLLED_NOT_MEASURED_BY_AG'}))
     args = ['/usr/libexec/constellation-operator-beta/m3-composition-driver', '/usr/libexec/constellation-operator-beta/docket', '/usr/libexec/agent-governor-ng/ag-effectd', str(output / 'custody'), 'm3-' + candidate['step_sha256'][:40], Path('/etc/machine-id').read_text().strip(), candidate['unit'], subject, scope, str(enrollment_path), digest(enrollment_raw)]
+    execution_started_us = time.time_ns() // 1000
     try:
         result = subprocess.run(args, capture_output=True, timeout=90)
         (output / 'driver.stdout').write_bytes(result.stdout)
@@ -208,11 +210,15 @@ def execute(candidate_path, output, cleanup):
     for label, command in (
         ('unit-state', ['systemctl', 'show', candidate['unit'], '--property=ActiveState', '--property=SubState', '--property=Result', '--property=ExecMainStatus', '--property=NRestarts', '--property=InvocationID']),
         ('unit-journal', ['journalctl', '--no-pager', '-u', candidate['unit'], '--output=cat']),
+        ('unit-journal-structured', ['journalctl', '--no-pager', '-u', candidate['unit'], '--output=json', '--all', '-n', '500']),
     ):
         captured = subprocess.run(command, capture_output=True, timeout=15)
         (output / (label + '.stdout')).write_bytes(captured.stdout)
         (output / (label + '.stderr')).write_bytes(captured.stderr)
         (output / (label + '.exit')).write_text(str(captured.returncode) + '\n')
+    (output / 'execution-window.json').write_bytes(canonical({'machine_id': Path('/etc/machine-id').read_text().strip(),
+        'unit': candidate['unit'], 'step_sha256': candidate['step_sha256'],
+        'started_us': execution_started_us, 'finished_us': time.time_ns() // 1000}))
     # No restart, reset-failed, reissue or cleanup here, including nonzero exit.
     # The checker joins Docket settlement, actual helper terminal/cut and native
     # observations; driver exit alone is never a maintenance success claim.

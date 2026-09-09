@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import sqlite3
+import re
 from m3_guest_route import validate_entry
 from pathlib import Path
 
@@ -46,6 +47,79 @@ def unit_state(path):
     return result
 
 
+def retained_invocation(directory, candidate, state, accepted):
+    window = read(directory / 'execution-window.json')
+    evidence = read(directory / 'custody/systemd-evidence.json')
+    require(window['unit'] == evidence['unit'] == candidate['unit'] and
+        window['step_sha256'] == candidate['step_sha256'], 'invocation unit/step differs')
+    require(window['machine_id'] == evidence['live_machine_identity'] == evidence['systemd_machine_identity'], 'invocation machine differs')
+    require(evidence['attempt'] == accepted['attempt'] and evidence['marker'] == accepted['executor_marker'], 'invocation attempt/marker differs')
+    require(evidence['action'] == 'start' and re.fullmatch(r'/org/freedesktop/systemd1/job/[0-9]+', evidence['job_path']), 'actual start job absent')
+    require(window['started_us'] <= evidence['started_at_unix_ms'] * 1000 + 999 <=
+        evidence['finished_at_unix_ms'] * 1000 + 999 <= window['finished_us'], 'execution window differs')
+    require((directory / 'unit-journal-structured.exit').read_text().strip() == '0', 'structured journal unavailable')
+    journal = directory / 'unit-journal-structured.stdout'
+    require(journal.is_file() and not journal.is_symlink() and journal.stat().st_size <= 2 * 1024 * 1024, 'bounded journal required')
+    identities = set()
+    for line in journal.read_text().splitlines():
+        row = json.loads(line)
+        require(isinstance(row, dict), 'journal row malformed')
+        if row.get('_MACHINE_ID') != window['machine_id']:
+            raise ValueError('journal machine mismatch')
+        stamp = int(row['__REALTIME_TIMESTAMP'])
+        require(window['started_us'] <= stamp <= window['finished_us'], 'journal outside execution window')
+        if row.get('_SYSTEMD_UNIT') == candidate['unit']:
+            identity = row.get('_SYSTEMD_INVOCATION_ID')
+        elif row.get('UNIT') == candidate['unit']:
+            identity = row.get('INVOCATION_ID')
+        else:
+            raise ValueError('journal unit mismatch')
+        if identity is not None:
+            require(isinstance(identity, str) and re.fullmatch('[0-9a-f]{32}', identity), 'journal invocation malformed')
+            identities.add(identity)
+    require(len(identities) == 1, 'missing or ambiguous retained invocation')
+    identity = next(iter(identities))
+    require(not state.get('InvocationID') or state['InvocationID'] == identity, 'current and retained invocation differ')
+    if not state.get('InvocationID'):
+        require(state.get('ActiveState') == 'inactive' and state.get('SubState') == 'dead'
+            and evidence['outcome_code'] == 'start_unit_completed' and evidence['job_result'] == 'done',
+            'absent current invocation without completed oneshot evidence')
+    return identity
+
+
+def nonsettled_owner(root, issuance, accepted, inspection, replay):
+    """Preserve owner uncertainty; helper failure is not a settlement receipt."""
+    result = read(root / 'composition-result.json')
+    require(result['disposition'] == 'NOT_SETTLED', 'missing explicit nonsettled export')
+    require(result['schema'] == 'constellation.operator_beta.docket_systemd_composition_result.v1'
+        and result['duplicate_acceptance'] == 'NOT_RUN'
+        and result['application_disposition'] == 'NOT_INFERRED_FROM_OWNER_STATE', 'nonsettled scope differs')
+    require(all(replay[key] == value for key, value in
+        (('ag_spends', 1), ('docket_attempts', 1), ('settlements', 0))), 'nonsettled owner cardinality differs')
+    record = inspection['record']
+    require(result['docket_inspection'] == {'observation': 'AVAILABLE', 'status': record['status']}
+        and result['systemd_evidence'] == {'observation': 'AVAILABLE'}, 'nonsettled required evidence unavailable')
+    require(record['status'] in ('accepted', 'indeterminate') and record['settlement'] is None,
+        'nonsettled export contradicts owner state')
+    require(record['issuance'] == issuance and record['custody'] == accepted,
+        'nonsettled issuance/custody correspondence differs')
+    require(not (root / 'docket-settlement.json').exists() and not (root / 'executor-outcome.json').exists(),
+        'nonsettled owner has fabricated terminal export')
+    dispatch = read(root / 'executor-dispatch.json')
+    require(dispatch['attempt'] == accepted['attempt'] and dispatch['marker'] == accepted['executor_marker'],
+        'nonsettled dispatch identity differs')
+    require(dispatch['subject'] == issuance['subject'] and dispatch['scope'] == issuance['scope'],
+        'nonsettled dispatch subject/scope differs')
+    require(result['issuance'] == issuance['issuance'] and result['attempt'] == accepted['attempt'],
+        'nonsettled summary identity differs')
+    expected_pc = {'PENDING': 'dispatched', 'RECONCILIATION_REQUIRED': 'reconciliation_required'}.get(result['docket_progress'])
+    require(expected_pc is not None and set(read(root / 'ag-state.json')['state']) == {expected_pc},
+        'nonsettled progress contradicts AG state')
+    require(all(result[key] == replay[key] for key in ('ag_spends', 'docket_attempts', 'settlements')),
+        'nonsettled summary cardinality differs')
+    return {'outcome': 'NOT_SETTLED', 'owner_status': record['status']}
+
+
 def custody(directory, candidate):
     directory = Path(directory)
     enrolled = read(directory / 'enrollment.json')
@@ -53,20 +127,23 @@ def custody(directory, candidate):
     require(hashlib.sha256(raw).hexdigest() == candidate['unit_sha256'], 'unit fragment changed after seal')
     require(enrolled['unit'] == candidate['unit'] and enrolled['step_sha256'] == candidate['step_sha256'], 'enrollment differs from candidate')
     root = directory / 'custody'
-    issuance, accepted, settled = (read(root / name) for name in ('issuance.json', 'docket-custody.json', 'docket-settlement.json'))
+    issuance, accepted = (read(root / name) for name in ('issuance.json', 'docket-custody.json'))
     replay = read(root / 'ag-replay.json')
-    require(all(replay[key] == 1 for key in ('ag_spends', 'docket_attempts', 'settlements')), 'not one spend/attempt/settlement')
-    require(issuance['issuance'] == accepted['issuance'] == settled['issuance'], 'issuance correspondence differs')
-    require(accepted['attempt'] == settled['attempt'], 'attempt correspondence differs')
-    require(read(root / 'duplicate-custody.json') == accepted, 'actual duplicate acceptance differs from original custody')
+    require(issuance['issuance'] == accepted['issuance'], 'issuance correspondence differs')
     inspection = read(root / 'docket-inspection.json')
-    require(inspection['record']['status'] == 'settled', 'owner query is not settled')
-    outcome = read(root / 'executor-outcome.json')
-    require(outcome['receipt'] == settled['receipt'], 'executor receipt differs from settlement')
+    if inspection['record']['status'] == 'settled':
+        settled = read(root / 'docket-settlement.json')
+        require(all(replay[key] == 1 for key in ('ag_spends', 'docket_attempts', 'settlements')), 'not one spend/attempt/settlement')
+        require(issuance['issuance'] == settled['issuance'] and accepted['attempt'] == settled['attempt'], 'settlement correspondence differs')
+        require(read(root / 'duplicate-custody.json') == accepted, 'actual duplicate acceptance differs from original custody')
+        outcome = read(root / 'executor-outcome.json')
+        require(outcome['receipt'] == settled['receipt'], 'executor receipt differs from settlement')
+    else:
+        settled = nonsettled_owner(root, issuance, accepted, inspection, replay)
     require(issuance['subject'] == enrolled['subject'] and issuance['scope'] == enrolled['scope'], 'subject/scope correspondence differs')
     state = unit_state(directory / 'unit-state.stdout')
     require(state.get('NRestarts') == '0', 'unexpected systemd retry')
-    require(bool(state.get('InvocationID')), 'actual unit invocation absent')
+    retained_invocation(directory, candidate, state, accepted)
     return state, settled
 
 
@@ -113,8 +190,22 @@ def check_step(candidate_path, directory):
         require(state.get('ExecMainStatus') == '0', 'helper completion and process disposition disagree')
     else:
         require(state.get('ExecMainStatus') not in (None, '0'), 'no helper completion and no observed refusal')
+        helper_reports = []
+        for line in (Path(directory) / 'unit-journal-structured.stdout').read_text().splitlines():
+            row = json.loads(line)
+            if row.get('_SYSTEMD_UNIT') != candidate['unit']:
+                continue
+            try:
+                report = json.loads(row.get('MESSAGE', ''))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(report, dict) and report.get('disposition') == 'REFUSED_OR_OUTCOME_UNKNOWN':
+                helper_reports.append(report)
+        require(len(helper_reports) == 1 and isinstance(helper_reports[0].get('reason'), str)
+            and helper_reports[0]['reason'], 'actual helper refusal-or-unknown report absent or ambiguous')
     return {'step_sha256': sha, 'action': step['action'], 'cut': cut,
             'helper_completed': terminal.exists(), 'docket_outcome': settlement['outcome'],
+            'docket_owner_status': settlement.get('owner_status', 'settled'),
             'claim': 'OCCURRENCE_CORRESPONDENCE_ONLY_NOT_RESOURCE_RELIEF'}
 
 
