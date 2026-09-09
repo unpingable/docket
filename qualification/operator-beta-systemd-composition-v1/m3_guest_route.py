@@ -139,6 +139,14 @@ def execute(candidate_path, output, cleanup):
     candidate = json.loads(candidate_path.read_bytes())
     step_raw = Path(candidate['step']).read_bytes()
     step = validate_candidate(candidate, step_raw)
+    entry_raw = None
+    if step['action'] == 'stage':
+        entry_raw = (Path(step['source']).parent / 'entry-diagnosis.json').read_bytes()
+        entry = json.loads(entry_raw)
+        if (entry['schema'] != 'labelwatch.m3-entry-diagnosis/v1' or entry['entry_disposition'] != 'NEED_ESTABLISHED'
+                or entry['unknowns'] != [] or entry['facts']['main']['identity'] != step['source_identity']
+                or entry['facts']['sqlite']['freelist_count'] < entry['policy']['minimum_freelist_pages']):
+            raise ValueError('observed entry need differs from exact staged source/policy')
     raw_unit = enrolled_unit(candidate)
     subject = 'sha256:' + digest(canonical({'schema': 'constellation.m3-subject/v1', 'operation': step['operation'], 'source': step['source'], 'revision': step['revision']}))
     scope = 'sha256:' + digest(canonical({'schema': 'constellation.m3-scope/v1', 'action': candidate['action'], 'step_sha256': candidate['step_sha256'], 'unit': candidate['unit'], 'unit_sha256': digest(raw_unit)}))
@@ -173,6 +181,10 @@ def execute(candidate_path, output, cleanup):
     enrollment_path.write_bytes(enrollment_raw)
     enrollment_path.chmod(0o400)
     (output / 'enrolled-unit.service').write_bytes(raw_unit)
+    if entry_raw is not None:
+        (output / 'entry-diagnosis.json').write_bytes(entry_raw)
+        (output / 'entry-binding.json').write_bytes(canonical({'entry_sha256': digest(entry_raw),
+            'policy_sha256': digest(canonical(entry['policy']).rstrip(b'\n')), 'claim': 'FIXTURE_ENTRY_EVIDENCE_NOT_NATIVE_QUALIFICATION_OR_AUTHORITY'}))
     (output / 'ENROLLMENT.json').write_bytes(canonical({'candidate': str(candidate_path), 'unit_sha256': digest(raw_unit), 'cut': candidate['qualification_interruption'], 'restore_substitution': candidate['qualification_restore_substitution'], 'step_sha256': candidate['step_sha256'], 'admission_basis': 'NATIVE_CLEANUP_RECEIPT' if cleanup else 'DEVELOPMENTAL_FIXTURE_ONLY', 'fragment_custody': 'ROOT_ENROLLED_NOT_MEASURED_BY_AG'}))
     args = ['/usr/libexec/constellation-operator-beta/m3-composition-driver', '/usr/libexec/constellation-operator-beta/docket', '/usr/libexec/agent-governor-ng/ag-effectd', str(output / 'custody'), 'm3-' + candidate['step_sha256'][:40], Path('/etc/machine-id').read_text().strip(), candidate['unit'], subject, scope, str(enrollment_path), digest(enrollment_raw)]
     try:

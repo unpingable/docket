@@ -442,7 +442,15 @@ pub(crate) fn run_with_admission(
         scope,
     )?;
     let mut engine = scenario.engine()?;
-    admit(&mut engine, &scenario)?;
+    if let Err(error) = admit(&mut engine, &scenario) {
+        #[cfg(feature = "m3-labelwatch")]
+        {
+            write_canonical(&output.join("admission-refusal-state.json"), &engine.current().map_err(|e| e.to_string())?)?;
+            write_canonical(&output.join("admission-refusal-replay.json"), &engine.replay().map_err(|e| e.to_string())?)?;
+            write_canonical(&output.join("admission-refusal-history.json"), &engine.history().map_err(|e| e.to_string())?)?;
+        }
+        return Err(error);
+    }
     let authorization_state = engine.current().map_err(|error| error.to_string())?;
     let issuance = authorization_state
         .issuance()
@@ -489,6 +497,8 @@ pub(crate) fn run_with_admission(
     if duplicate != custody {
         return Err("identical issuance did not converge on retained Docket custody".to_owned());
     }
+    #[cfg(feature = "m3-labelwatch")]
+    write_canonical(&output.join("duplicate-custody.json"), &duplicate)?;
     let (inspection, inspection_raw) =
         inspect_docket(&docket, &docket_state, issuance.issuance.as_str())?;
     if inspection["record"]["status"] != "settled" {

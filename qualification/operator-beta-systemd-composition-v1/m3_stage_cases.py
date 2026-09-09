@@ -79,13 +79,15 @@ def run(case, revision):
                     'size=4M,mode=0700,nodev,nosuid,noexec', 'm3-' + case, str(mountpoint)])
     backup = Path('/mnt/constellation-m3-backup') / ('stage-' + case)
     backup.mkdir(mode=0o700)
+    execute_command(output, 'mount-backup', ['mount', '-t', 'tmpfs', '-o',
+                    'size=8M,mode=0700,nodev,nosuid,noexec', 'm3-backup-' + case, str(backup)])
     fixture = mountpoint / 'operation'
     generator = str(route.ROOT / 'labelwatch/scripts/m3_fixture_enrollment.py')
     execute_command(output, 'initialize', ['/usr/bin/python3', generator, 'initialize',
                     '--target', str(fixture), '--backup', str(backup), '--revision', revision])
     command = ['/usr/bin/python3', generator, 'seal', '--target', str(fixture),
                '--action', 'stage', '--source-root', str(route.ROOT / 'labelwatch'),
-               '--python', '/usr/bin/python3']
+               '--python', str(Path('/usr/bin/python3').resolve())]
     if case.startswith('cut-'):
         command += ['--interruption-cut', case[4:]]
     if case == 'backup-not-restore':
