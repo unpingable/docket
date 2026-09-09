@@ -20,8 +20,8 @@ from typing import Any
 SCHEMA = "constellation.operator_beta.docket_systemd_fixture_build.v1"
 AG_HEAD = "bf6adde2792a886d1ba75d97ca77efb8e914f4f5"
 AG_TREE = "31b3b15437baffcaa41ae31020f4570599304019"
-DOCKET_HEAD = "6c57926d2560c47c681691e006fbbfe244c6993e"
-DOCKET_TREE = "fb0b72b74226bfe3e4d39ccf0eca79241bd80fe2"
+DOCKET_HEAD = "09ba85fdf0c05b7e1664ebea84cdbb611a0ceda4"
+DOCKET_TREE = "96df8b9a421f25aba07955422fc964c0129703ec"
 IMAGE_ID = "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379"
 IMAGE_REPO_DIGEST = "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
 SOURCE_DATE_EPOCH = "1700000000"
@@ -442,6 +442,19 @@ def package_facts(package: pathlib.Path, scratch: pathlib.Path) -> dict[str, Any
     }
 
 
+def run_logged(command: list[str], destination: pathlib.Path) -> None:
+    """Retain build output before returning or reporting a failed subprocess."""
+    with destination.open("xb") as stream:
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                    stdout=stream, stderr=subprocess.STDOUT, check=False)
+        finally:
+            stream.flush()
+            os.fsync(stream.fileno())
+    if result.returncode != 0:
+        raise Refusal(f"build exited {result.returncode}; retained log: {destination}")
+
+
 def build_case(
     label: str,
     scratch: pathlib.Path,
@@ -472,12 +485,8 @@ def build_case(
         config.write_text(cargo_config(vendor_path), encoding="utf-8")
     for name in ("ag-cargo", "docket-cargo", "ag-target", "docket-target"):
         (case / name).mkdir()
-    ag_build = run(build_command(ag, ag_vendor, case / "ag-cargo", case / "ag-target", "ag"))
-    docket_build = run(
-        build_command(docket, docket_vendor, case / "docket-cargo", case / "docket-target", "docket")
-    )
-    (case / "ag-build.log").write_bytes(ag_build.stdout + ag_build.stderr)
-    (case / "docket-build.log").write_bytes(docket_build.stdout + docket_build.stderr)
+    run_logged(build_command(ag, ag_vendor, case / "ag-cargo", case / "ag-target", "ag"), case / "ag-build.log")
+    run_logged(build_command(docket, docket_vendor, case / "docket-cargo", case / "docket-target", "docket"), case / "docket-build.log")
     package = assemble(case)
     return {
         "package": package_facts(package, case / "package-inspect"),
@@ -528,6 +537,7 @@ def build(args: argparse.Namespace) -> None:
     )
     builder = image_facts()
     scratch = pathlib.Path(tempfile.mkdtemp(prefix=".docket-composition-build.", dir=args.output.parent))
+    completed = False
     try:
         cases = [
             build_case(
@@ -579,13 +589,20 @@ def build(args: argparse.Namespace) -> None:
             "limitations": LIMITATIONS,
         }
         (args.output / "fixture-build-receipt.v1.json").write_bytes(canonical(receipt) + b"\n")
+        completed = True
         print(json.dumps({"result": "REPRODUCIBLE_COMPOSITION_FIXTURE", "package_sha256": receipt["package"]["sha256"]}, sort_keys=True))
-    except Exception:
-        if args.output.exists():
-            shutil.rmtree(args.output)
+    except BaseException:
+        # A failed occurrence retains its logs, sources and partial packages;
+        # neither supervisor recovery nor a later attempt may erase them.
+        args.output.mkdir(mode=0o700, exist_ok=True)
+        (args.output / "BUILD_FAILURE.json").write_bytes(canonical({
+            "state": "BUILD_INCOMPLETE", "scratch": str(scratch),
+            "automatic_retry": False,
+        }) + b"\n")
         raise
     finally:
-        shutil.rmtree(scratch)
+        if completed:
+            shutil.rmtree(scratch)
 
 
 def verify(args: argparse.Namespace) -> None:
