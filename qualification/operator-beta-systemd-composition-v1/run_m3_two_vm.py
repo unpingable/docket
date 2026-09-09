@@ -90,6 +90,63 @@ def producer_class(nq):
     class M3Producer(parent):
         m3_started = False
 
+        def wait_http_fixture_ready(self, control):
+            try:
+                return super().wait_http_fixture_ready(control)
+            except Exception as error:
+                try:
+                    self.capture_baseline_failure(error)
+                except Exception as capture_error:
+                    print('Baseline diagnostics unavailable: ' + str(capture_error), file=sys.stderr)
+                raise
+
+        def capture_baseline_failure(self, cause):
+            """Read-only observations after failed readiness; never repeat an effect.
+
+            Two guests, three commands each, each bounded to 12 seconds. Partial
+            output is retained even on timeout. No coherent-snapshot claim.
+            """
+            record = {'schema': 'constellation.m3-baseline-failure/v1',
+                'cause': str(cause), 'effect_outcome': self.effect_outcome,
+                'classification': 'READ_ONLY_DIAGNOSTICS_NOT_NETWORK_REPAIR',
+                'cut': 'CONCURRENT_OBSERVATIONS_NOT_QUALIFIED_SNAPSHOT', 'commands': []}
+            output = self.output / 'evidence/baseline-failure'
+            output.mkdir(mode=0o700)
+            probe = """import json,socket
+for address in ('127.0.0.1','192.168.76.1','192.168.76.2'):
+ with socket.socket() as stream:
+  stream.settimeout(2)
+  try: result={'connect_errno':stream.connect_ex((address,18080))}
+  except OSError as error: result={'error':str(error)}
+  print(json.dumps({'address':address,'port':18080,**result}),flush=True)
+"""
+            commands = [('network', 'ip -details address show; ip route show table all; ip neigh show'),
+                ('unit', 'sudo systemctl show constellation-beta-http-fixture.service '
+                    '-p Id -p LoadState -p ActiveState -p SubState -p MainPID -p InvocationID -p Result -p ExecMainStatus; '
+                    'sudo journalctl -u constellation-beta-http-fixture.service --no-pager -n 100'),
+                ('probe', shlex.join(['python3', '-c', probe]))]
+            try:
+                for guest in self.guests:
+                    require(guest.role in ('control', 'target'), 'unexpected diagnostic guest')
+                    for label, command in commands:
+                        name = guest.role + '-' + label
+                        observation = {'guest': guest.role, 'kind': label}
+                        try:
+                            with (output / (name + '.stdout')).open('xb') as stdout, (output / (name + '.stderr')).open('xb') as stderr:
+                                result = subprocess.run(guest.ssh_base() + [command], stdout=stdout,
+                                    stderr=stderr, timeout=12)
+                                stdout.flush()
+                                stderr.flush()
+                                os.fsync(stdout.fileno())
+                                os.fsync(stderr.fileno())
+                            observation['exit'] = result.returncode
+                        except Exception as error:
+                            observation['exit'] = 'NOT_OBSERVABLE'
+                            observation['error'] = str(error)
+                        record['commands'].append(observation)
+            finally:
+                nq.atomic_write(self.output / 'BASELINE-FAILURE-CAPTURE.json', nq.canonical(record) + b'\n', 0o400)
+
         def state(self, phase, next_action, **facts):
             facts.update(schema='constellation.m3-vm-recovery/v1', campaign='OPERATOR-BETA-M3-FIXTURE',
                 expected_terminal_records=['M3-RESULT.json + M3-ARTIFACTS.json',

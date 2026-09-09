@@ -15,6 +15,41 @@ import m3_guest_matrix as batch
 
 
 class HostControls(unittest.TestCase):
+    def test_baseline_failure_preserves_original_and_collects_once(self):
+        class Parent:
+            def wait_http_fixture_ready(self, control):
+                raise RuntimeError('original readiness refusal')
+        with patch.object(host.composition, 'producer_class', return_value=Parent):
+            producer = host.producer_class(object())()
+            seen = []
+            producer.capture_baseline_failure = lambda error: seen.append(str(error))
+            with self.assertRaisesRegex(RuntimeError, 'original readiness refusal'):
+                producer.wait_http_fixture_ready(None)
+            self.assertEqual(seen, ['original readiness refusal'])
+            def failed_capture(error):
+                raise OSError('storage unavailable')
+            producer.capture_baseline_failure = failed_capture
+            with self.assertRaisesRegex(RuntimeError, 'original readiness refusal'):
+                producer.wait_http_fixture_ready(None)
+
+    def test_baseline_capture_retains_unreachable_and_partial_commands(self):
+        class Parent:
+            pass
+        nq = SimpleNamespace(canonical=lambda value: json.dumps(value).encode(),
+            atomic_write=lambda path, data, mode: path.write_bytes(data))
+        with tempfile.TemporaryDirectory() as temporary, patch.object(host.composition, 'producer_class', return_value=Parent):
+            producer = host.producer_class(nq)()
+            producer.output = Path(temporary)
+            (producer.output / 'evidence').mkdir()
+            producer.effect_outcome = 'KNOWN_COMPOSED_EFFECT_OWNER_SUCCESS'
+            producer.guests = [SimpleNamespace(role=role, ssh_base=lambda: [sys.executable, '-c',
+                "print('retained partial'); raise SystemExit(255)"]) for role in ('control', 'target')]
+            producer.capture_baseline_failure(RuntimeError('readiness'))
+            record = json.loads((producer.output / 'BASELINE-FAILURE-CAPTURE.json').read_bytes())
+            self.assertEqual([item['exit'] for item in record['commands']], [255] * 6)
+            self.assertEqual(record['effect_outcome'], producer.effect_outcome)
+            self.assertEqual((producer.output / 'evidence/baseline-failure/target-probe.stdout').read_text(), 'retained partial\n')
+
     def test_manifest_covers_nested_terminal_named_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
