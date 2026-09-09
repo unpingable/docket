@@ -20,6 +20,8 @@ struct Enrollment {
     action: String,
     unit: String,
     step_sha256: String,
+    qualification_interruption: Option<String>,
+    qualification_restore_substitution: bool,
     subject: String,
     scope: String,
     receipt: Option<PathBuf>,
@@ -46,10 +48,16 @@ fn run() -> Result<(), String> {
         return Err("exact root enrollment bytes differ".into());
     }
     let enrollment: Enrollment = nq_protocol::decode_json_document(&raw, 2 * 1024 * 1024).map_err(|e| e.to_string())?;
+    let suffix = match (enrollment.qualification_interruption.as_deref(), enrollment.qualification_restore_substitution) {
+        (None, false) => String::new(),
+        (None, true) if enrollment.action == "stage" => "-q-restore-substitution".into(),
+        (Some(cut), false) if matches!(cut, "before_started" | "after_started" | "before_terminal" | "after_terminal" | "after_original_rename" | "after_replacement_rename" | "after_backup_sync" | "after_restore_sync" | "after_staging_sync" | "before_cleanup_unlink" | "after_cleanup_unlink" | "after_cleanup_authorized" | "after_release_record") => format!("-q-{cut}"),
+        _ => return Err("unknown or conflicting sealed qualification mode".into()),
+    };
     if enrollment.schema != "constellation.m3-driver-enrollment/v1"
         || enrollment.step_sha256.len() != 64
         || !enrollment.step_sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        || enrollment.unit != format!("labelwatch-relief-{}.service", enrollment.step_sha256)
+        || enrollment.unit != format!("labelwatch-relief-{}{suffix}.service", enrollment.step_sha256)
         || arguments[5] != enrollment.unit
         || arguments[6] != enrollment.subject
         || arguments[7] != enrollment.scope
