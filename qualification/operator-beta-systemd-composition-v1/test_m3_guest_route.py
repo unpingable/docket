@@ -1,8 +1,9 @@
 import tempfile
 import copy
+import types
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import m3_guest_route as route
 
 
@@ -143,6 +144,18 @@ class EnrolledRouteTests(unittest.TestCase):
         value = {'z': 'é😀\u007f\n\t\b\f\r\0\\"', 'a': [1, True, None]}
         expected = br'{"a":[1,true,null],"z":"\u00e9\ud83d\ude00\u007f\n\t\b\f\r\u0000\\\""}'
         self.assertEqual(route.canonical(value).rstrip(b'\n'), expected)
+
+    def test_entry_adapter_preserves_owner_refusal_instead_of_trusting_label(self):
+        # Adapter control only; the owner's real six-case qualification remains
+        # separate evidence on its exact 17a2ded source.
+        module = types.ModuleType('labelwatch.maintenance_diagnosis')
+        module.require_entry = Mock(side_effect=ValueError('owner consistency refusal'))
+        record = {'entry_disposition': 'NEED_ESTABLISHED'}
+        identity = {'device': 1, 'inode': 2}
+        with patch.dict(route.sys.modules, {'labelwatch.maintenance_diagnosis': module}), patch.object(route.sys, 'path', list(route.sys.path)):
+            with self.assertRaisesRegex(ValueError, 'owner consistency refusal'):
+                route.validate_entry(record, identity)
+        module.require_entry.assert_called_once_with(record, identity)
 
 
 if __name__ == '__main__':

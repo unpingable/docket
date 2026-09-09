@@ -3,11 +3,14 @@
 The application owns `qualification/m3-admission/cases.json` and the exact
 enrollment/capture semantics. Docket owns only this bounded qualification route.
 Current capture interface is Labelwatch `2b5a03467e2cd4b86b90ce819dc2934c19043596`,
-with entry diagnosis descendant `06a536fdc04d74ed8095b923126dda22010f7d26`.
+with corrected entry diagnosis descendant `17a2dedb2528025ec0c05b173d9be9b4b8b4ba53`.
 Each stage retains the actual entry diagnosis and exact policy digest: observed
 freelist pages must meet the explicitly configured fixture threshold. Filesystem
 pressure is separately reported; a roomy fixture is not described as pressured.
 The diagnosis is application-owned evidence, not NQ qualification or authority.
+Both route and checker call that exact enrolled application's `require_entry`:
+freelist/threshold/pressure classifications, OS/SQLite/file/sidecar consistency,
+and original identity are checked; favorable labels alone are insufficient.
 New cleanup-v2 NQ and the companion Rust driver still require real compilation,
 package construction, independent review and actual local VM execution. No case
 is credited from Python inventory tests or an exit-code expectation alone.

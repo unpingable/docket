@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 ROOT = Path('/opt/constellation-m3')
 DATA = Path('/var/lib/constellation-m3')
@@ -21,6 +22,14 @@ def canonical(value):
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def validate_entry(entry, source_identity):
+    # Reuse the exact enrolled application's consistency rules, not a favorable
+    # label or a duplicated weaker inference in the integration layer.
+    sys.path.insert(0, str(ROOT / 'labelwatch/src'))
+    from labelwatch.maintenance_diagnosis import require_entry
+    require_entry(entry, source_identity)
 
 
 def unit_name(candidate):
@@ -143,10 +152,7 @@ def execute(candidate_path, output, cleanup):
     if step['action'] == 'stage':
         entry_raw = (Path(step['source']).parent / 'entry-diagnosis.json').read_bytes()
         entry = json.loads(entry_raw)
-        if (entry['schema'] != 'labelwatch.m3-entry-diagnosis/v1' or entry['entry_disposition'] != 'NEED_ESTABLISHED'
-                or entry['unknowns'] != [] or entry['facts']['main']['identity'] != step['source_identity']
-                or entry['facts']['sqlite']['freelist_count'] < entry['policy']['minimum_freelist_pages']):
-            raise ValueError('observed entry need differs from exact staged source/policy')
+        validate_entry(entry, step['source_identity'])
     raw_unit = enrolled_unit(candidate)
     subject = 'sha256:' + digest(canonical({'schema': 'constellation.m3-subject/v1', 'operation': step['operation'], 'source': step['source'], 'revision': step['revision']}))
     scope = 'sha256:' + digest(canonical({'schema': 'constellation.m3-scope/v1', 'action': candidate['action'], 'step_sha256': candidate['step_sha256'], 'unit': candidate['unit'], 'unit_sha256': digest(raw_unit)}))

@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import sqlite3
+from m3_guest_route import validate_entry
 from pathlib import Path
 
 
@@ -81,9 +82,7 @@ def check_step(candidate_path, directory):
         binding = read(Path(directory) / 'entry-binding.json')
         require(hashlib.sha256((Path(directory) / 'entry-diagnosis.json').read_bytes()).hexdigest() == binding['entry_sha256'], 'entry bytes differ from retained admission evidence')
         require(hashlib.sha256(json.dumps(entry['policy'], sort_keys=True, separators=(',', ':')).encode()).hexdigest() == binding['policy_sha256'], 'entry policy identity differs')
-        require(entry['entry_disposition'] == 'NEED_ESTABLISHED' and entry['facts']['main']['identity'] == step['source_identity'], 'entry observation belongs to another source')
-        require(entry['facts']['sqlite']['freelist_count'] >= entry['policy']['minimum_freelist_pages'] > 0, 'entry freelist threshold not established')
-        require(entry['facts']['wal']['state'] == entry['facts']['shm']['state'] == 'OBSERVED_ABSENT' and entry['unknowns'] == [], 'entry quiescent acquisition is incomplete')
+        validate_entry(entry, step['source_identity'])
     sha = candidate['step_sha256']
     started = Path(step['journal']) / (sha + '.started.json')
     terminal = Path(candidate['expected_result'])
