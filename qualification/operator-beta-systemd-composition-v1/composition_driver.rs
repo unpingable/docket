@@ -492,6 +492,16 @@ fn controller_loss_barrier(
 /// may record reconciliation transitions; this is not a claim of no store writes.
 #[cfg(feature = "m3-labelwatch")]
 pub(crate) fn recover_existing(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    existing_owner_observation(&mut args, true)
+}
+
+#[cfg(feature = "m3-labelwatch")]
+pub(crate) fn inspect_existing(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    existing_owner_observation(&mut args, false)
+}
+
+#[cfg(feature = "m3-labelwatch")]
+fn existing_owner_observation(mut args: impl Iterator<Item = String>, recover: bool) -> Result<(), String> {
     use ag_app::governed_ports::CommandDocketReconciliationPortV1;
     let docket = require_absolute_executable(&PathBuf::from(args.next().ok_or("missing Docket")?), "Docket")?;
     let effectd = require_absolute_executable(&PathBuf::from(args.next().ok_or("missing effectd")?), "effectd")?;
@@ -520,7 +530,7 @@ pub(crate) fn recover_existing(mut args: impl Iterator<Item = String>) -> Result
         occurrence.join("systemd-plan-v2.json"));
     let now: u64 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?.as_millis().try_into().map_err(|_| "recovery clock overflow")?;
-    let recovered = engine.recover(&mut port, now).map_err(|e| e.to_string())?;
+    let recovered = if recover { Some(engine.recover(&mut port, now).map_err(|e| e.to_string())?) } else { None };
     let after = engine.current().map_err(|e| e.to_string())?;
     let replay_after = engine.replay().map_err(|e| e.to_string())?;
     if before.issuance() != after.issuance() || replay_before.ag_spends != replay_after.ag_spends {
@@ -528,6 +538,8 @@ pub(crate) fn recover_existing(mut args: impl Iterator<Item = String>) -> Result
     }
     println!("{}", serde_json::to_string(&json!({
         "schema":"constellation.m3-existing-owner-recovery/v1", "expected_issuance":expected,
+        "inspection_only":!recover,
+        "observed_at_unix_ms":now,
         "before":before, "recovery":recovered, "after":after,
         "replay_before":replay_before, "replay_after":replay_after,
         "execution_capability":"RECONCILIATION_ONLY_NO_SIGNER_NO_ACCEPT_ISSUANCE",
@@ -642,11 +654,63 @@ pub(crate) fn run_with_admission(
         .ok_or("Docket did not return custody")?;
     #[cfg(feature = "m3-labelwatch")]
     controller_loss_barrier("docket-settled-before-ag-poll", &output, &engine)?;
-    let DocketProgressV1::Settled(settled) = engine
+    let progress = engine
         .poll_docket(&mut custody_port, now())
-        .map_err(|error| error.to_string())?
-    else {
-        return Err("composed occurrence did not reach a known settlement".to_owned());
+        .map_err(|error| error.to_string())?;
+    let settled = match progress {
+        DocketProgressV1::Settled(settled) => settled,
+        other => {
+            #[cfg(feature = "m3-labelwatch")]
+            {
+                let progress_label = match other {
+                    DocketProgressV1::Pending => "PENDING",
+                    DocketProgressV1::ReconciliationRequired(_) => "RECONCILIATION_REQUIRED",
+                    DocketProgressV1::Settled(_) => unreachable!(),
+                };
+                let state = engine.current().map_err(|e| e.to_string())?;
+                let replay = engine.replay().map_err(|e| e.to_string())?;
+                write_canonical(&output.join("authorization-state.json"), &authorization_state)?;
+                write_canonical(&output.join("issuance.json"), &issuance)?;
+                write_canonical(&output.join("docket-custody.json"), &custody)?;
+                write_canonical(&output.join("ag-state.json"), &state)?;
+                write_canonical(&output.join("ag-replay.json"), &replay)?;
+                write_canonical(&output.join("ag-history.json"), &engine.history().map_err(|e| e.to_string())?)?;
+                let dispatch = EffectExecutorDispatchV1 {
+                    attempt: custody.attempt.as_digest().clone(),
+                    marker: custody.executor_marker.as_digest().clone(),
+                    work_schema: EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2.to_owned(),
+                    work: scenario.work.clone(), subject: scenario.subject.clone(), scope: scenario.scope.clone(),
+                };
+                write_canonical(&output.join("executor-dispatch.json"), &dispatch)?;
+                let inspection_status = match inspect_docket(&docket, &docket_state, issuance.issuance.as_str()) {
+                    Ok((inspection, raw)) => {
+                        std::fs::write(output.join("docket-inspection.json"), raw).map_err(|e| e.to_string())?;
+                        json!({"observation":"AVAILABLE", "status":inspection["record"]["status"]})
+                    }
+                    Err(error) => json!({"observation":"NOT_OBSERVABLE", "reason":error}),
+                };
+                let dbus_status = match reopen_systemd_dbus_evidence(&scenario.plan, &dispatch) {
+                    Ok(raw) => {
+                        std::fs::write(output.join("systemd-evidence.json"), raw).map_err(|e| e.to_string())?;
+                        json!({"observation":"AVAILABLE"})
+                    }
+                    Err(error) => json!({"observation":"NOT_OBSERVABLE", "reason":error.to_string()}),
+                };
+                write_canonical(&output.join("composition-result.json"), &json!({
+                    "schema":"constellation.operator_beta.docket_systemd_composition_result.v1",
+                    "run_id":run_id, "disposition":"NOT_SETTLED", "docket_progress":progress_label,
+                    "issuance":issuance.issuance, "attempt":custody.attempt, "marker":custody.executor_marker,
+                    "work":scenario.work, "subject":scenario.subject, "scope":scenario.scope,
+                    "ag_spends":replay.ag_spends, "docket_attempts":replay.docket_attempts,
+                    "settlements":replay.settlements, "docket_inspection":inspection_status,
+                    "systemd_evidence":dbus_status, "duplicate_acceptance":"NOT_RUN",
+                    "application_disposition":"NOT_INFERRED_FROM_OWNER_STATE"
+                }))?;
+            }
+            #[cfg(not(feature = "m3-labelwatch"))]
+            let _ = other;
+            return Err("composed occurrence did not reach a known settlement; retained M3 owner observations where applicable".to_owned());
+        }
     };
     let settlement = settled
         .settlement()

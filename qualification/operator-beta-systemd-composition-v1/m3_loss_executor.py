@@ -51,6 +51,7 @@ def main():
         raise ValueError('observed custody differs from actual executor dispatch')
     observation = {'dispatch': dispatch, 'docket_inspection': owner,
         'real_executor_deliveries_before_barrier': 0,
+        'ag_attempt_store_present_before_execution': Path(read(sys.argv[2])['attempt_store']).exists(),
         'wrapper_transport_invocation': 'PRESENT_NOT_CLAIMED_ABSENT'}
     if config['cut'] == 'docket-reserved-before-executor':
         record = arrive(directory, config['cut'], companion, observation)
