@@ -17,7 +17,7 @@ def verify_steps(returns, nq):
 
 
 def verify_manifests(manifests, first_baseline, second_baseline, nq):
-    if manifests['old-archive/db/nq.db'] != manifests['rollback.sqlite']:
+    if manifests['old-archive/db/nq.db'] != manifests['rollback-restored.sqlite']:
         raise nq.Refusal('old rollback changed typed rows or schema')
     if manifests['cut-one/nq.sqlite'] != first_baseline:
         raise nq.Refusal('preactivation cohort changed before rollback')
@@ -102,7 +102,7 @@ def verify(path, nq, owner_json_record):
             raise nq.Refusal('fresh admission profile differs')
         with tempfile.TemporaryDirectory(prefix='m4-cold-check-') as temporary:
             manifests = {}
-            for index, name in enumerate(('old-archive/db/nq.db', 'rollback.sqlite', 'cut-one/nq.sqlite', 'cut-two/nq.sqlite', 'forward-backup.sqlite')):
+            for index, name in enumerate(('old-archive/db/nq.db', 'rollback-restored.sqlite', 'cut-one/nq.sqlite', 'cut-two/nq.sqlite', 'forward-backup.sqlite')):
                 if name + '-wal' in members and members[name + '-wal'].size:
                     raise nq.Refusal('standalone cold snapshot still has a nonempty WAL')
                 target = pathlib.Path(temporary) / str(index)
