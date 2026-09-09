@@ -464,7 +464,14 @@ fn controller_loss_barrier(
     let registration = directory.join("COMPANION.json");
     let registered = json!({"pid":std::process::id(),"start_ticks":start,
         "issuance":current.issuance().ok_or("loss companion issuance absent")?.issuance});
-    if !registration.exists() {
+    if registration.exists() {
+        let existing: Value = nq_protocol::decode_json_document(
+            &nq_app::bounded_input::read(&registration, 4096).map_err(|e| e.to_string())?, 4096)
+            .map_err(|e| e.to_string())?;
+        if existing != registered {
+            return Err("retained companion registration differs from current process/issuance".into());
+        }
+    } else {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
             .open(&registration).map_err(|e| e.to_string())?;
         file.write_all(JcsDocument::canonicalize(&registered).map_err(|e| e.to_string())?.as_bytes())
@@ -652,6 +659,20 @@ pub(crate) fn run_with_admission(
         .docket_custody()
         .cloned()
         .ok_or("Docket did not return custody")?;
+    #[cfg(feature = "m3-labelwatch")]
+    if let Some(config) = std::env::var_os("CONSTELLATION_M3_CONTROLLER_LOSS") {
+        let config: Value = nq_protocol::decode_json_document(
+            &nq_app::bounded_input::read(Path::new(&config), 4096).map_err(|e| e.to_string())?, 4096)
+            .map_err(|e| e.to_string())?;
+        if config["cut"] == "docket-settled-before-ag-poll" {
+            let (inspection, raw) = inspect_docket(&docket, &docket_state, issuance.issuance.as_str())?;
+            std::fs::write(output.parent().ok_or("loss output parent absent")?
+                .join("controller-loss/DOCKET-AT-DISPATCH-RETURN.json"), raw).map_err(|e| e.to_string())?;
+            if inspection["record"]["status"] != "settled" {
+                return Err("requested Docket-settled cut not established; actual owner observation retained".into());
+            }
+        }
+    }
     #[cfg(feature = "m3-labelwatch")]
     controller_loss_barrier("docket-settled-before-ag-poll", &output, &engine)?;
     let progress = engine
