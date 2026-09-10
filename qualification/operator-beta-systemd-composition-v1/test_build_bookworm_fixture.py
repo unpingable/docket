@@ -50,7 +50,7 @@ class FixtureBuilderTests(unittest.TestCase):
         for kind, command in commands.items():
             expected = builder.build_command(
                 pathlib.Path(f"<{kind.upper()}_SOURCE>"),
-                pathlib.Path(f"<{kind.upper()}_VENDOR>"),
+                pathlib.Path("<AG_REGISTRY_SEED>" if kind == "ag" else "<DOCKET_VENDOR>"),
                 pathlib.Path("<CARGO_HOME>"),
                 pathlib.Path("<TARGET>"),
                 kind,
@@ -62,10 +62,11 @@ class FixtureBuilderTests(unittest.TestCase):
             self.assertIn("--locked", command)
             self.assertIn("--offline", command)
             self.assertIn(f"<{kind.upper()}_SOURCE>:/{kind}:ro", command)
-            self.assertIn(f"<{kind.upper()}_VENDOR>:/{kind}-vendor:ro", command)
+            dependency_mount = "<AG_REGISTRY_SEED>:/ag-registry-seed:ro" if kind == "ag" else "<DOCKET_VENDOR>:/docket-vendor:ro"
+            self.assertIn(dependency_mount, command)
             for mount in (
                 f"<{kind.upper()}_SOURCE>:/{kind}:ro",
-                f"<{kind.upper()}_VENDOR>:/{kind}-vendor:ro",
+                dependency_mount,
                 "<CARGO_HOME>:/cargo-home:rw",
                 "<TARGET>:/target:rw",
             ):

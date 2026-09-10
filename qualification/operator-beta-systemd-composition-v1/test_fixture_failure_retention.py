@@ -34,7 +34,7 @@ class FailureRetention(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             args = argparse.Namespace(output=root / 'output', ag_source=root,
-                                      docket_source=root, ag_vendor=root, docket_vendor=root)
+                                      docket_source=root, ag_registry_seed=root, docket_vendor=root)
 
             def partial_case(label, scratch, *_args):
                 case = scratch / label
@@ -48,6 +48,7 @@ class FailureRetention(unittest.TestCase):
                  mock.patch.object(builder.os, 'getgid', return_value=1000), \
                  mock.patch.object(builder, 'source_facts', return_value={}), \
                  mock.patch.object(builder, 'tree_digest', return_value=('a' * 64, 1)), \
+                 mock.patch.object(builder, 'registry_facts', return_value={}), \
                  mock.patch.object(builder, 'image_facts', return_value={}), \
                  mock.patch.object(builder, 'build_case', side_effect=partial_case):
                 with self.assertRaisesRegex(builder.Refusal, 'second build failed'):

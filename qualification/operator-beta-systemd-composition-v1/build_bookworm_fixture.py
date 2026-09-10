@@ -16,8 +16,16 @@ import subprocess
 import tarfile
 import tempfile
 from typing import Any
+import importlib.util
 
-SCHEMA = "constellation.operator_beta.final_pin_fixture_build.v1"
+_REGISTRY_SPEC = importlib.util.spec_from_file_location(
+    "final_pin_registry", pathlib.Path(__file__).with_name("prepare_final_pin_registry.py")
+)
+assert _REGISTRY_SPEC is not None and _REGISTRY_SPEC.loader is not None
+registry = importlib.util.module_from_spec(_REGISTRY_SPEC)
+_REGISTRY_SPEC.loader.exec_module(registry)
+
+SCHEMA = "constellation.operator_beta.final_pin_fixture_build.v2"
 AG_HEAD = "ae993551349eb23e3b833caecffb4e352bcd983b"
 AG_TREE = "8628d327e14436a20592c813dd9b7a678f8e78c8"
 DOCKET_HEAD = "ff363e9a7be89b19eb8a4e9f1d8b5ab7547f45ef"
@@ -210,7 +218,7 @@ def normalized_commands() -> dict[str, list[str]]:
     return {
         "ag": build_command(
             pathlib.Path("<AG_SOURCE>"),
-            pathlib.Path("<AG_VENDOR>"),
+            pathlib.Path("<AG_REGISTRY_SEED>"),
             pathlib.Path("<CARGO_HOME>"),
             pathlib.Path("<TARGET>"),
             "ag",
@@ -253,7 +261,7 @@ def build_command(
             "-v",
             f"{source}:/{kind}:ro",
             "-v",
-            f"{vendor}:/{kind}-vendor:ro",
+            f"{vendor}:/ag-registry-seed:ro" if kind == "ag" else f"{vendor}:/docket-vendor:ro",
             "-v",
             f"{cargo_home}:/cargo-home:rw",
             "-v",
@@ -462,7 +470,7 @@ def build_case(
     scratch: pathlib.Path,
     ag_source: pathlib.Path,
     docket_source: pathlib.Path,
-    ag_vendor: pathlib.Path,
+    ag_registry_seed: pathlib.Path,
     docket_vendor: pathlib.Path,
     driver: pathlib.Path,
 ) -> dict[str, Any]:
@@ -481,13 +489,14 @@ def build_case(
     # Declares the companion-only compile guard; the ordinary composition
     # example remains built without this feature and keeps its fixed contract.
     manifest.write_text(manifest_text.replace("[features]\n", "[features]\nm3-labelwatch = []\n"))
-    for source, vendor_path in ((ag, "/ag-vendor"), (docket, "/docket-vendor")):
+    for source, vendor_path in ((ag, None), (docket, "/docket-vendor")):
         config = source / ".cargo/config.toml"
         config.parent.mkdir(exist_ok=True)
-        config.write_text(cargo_config(vendor_path), encoding="utf-8")
-    for name in ("ag-cargo", "docket-cargo", "ag-target", "docket-target"):
+        config.write_text("[net]\noffline = true\n" if vendor_path is None else cargo_config(vendor_path), encoding="utf-8")
+    derive_cargo_home(ag_registry_seed, case / "ag-cargo")
+    for name in ("docket-cargo", "ag-target", "docket-target"):
         (case / name).mkdir()
-    run_logged(build_command(ag, ag_vendor, case / "ag-cargo", case / "ag-target", "ag"), case / "ag-build.log")
+    run_logged(build_command(ag, ag_registry_seed, case / "ag-cargo", case / "ag-target", "ag"), case / "ag-build.log")
     run_logged(build_command(docket, docket_vendor, case / "docket-cargo", case / "docket-target", "docket"), case / "docket-build.log")
     package = assemble(case)
     return {
@@ -509,7 +518,36 @@ def qualification_facts(repository: pathlib.Path) -> dict[str, Any]:
     return {
         "builder": {"path": BUILDER_RELATIVE.as_posix(), "sha256": sha256(builder)},
         "driver": {"path": DRIVER_RELATIVE.as_posix(), "sha256": sha256(driver)},
+        "registry": {"path": str(BUILDER_RELATIVE.with_name("prepare_final_pin_registry.py")),
+                     "sha256": sha256(builder.with_name("prepare_final_pin_registry.py"))},
     }
+
+
+def derive_cargo_home(seed: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy frozen registry bytes to a fresh, independently writable build case."""
+    registry.require_absent(destination)
+    registry.physical_directory(destination.parent)
+    before = registry.tree_digest(seed, registry.TREE_DOMAIN)
+    for path in [seed, *seed.rglob("*")]:
+        if path.lstat().st_mode & 0o222:
+            raise Refusal("registry seed is writable")
+    # copytree refuses an existing root; copyfile creates new files, not hardlinks.
+    shutil.copytree(seed, destination, copy_function=shutil.copyfile, symlinks=True)
+    registry.finalize_readonly(destination)
+    if registry.tree_digest(destination, registry.TREE_DOMAIN) != before:
+        raise Refusal("registry derivative differs")
+    if registry.tree_digest(seed, registry.TREE_DOMAIN) != before:
+        raise Refusal("registry seed changed during derivation")
+    # Final seed modes are known: directories 0555, files 0444. Only the derivative
+    # becomes writable. Each case calls this with an exclusive distinct pathname.
+    for path in [destination, *destination.rglob("*")]:
+        mode = path.lstat().st_mode
+        os.chmod(path, 0o755 if stat.S_ISDIR(mode) else 0o644, follow_symlinks=False)
+
+
+def registry_facts(args: argparse.Namespace) -> dict[str, Any]:
+    return registry.validate_seed(args.ag_registry_seed, args.ag_registry_receipt,
+                                  args.ag_registry_receipt_sha256, args.ag_source / "Cargo.lock")
 
 
 def validate_receipt_structure(receipt: Any, raw: bytes) -> None:
@@ -520,12 +558,12 @@ def validate_receipt_structure(receipt: Any, raw: bytes) -> None:
         or receipt.get("schema") != SCHEMA
         or receipt.get("limitations") != LIMITATIONS
     ):
-        raise Refusal("fixture receipt is not exact canonical V1")
+        raise Refusal("fixture receipt is not exact canonical V2")
 
 
 def build(args: argparse.Namespace) -> None:
-    if args.output.exists():
-        raise Refusal("output path already exists")
+    registry.require_absent(args.output)
+    registry.physical_directory(args.output.parent)
     if f"{os.getuid()}:{os.getgid()}" != BUILD_USER:
         raise Refusal(f"builder requires host uid:gid {BUILD_USER}")
     repository = pathlib.Path(__file__).resolve().parents[2]
@@ -533,11 +571,12 @@ def build(args: argparse.Namespace) -> None:
         "ag": source_facts(args.ag_source, AG_HEAD, AG_TREE, "AG"),
         "docket": source_facts(args.docket_source, DOCKET_HEAD, DOCKET_TREE, "Docket"),
     }
-    ag_vendor_sha, ag_vendor_files = tree_digest(args.ag_vendor, b"ag-composition-vendor-v1")
+    ag_registry = registry_facts(args)
     docket_vendor_sha, docket_vendor_files = tree_digest(
         args.docket_vendor, b"docket-composition-vendor-v1"
     )
     builder = image_facts()
+    args.output.mkdir(mode=0o700)
     scratch = pathlib.Path(tempfile.mkdtemp(prefix=".docket-composition-build.", dir=args.output.parent))
     completed = False
     try:
@@ -547,7 +586,7 @@ def build(args: argparse.Namespace) -> None:
                 scratch,
                 args.ag_source,
                 args.docket_source,
-                args.ag_vendor,
+                args.ag_registry_seed,
                 args.docket_vendor,
                 repository / DRIVER_RELATIVE,
             )
@@ -555,7 +594,8 @@ def build(args: argparse.Namespace) -> None:
         ]
         if cases[0]["package"] != cases[1]["package"] or cases[0]["binaries"] != cases[1]["binaries"]:
             raise Refusal("independent fixture builds differ")
-        args.output.mkdir(mode=0o700)
+        if registry_facts(args) != ag_registry:
+            raise Refusal("registry input changed during build")
         shutil.copyfile(scratch / "a" / PACKAGE_FILE, args.output / PACKAGE_FILE)
         for label in ("a", "b"):
             for name in ("ag-build.log", "docket-build.log"):
@@ -564,7 +604,7 @@ def build(args: argparse.Namespace) -> None:
             "schema": SCHEMA,
             "sources": sources,
             "vendor": {
-                "ag": {"tree_sha256": ag_vendor_sha, "regular_files": ag_vendor_files},
+                "ag": {"mode": "READONLY_REGISTRY_SEED_WITH_DISTINCT_WRITABLE_CARGO_HOME", **ag_registry},
                 "docket": {
                     "tree_sha256": docket_vendor_sha,
                     "regular_files": docket_vendor_files,
@@ -619,7 +659,7 @@ def verify(args: argparse.Namespace) -> None:
         "ag": source_facts(args.ag_source, AG_HEAD, AG_TREE, "AG"),
         "docket": source_facts(args.docket_source, DOCKET_HEAD, DOCKET_TREE, "Docket"),
     }
-    ag_vendor_sha, ag_vendor_files = tree_digest(args.ag_vendor, b"ag-composition-vendor-v1")
+    ag_registry = registry_facts(args)
     docket_vendor_sha, docket_vendor_files = tree_digest(
         args.docket_vendor, b"docket-composition-vendor-v1"
     )
@@ -632,7 +672,7 @@ def verify(args: argparse.Namespace) -> None:
     checks = {
         "sources": expected_sources,
         "vendor": {
-            "ag": {"tree_sha256": ag_vendor_sha, "regular_files": ag_vendor_files},
+            "ag": {"mode": "READONLY_REGISTRY_SEED_WITH_DISTINCT_WRITABLE_CARGO_HOME", **ag_registry},
             "docket": {"tree_sha256": docket_vendor_sha, "regular_files": docket_vendor_files},
         },
         "builder": image_facts(),
@@ -681,7 +721,9 @@ def parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--ag-source", type=pathlib.Path, required=True)
         command.add_argument("--docket-source", type=pathlib.Path, required=True)
-        command.add_argument("--ag-vendor", type=pathlib.Path, required=True)
+        command.add_argument("--ag-registry-seed", type=pathlib.Path, required=True)
+        command.add_argument("--ag-registry-receipt", type=pathlib.Path, required=True)
+        command.add_argument("--ag-registry-receipt-sha256", required=True)
         command.add_argument("--docket-vendor", type=pathlib.Path, required=True)
         command.add_argument("--output", type=pathlib.Path, required=True)
     return root
@@ -695,7 +737,7 @@ def main() -> int:
         else:
             verify(args)
         return 0
-    except (OSError, ValueError, Refusal, tarfile.TarError) as error:
+    except (OSError, ValueError, KeyError, Refusal, registry.Refusal, tarfile.TarError) as error:
         print(f"REFUSED: {error}", file=os.sys.stderr)
         return 1
 
