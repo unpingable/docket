@@ -20,6 +20,7 @@ AG_HEAD = "ae993551349eb23e3b833caecffb4e352bcd983b"
 AG_TREE = "8628d327e14436a20592c813dd9b7a678f8e78c8"
 LOCK_SHA256 = "68205a7d2319b648ed5ebcbc42c015222dba2257286012af44b4d9d9e073bcad"
 TARGET = "x86_64-unknown-linux-gnu"
+FEATURES = "ag-app/systemd-dbus"
 SCHEMA = "constellation.operator_beta.target_vendor_closure.v1"
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
@@ -102,6 +103,8 @@ def resolved_registry(source: pathlib.Path) -> set[tuple[str, str, str]]:
             "--offline",
             "--filter-platform",
             TARGET,
+            "--features",
+            FEATURES,
             "--format-version",
             "1",
         ],
@@ -267,6 +270,7 @@ def prepare(args: argparse.Namespace) -> None:
             "schema": SCHEMA,
             "source": {"head": AG_HEAD, "tree": AG_TREE, "cargo_lock_sha256": LOCK_SHA256},
             "target": TARGET,
+            "features": FEATURES,
             "network": "OFFLINE_NO_RETRIEVAL",
             "packages": packages,
             "excluded_lock_packages": excluded,
