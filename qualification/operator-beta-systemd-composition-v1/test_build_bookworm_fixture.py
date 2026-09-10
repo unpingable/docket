@@ -44,6 +44,22 @@ class FixtureBuilderTests(unittest.TestCase):
             with self.assertRaisesRegex(builder.Refusal, "non-regular entry"):
                 builder.tree_digest(root, b"test-domain")
 
+    def test_docket_vendor_requires_exact_admitted_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            dependency = root / "crate"
+            dependency.write_bytes(b"admitted")
+            digest, files = builder.tree_digest(root, b"docket-composition-vendor-v1")
+            with mock.patch.object(builder, "DOCKET_VENDOR_TREE_SHA256", digest), \
+                 mock.patch.object(builder, "DOCKET_VENDOR_FILES", files):
+                self.assertEqual(
+                    builder.docket_vendor_facts(root),
+                    {"tree_sha256": digest, "regular_files": files},
+                )
+                dependency.write_bytes(b"substituted")
+                with self.assertRaisesRegex(builder.Refusal, "admitted tree"):
+                    builder.docket_vendor_facts(root)
+
     def test_normalized_commands_are_network_disabled_and_input_explicit(self) -> None:
         commands = builder.normalized_commands()
         self.assertEqual(set(commands), {"ag", "docket"})

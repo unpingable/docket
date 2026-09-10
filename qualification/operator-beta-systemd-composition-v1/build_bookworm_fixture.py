@@ -30,6 +30,8 @@ AG_HEAD = "ae993551349eb23e3b833caecffb4e352bcd983b"
 AG_TREE = "8628d327e14436a20592c813dd9b7a678f8e78c8"
 DOCKET_HEAD = "ff363e9a7be89b19eb8a4e9f1d8b5ab7547f45ef"
 DOCKET_TREE = "d4b0f34c42afdf1583c2ac131ef81e42850027ce"
+DOCKET_VENDOR_TREE_SHA256 = "248b7472ad7685653a2968332b4963a6c7cf75435bb02586b2063993b7726cc4"
+DOCKET_VENDOR_FILES = 3042
 IMAGE_ID = "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379"
 IMAGE_REPO_DIGEST = "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
 SOURCE_DATE_EPOCH = "1700000000"
@@ -550,6 +552,13 @@ def registry_facts(args: argparse.Namespace) -> dict[str, Any]:
                                   args.ag_registry_receipt_sha256, args.ag_source / "Cargo.lock")
 
 
+def docket_vendor_facts(path: pathlib.Path) -> dict[str, Any]:
+    digest, files = tree_digest(path, b"docket-composition-vendor-v1")
+    if digest != DOCKET_VENDOR_TREE_SHA256 or files != DOCKET_VENDOR_FILES:
+        raise Refusal("Docket vendor differs from the admitted tree")
+    return {"tree_sha256": digest, "regular_files": files}
+
+
 def validate_receipt_structure(receipt: Any, raw: bytes) -> None:
     if (
         not isinstance(receipt, dict)
@@ -572,9 +581,7 @@ def build(args: argparse.Namespace) -> None:
         "docket": source_facts(args.docket_source, DOCKET_HEAD, DOCKET_TREE, "Docket"),
     }
     ag_registry = registry_facts(args)
-    docket_vendor_sha, docket_vendor_files = tree_digest(
-        args.docket_vendor, b"docket-composition-vendor-v1"
-    )
+    docket_vendor = docket_vendor_facts(args.docket_vendor)
     builder = image_facts()
     args.output.mkdir(mode=0o700)
     scratch = pathlib.Path(tempfile.mkdtemp(prefix=".docket-composition-build.", dir=args.output.parent))
@@ -596,6 +603,8 @@ def build(args: argparse.Namespace) -> None:
             raise Refusal("independent fixture builds differ")
         if registry_facts(args) != ag_registry:
             raise Refusal("registry input changed during build")
+        if docket_vendor_facts(args.docket_vendor) != docket_vendor:
+            raise Refusal("Docket vendor changed during build")
         shutil.copyfile(scratch / "a" / PACKAGE_FILE, args.output / PACKAGE_FILE)
         for label in ("a", "b"):
             for name in ("ag-build.log", "docket-build.log"):
@@ -605,10 +614,7 @@ def build(args: argparse.Namespace) -> None:
             "sources": sources,
             "vendor": {
                 "ag": {"mode": "READONLY_REGISTRY_SEED_WITH_DISTINCT_WRITABLE_CARGO_HOME", **ag_registry},
-                "docket": {
-                    "tree_sha256": docket_vendor_sha,
-                    "regular_files": docket_vendor_files,
-                },
+                "docket": docket_vendor,
             },
             "builder": builder,
             "build": {
@@ -660,9 +666,7 @@ def verify(args: argparse.Namespace) -> None:
         "docket": source_facts(args.docket_source, DOCKET_HEAD, DOCKET_TREE, "Docket"),
     }
     ag_registry = registry_facts(args)
-    docket_vendor_sha, docket_vendor_files = tree_digest(
-        args.docket_vendor, b"docket-composition-vendor-v1"
-    )
+    docket_vendor = docket_vendor_facts(args.docket_vendor)
     package = output / PACKAGE_FILE
     regular_file(package, "fixture package")
     with tempfile.TemporaryDirectory(prefix="docket-composition-verify.") as temporary:
@@ -673,7 +677,7 @@ def verify(args: argparse.Namespace) -> None:
         "sources": expected_sources,
         "vendor": {
             "ag": {"mode": "READONLY_REGISTRY_SEED_WITH_DISTINCT_WRITABLE_CARGO_HOME", **ag_registry},
-            "docket": {"tree_sha256": docket_vendor_sha, "regular_files": docket_vendor_files},
+            "docket": docket_vendor,
         },
         "builder": image_facts(),
         "build": {

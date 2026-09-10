@@ -47,7 +47,7 @@ class FailureRetention(unittest.TestCase):
             with mock.patch.object(builder.os, 'getuid', return_value=1000), \
                  mock.patch.object(builder.os, 'getgid', return_value=1000), \
                  mock.patch.object(builder, 'source_facts', return_value={}), \
-                 mock.patch.object(builder, 'tree_digest', return_value=('a' * 64, 1)), \
+                 mock.patch.object(builder, 'docket_vendor_facts', return_value={'tree_sha256': 'a' * 64, 'regular_files': 1}), \
                  mock.patch.object(builder, 'registry_facts', return_value={}), \
                  mock.patch.object(builder, 'image_facts', return_value={}), \
                  mock.patch.object(builder, 'build_case', side_effect=partial_case):
@@ -60,6 +60,29 @@ class FailureRetention(unittest.TestCase):
             self.assertEqual((scratch / 'a/retained.log').read_text(), 'a')
             self.assertEqual((scratch / 'b/retained.log').read_text(), 'b')
             self.assertFalse((args.output / 'fixture-build-receipt.v1.json').exists())
+
+    def test_docket_vendor_mutation_after_build_cases_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            args = argparse.Namespace(output=root / 'output', ag_source=root,
+                                      docket_source=root, ag_registry_seed=root,
+                                      ag_registry_receipt=root / 'registry.json',
+                                      ag_registry_receipt_sha256='b' * 64,
+                                      docket_vendor=root)
+            admitted = {'tree_sha256': 'a' * 64, 'regular_files': 1}
+            changed = {'tree_sha256': 'c' * 64, 'regular_files': 1}
+            case = {'package': {}, 'binaries': {}}
+            with mock.patch.object(builder.os, 'getuid', return_value=1000), \
+                 mock.patch.object(builder.os, 'getgid', return_value=1000), \
+                 mock.patch.object(builder, 'source_facts', return_value={}), \
+                 mock.patch.object(builder, 'docket_vendor_facts', side_effect=[admitted, changed]), \
+                 mock.patch.object(builder, 'registry_facts', return_value={}), \
+                 mock.patch.object(builder, 'image_facts', return_value={}), \
+                 mock.patch.object(builder, 'build_case', return_value=case):
+                with self.assertRaisesRegex(builder.Refusal, 'changed during build'):
+                    builder.build(args)
+            failure = json.loads((args.output / 'BUILD_FAILURE.json').read_bytes())
+            self.assertEqual(failure['state'], 'BUILD_INCOMPLETE')
 
 
 if __name__ == '__main__':
