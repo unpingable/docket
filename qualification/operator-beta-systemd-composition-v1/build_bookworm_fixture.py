@@ -25,7 +25,7 @@ assert _REGISTRY_SPEC is not None and _REGISTRY_SPEC.loader is not None
 registry = importlib.util.module_from_spec(_REGISTRY_SPEC)
 _REGISTRY_SPEC.loader.exec_module(registry)
 
-SCHEMA = "constellation.operator_beta.final_pin_fixture_build.v2"
+SCHEMA = "constellation.operator_beta.final_pin_fixture_build.v3"
 AG_HEAD = "ae993551349eb23e3b833caecffb4e352bcd983b"
 AG_TREE = "8628d327e14436a20592c813dd9b7a678f8e78c8"
 DOCKET_HEAD = "ff363e9a7be89b19eb8a4e9f1d8b5ab7547f45ef"
@@ -39,6 +39,10 @@ BUILD_USER = "1000:1000"
 PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
 PACKAGE_VERSION = "0.1.0-1+finalpin1"
 PACKAGE_FILE = f"{PACKAGE_NAME}_{PACKAGE_VERSION}_amd64.deb"
+CASE_PACKAGE_FILES = {
+    label: f"{label}-{PACKAGE_FILE}"
+    for label in ("a", "b")
+}
 DRIVER_RELATIVE = pathlib.Path(
     "qualification/operator-beta-systemd-composition-v1/composition_driver.rs"
 )
@@ -64,6 +68,7 @@ RECEIPT_FIELDS = {
     "builder",
     "build",
     "package",
+    "reproducibility",
     "binaries",
     "logs",
     "qualification",
@@ -444,14 +449,61 @@ def binary_facts(package: pathlib.Path, scratch: pathlib.Path) -> dict[str, Any]
     return result
 
 
-def package_facts(package: pathlib.Path, scratch: pathlib.Path) -> dict[str, Any]:
+def package_facts(
+    package: pathlib.Path, scratch: pathlib.Path, *, file_name: str = PACKAGE_FILE
+) -> dict[str, Any]:
     return {
-        "file": PACKAGE_FILE,
+        "file": file_name,
         "bytes": package.stat().st_size,
         "sha256": sha256(package),
         "data_inventory": package_data_inventory(package),
         "control": package_control(package, scratch),
     }
+
+
+def expected_output_files() -> set[str]:
+    return {
+        PACKAGE_FILE,
+        *CASE_PACKAGE_FILES.values(),
+        "fixture-build-receipt.v1.json",
+        *(f"{label}-{name}" for label in ("a", "b") for name in ("ag-build.log", "docket-build.log")),
+    }
+
+
+def seal_output(output: pathlib.Path) -> None:
+    """Seal the complete successful evidence cut before reporting success."""
+    actual = {path.name for path in output.iterdir()}
+    if actual != expected_output_files():
+        raise Refusal("fixture output directory is not one closed artifact inventory")
+    for path in output.iterdir():
+        metadata = regular_file(path, f"retained output {path.name}")
+        if metadata.st_nlink != 1:
+            raise Refusal(f"retained output is not independently owned: {path.name}")
+        os.chmod(path, 0o444, follow_symlinks=False)
+    os.chmod(output, 0o555)
+
+
+def verify_output_modes(output: pathlib.Path) -> None:
+    metadata = output.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or output.is_symlink()
+        or stat.S_IMODE(metadata.st_mode) != 0o555
+    ):
+        raise Refusal("fixture output directory is not one sealed physical directory")
+    actual = {path.name for path in output.iterdir()}
+    if actual != expected_output_files():
+        raise Refusal("fixture output directory is not one closed artifact inventory")
+    for path in output.iterdir():
+        item = regular_file(path, f"retained output {path.name}")
+        if stat.S_IMODE(item.st_mode) != 0o444 or item.st_nlink != 1:
+            raise Refusal(f"retained output mode/custody differs: {path.name}")
+    identities = {
+        ((output / file_name).stat().st_dev, (output / file_name).stat().st_ino)
+        for file_name in (PACKAGE_FILE, *CASE_PACKAGE_FILES.values())
+    }
+    if len(identities) != 3:
+        raise Refusal("retained package cases are not independently addressable files")
 
 
 def run_logged(command: list[str], destination: pathlib.Path) -> None:
@@ -567,7 +619,7 @@ def validate_receipt_structure(receipt: Any, raw: bytes) -> None:
         or receipt.get("schema") != SCHEMA
         or receipt.get("limitations") != LIMITATIONS
     ):
-        raise Refusal("fixture receipt is not exact canonical V2")
+        raise Refusal("fixture receipt is not exact canonical V3")
 
 
 def build(args: argparse.Namespace) -> None:
@@ -607,6 +659,11 @@ def build(args: argparse.Namespace) -> None:
             raise Refusal("Docket vendor changed during build")
         shutil.copyfile(scratch / "a" / PACKAGE_FILE, args.output / PACKAGE_FILE)
         for label in ("a", "b"):
+            shutil.copyfile(
+                scratch / label / PACKAGE_FILE,
+                args.output / CASE_PACKAGE_FILES[label],
+            )
+        for label in ("a", "b"):
             for name in ("ag-build.log", "docket-build.log"):
                 shutil.copyfile(scratch / label / name, args.output / f"{label}-{name}")
         receipt = {
@@ -624,6 +681,14 @@ def build(args: argparse.Namespace) -> None:
                 "clean_builds": 2,
             },
             "package": cases[0]["package"] | {"file": PACKAGE_FILE},
+            "reproducibility": {
+                "byte_equal": True,
+                "cases": {
+                    label: cases[index]["package"]
+                    | {"file": CASE_PACKAGE_FILES[label]}
+                    for index, label in enumerate(("a", "b"))
+                },
+            },
             "binaries": cases[0]["binaries"],
             "logs": {
                 f"{label}-{name}": {
@@ -637,6 +702,7 @@ def build(args: argparse.Namespace) -> None:
             "limitations": LIMITATIONS,
         }
         (args.output / "fixture-build-receipt.v1.json").write_bytes(canonical(receipt) + b"\n")
+        seal_output(args.output)
         completed = True
         print(json.dumps({"result": "REPRODUCIBLE_COMPOSITION_FIXTURE", "package_sha256": receipt["package"]["sha256"]}, sort_keys=True))
     except BaseException:
@@ -655,7 +721,10 @@ def build(args: argparse.Namespace) -> None:
 
 def verify(args: argparse.Namespace) -> None:
     repository = pathlib.Path(__file__).resolve().parents[2]
+    if not args.output.is_dir() or args.output.is_symlink():
+        raise Refusal("fixture output is not one physical directory")
     output = args.output.resolve(strict=True)
+    verify_output_modes(output)
     receipt_path = output / "fixture-build-receipt.v1.json"
     regular_file(receipt_path, "fixture receipt")
     raw = receipt_path.read_bytes()
@@ -673,6 +742,21 @@ def verify(args: argparse.Namespace) -> None:
         verify_root = pathlib.Path(temporary)
         binaries = binary_facts(package, verify_root / "binaries")
         package_record = package_facts(package, verify_root / "package")
+        case_records = {
+            label: package_facts(
+                output / file_name,
+                verify_root / f"case-{label}-package",
+                file_name=file_name,
+            )
+            for label, file_name in CASE_PACKAGE_FILES.items()
+        }
+    if case_records["a"] | {"file": PACKAGE_FILE} != package_record:
+        raise Refusal("canonical fixture package differs from retained case a")
+    if (
+        case_records["a"] | {"file": CASE_PACKAGE_FILES["b"]}
+        != case_records["b"]
+    ):
+        raise Refusal("retained fixture package cases differ")
     checks = {
         "sources": expected_sources,
         "vendor": {
@@ -687,6 +771,10 @@ def verify(args: argparse.Namespace) -> None:
             "clean_builds": 2,
         },
         "package": package_record,
+        "reproducibility": {
+            "byte_equal": True,
+            "cases": case_records,
+        },
         "binaries": binaries,
         "qualification": qualification_facts(repository),
     }
@@ -703,11 +791,7 @@ def verify(args: argparse.Namespace) -> None:
     }
     if receipt.get("logs") != expected_logs:
         raise Refusal("fixture receipt logs differ")
-    expected_output = {
-        PACKAGE_FILE,
-        "fixture-build-receipt.v1.json",
-        *expected_logs,
-    }
+    expected_output = expected_output_files()
     actual_output = {
         path.relative_to(output).as_posix()
         for path in output.rglob("*")

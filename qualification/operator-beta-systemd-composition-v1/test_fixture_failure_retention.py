@@ -2,6 +2,8 @@
 import argparse
 import json
 import pathlib
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -83,6 +85,64 @@ class FailureRetention(unittest.TestCase):
                     builder.build(args)
             failure = json.loads((args.output / 'BUILD_FAILURE.json').read_bytes())
             self.assertEqual(failure['state'], 'BUILD_INCOMPLETE')
+
+
+class SuccessfulOutputCustody(unittest.TestCase):
+    def make_output(self, root: pathlib.Path) -> pathlib.Path:
+        output = root / 'output'
+        output.mkdir(mode=0o700)
+        for index, name in enumerate(sorted(builder.expected_output_files())):
+            (output / name).write_bytes(f'evidence-{index}'.encode())
+        return output
+
+    def test_seal_retains_two_distinct_cases_and_enforces_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.make_output(pathlib.Path(temporary))
+            builder.seal_output(output)
+            builder.verify_output_modes(output)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o555)
+            identities = {
+                (output / name).stat().st_ino
+                for name in (builder.PACKAGE_FILE, *builder.CASE_PACKAGE_FILES.values())
+            }
+            self.assertEqual(len(identities), 3)
+            self.assertEqual(
+                {stat.S_IMODE(path.stat().st_mode) for path in output.iterdir()},
+                {0o444},
+            )
+
+    def test_writable_retained_evidence_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.make_output(pathlib.Path(temporary))
+            builder.seal_output(output)
+            evidence = output / builder.CASE_PACKAGE_FILES['b']
+            os.chmod(evidence, 0o644)
+            with self.assertRaisesRegex(builder.Refusal, 'mode/custody differs'):
+                builder.verify_output_modes(output)
+
+    def test_missing_second_case_refuses_before_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.make_output(pathlib.Path(temporary))
+            (output / builder.CASE_PACKAGE_FILES['b']).unlink()
+            with self.assertRaisesRegex(builder.Refusal, 'closed artifact inventory'):
+                builder.seal_output(output)
+
+    def test_hardlinked_case_refuses_independent_custody(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = self.make_output(pathlib.Path(temporary))
+            second = output / builder.CASE_PACKAGE_FILES['b']
+            second.unlink()
+            os.link(output / builder.CASE_PACKAGE_FILES['a'], second)
+            with self.assertRaisesRegex(builder.Refusal, 'independently owned'):
+                builder.seal_output(output)
+
+    def test_prior_receipt_schema_cannot_transfer(self):
+        receipt = {field: {} for field in builder.RECEIPT_FIELDS}
+        receipt.update(schema='constellation.operator_beta.final_pin_fixture_build.v2',
+                       limitations=builder.LIMITATIONS)
+        raw = builder.canonical(receipt) + b'\n'
+        with self.assertRaisesRegex(builder.Refusal, 'not exact canonical V3'):
+            builder.validate_receipt_structure(receipt, raw)
 
 
 if __name__ == '__main__':
