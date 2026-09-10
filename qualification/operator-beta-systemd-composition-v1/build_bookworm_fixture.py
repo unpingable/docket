@@ -17,17 +17,17 @@ import tarfile
 import tempfile
 from typing import Any
 
-SCHEMA = "constellation.operator_beta.docket_systemd_fixture_build.v1"
-AG_HEAD = "bf6adde2792a886d1ba75d97ca77efb8e914f4f5"
-AG_TREE = "31b3b15437baffcaa41ae31020f4570599304019"
-DOCKET_HEAD = "09ba85fdf0c05b7e1664ebea84cdbb611a0ceda4"
-DOCKET_TREE = "96df8b9a421f25aba07955422fc964c0129703ec"
+SCHEMA = "constellation.operator_beta.final_pin_fixture_build.v1"
+AG_HEAD = "ae993551349eb23e3b833caecffb4e352bcd983b"
+AG_TREE = "8628d327e14436a20592c813dd9b7a678f8e78c8"
+DOCKET_HEAD = "ff363e9a7be89b19eb8a4e9f1d8b5ab7547f45ef"
+DOCKET_TREE = "d4b0f34c42afdf1583c2ac131ef81e42850027ce"
 IMAGE_ID = "sha256:fb7a58d0482a24e269ba85636ce46cb06aaaef3aea0e868154ed0ae7c18fa379"
 IMAGE_REPO_DIGEST = "rust@sha256:365468470075493dc4583f47387001854321c5a8583ea9604b297e67f01c5a4f"
 SOURCE_DATE_EPOCH = "1700000000"
 BUILD_USER = "1000:1000"
 PACKAGE_NAME = "constellation-operator-beta-composition-fixture"
-PACKAGE_VERSION = "0.1.0-1"
+PACKAGE_VERSION = "0.1.0-1+finalpin1"
 PACKAGE_FILE = f"{PACKAGE_NAME}_{PACKAGE_VERSION}_amd64.deb"
 DRIVER_RELATIVE = pathlib.Path(
     "qualification/operator-beta-systemd-composition-v1/composition_driver.rs"
@@ -43,6 +43,8 @@ LIMITATIONS = [
     "qualification-only",
     "installs no service or configuration",
     "does not itself grant AG or Docket authority",
+    "covers the installable AG-ng Docket NQ-ng core, not every release component",
+    "does not establish provider success, Labelwatch production, deployment, or human use",
     "live VM and systemd effect remain separate qualification gates",
 ]
 RECEIPT_FIELDS = {
