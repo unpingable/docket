@@ -121,3 +121,17 @@ docs/governed-runtime  the normative specification, audits, and freeze record.
   from operator input is a defect even when it fails closed.
 - Tests assert behaviour through public APIs and real subprocesses where the property is
   about real process death.
+
+## Campaign selection
+
+Use Docket when work needs durable attempt custody, exact dispatch evidence, or
+reconciliation; keep bounded edits on the ordinary repository workflow. Start
+with `cargo run -p gwr-local --bin docket -- --help` and
+`docs/governed-runtime/operator-runbook.md`, using an owner-approved state
+root, repository registration, effect class, provider, and standing profile.
+
+For prolonged work, use the campaign-approved durable producer and checkpoint.
+After supervisor interruption, inspect the original attempt with `docket show`
+and `docket journal`, then reconcile indeterminate state before any successor.
+Tool availability grants no standing or authority. When custody is unavailable,
+use the documented fallback with a reduced claim.
